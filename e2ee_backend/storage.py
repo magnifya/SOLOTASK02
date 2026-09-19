@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import threading
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .models import Device, Message, Session
+from .models import Device, Message, MessageDelivery, Session, SignedPreKey
 
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
@@ -28,6 +28,13 @@ MESSAGE_BAD_SEQUENCE = "bad_sequence"
 
 #: Outcome code for a failed message listing.
 MESSAGE_DEVICE_INACTIVE = "device_inactive"
+
+#: Outcome codes for delivery (retry/ack/status) failures.
+DELIVERY_SESSION_UNKNOWN = "session_unknown"
+DELIVERY_MESSAGE_UNKNOWN = "message_unknown"
+DELIVERY_DEVICE_MISMATCH = "device_mismatch"
+DELIVERY_DEVICE_INACTIVE = "device_inactive"
+DELIVERY_BAD_SEQUENCE = "bad_sequence"
 
 
 class SessionCreateError(Exception):
@@ -54,6 +61,14 @@ class MessageListError(Exception):
         self.reason = reason
 
 
+class DeliveryError(Exception):
+    """An atomic delivery (retry/ack/status) check failed; nothing changed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class DeviceStore:
     """In-memory store keyed by ``(user_id, device_id)``.
 
@@ -67,6 +82,15 @@ class DeviceStore:
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
         self._messages: Dict[str, List[Message]] = {}
+        # Delivery state keyed by (session_id, message_id).
+        self._delivery: Dict[Tuple[str, str], MessageDelivery] = {}
+        # Called (under the lock) after any state mutation, for persistence.
+        self.on_change: Optional[Callable[[], None]] = None
+
+    def _notify_change(self) -> None:
+        """Invoke the persistence hook after a committed mutation."""
+        if self.on_change is not None:
+            self.on_change()
 
     def add_device(self, device: Device) -> bool:
         """Insert a device.
@@ -80,6 +104,7 @@ class DeviceStore:
                 return False
             self._devices[key] = device
             self._device_index[device.device_id] = key
+            self._notify_change()
             return True
 
     def get_device(self, user_id: str, device_id: str) -> Optional[Device]:
@@ -104,6 +129,7 @@ class DeviceStore:
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
                     prekey.revoked = True
+                    self._notify_change()
                     return True
             return False
 
@@ -121,6 +147,7 @@ class DeviceStore:
             device.revoked = True
             for prekey in device.prekeys:
                 prekey.revoked = True
+            self._notify_change()
             return device
 
     def revoke_prekey_by_id(self, device_id: str,
@@ -139,6 +166,7 @@ class DeviceStore:
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
                     prekey.revoked = True
+                    self._notify_change()
                     return device, True
             return device, False
 
@@ -207,6 +235,7 @@ class DeviceStore:
                 public_key=used_prekey.public_key,
             )
             self._sessions[session.session_id] = session
+            self._notify_change()
             return session
 
     def session_view(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -283,6 +312,7 @@ class DeviceStore:
                 ciphertext=ciphertext,
             )
             stream.append(message)
+            self._notify_change()
             return message
 
     def message_page(self, session_id: str, device_id: str, after: int,
@@ -310,3 +340,278 @@ class DeviceStore:
             page = [m for m in stream if m.sequence > after][:limit]
             next_after = page[-1].sequence if page else after
             return [self.message_view(m) for m in page], next_after
+
+    # -- delivery (reliable retry/ack/status) ------------------------------
+
+    @staticmethod
+    def _delivery_view(session_id: str, message: Message,
+                       state: Optional["MessageDelivery"]) -> Dict[str, Any]:
+        """Build the five-field delivery status view of one message."""
+        return {
+            "session_id": session_id,
+            "message_id": message.message_id,
+            "status": "acked" if state is not None and state.acked
+            else "pending",
+            "attempts": state.attempts if state is not None else 0,
+            "sequence": message.sequence,
+        }
+
+    def _delivery_target(self, session_id: str, message_id: str,
+                         device_id: str
+                         ) -> Tuple[Session, Message]:
+        """Resolve and authorize a (session, message, recipient) triple.
+
+        Must be called while holding the store lock. Raises
+        :class:`DeliveryError` with the mapped reason on any failure.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise DeliveryError(DELIVERY_SESSION_UNKNOWN)
+        message = next((m for m in self._messages.get(session_id, [])
+                        if m.message_id == message_id), None)
+        if message is None:
+            raise DeliveryError(DELIVERY_MESSAGE_UNKNOWN)
+        device_key = self._device_index.get(device_id)
+        device = (self._devices.get(device_key)
+                  if device_key is not None else None)
+        if device is None or device.revoked:
+            raise DeliveryError(DELIVERY_DEVICE_INACTIVE)
+        if device_id != session.recipient_device_id:
+            raise DeliveryError(DELIVERY_DEVICE_MISMATCH)
+        return session, message
+
+    def retry_message(self, session_id: str, message_id: str,
+                      device_id: str, attempt_id: str
+                      ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically record one delivery attempt for a message.
+
+        The recipient must be the session's active recipient. Each distinct
+        ``attempt_id`` is counted exactly once, so retries with the same id
+        are idempotent. Returns ``(view, created)`` where ``created`` says
+        whether this is the first ever attempt for the message (201 vs 200).
+        Nothing changes on a failed authorization check.
+        """
+        with self._lock:
+            _, message = self._delivery_target(
+                session_id, message_id, device_id)
+            key = (session_id, message_id)
+            state = self._delivery.get(key)
+            created = state is None
+            if created:
+                state = MessageDelivery()
+                self._delivery[key] = state
+            if attempt_id not in state.attempt_ids:
+                state.attempt_ids.add(attempt_id)
+                state.attempts += 1
+            view = self._delivery_view(session_id, message, state)
+            self._notify_change()
+            return view, created
+
+    def ack_message(self, session_id: str, message_id: str, device_id: str,
+                    sequence: int) -> Tuple[Dict[str, Any], bool]:
+        """Atomically acknowledge a message for the active recipient.
+
+        ``sequence`` must equal the message's stored sequence. The first ack
+        marks the message acked; repeated acks are idempotent. Returns
+        ``(view, first_ack)``.
+        """
+        with self._lock:
+            _, message = self._delivery_target(
+                session_id, message_id, device_id)
+            if sequence != message.sequence:
+                raise DeliveryError(DELIVERY_BAD_SEQUENCE)
+            key = (session_id, message_id)
+            state = self._delivery.get(key)
+            first_ack = state is None or not state.acked
+            if state is None:
+                state = MessageDelivery()
+                self._delivery[key] = state
+            state.acked = True
+            state.ack_sequence = sequence
+            view = self._delivery_view(session_id, message, state)
+            self._notify_change()
+            return view, first_ack
+
+    def message_delivery_status(self, session_id: str, message_id: str,
+                                device_id: str) -> Dict[str, Any]:
+        """Atomically read one message's delivery status for its recipient."""
+        with self._lock:
+            _, message = self._delivery_target(
+                session_id, message_id, device_id)
+            state = self._delivery.get((session_id, message_id))
+            return self._delivery_view(session_id, message, state)
+
+    # -- persistence snapshot ----------------------------------------------
+
+    def snapshot_state(self) -> Dict[str, Any]:
+        """Return a JSON-serializable deep copy of all stored state.
+
+        Copied under the store lock, so the snapshot is a consistent
+        linearization point: concurrent mutations are never seen half-applied.
+        """
+        with self._lock:
+            devices = []
+            for (user_id, _device_id), device in self._devices.items():
+                devices.append({
+                    "user_id": device.user_id,
+                    "device_id": device.device_id,
+                    "identity_key": device.identity_key,
+                    "registered_at": device.registered_at,
+                    "revoked": device.revoked,
+                    "prekeys": [{"key_id": pk.key_id,
+                                 "public_key": pk.public_key,
+                                 "revoked": pk.revoked}
+                                for pk in device.prekeys],
+                })
+            sessions = [{
+                "session_id": s.session_id,
+                "initiator_device_id": s.initiator_device_id,
+                "recipient_device_id": s.recipient_device_id,
+                "prekey_id": s.prekey_id,
+                "ephemeral_key": s.ephemeral_key,
+                "identity_key": s.identity_key,
+                "public_key": s.public_key,
+                "created_at": s.created_at,
+            } for s in self._sessions.values()]
+            messages = {
+                sid: [{
+                    "session_id": m.session_id,
+                    "sender_device_id": m.sender_device_id,
+                    "message_id": m.message_id,
+                    "sequence": m.sequence,
+                    "nonce": m.nonce,
+                    "ciphertext": m.ciphertext,
+                    "created_at": m.created_at,
+                } for m in stream]
+                for sid, stream in self._messages.items()
+            }
+            delivery = [{
+                "session_id": sid,
+                "message_id": mid,
+                "attempts": state.attempts,
+                "attempt_ids": sorted(state.attempt_ids),
+                "acked": state.acked,
+                "ack_sequence": state.ack_sequence,
+            } for (sid, mid), state in self._delivery.items()]
+            return {"devices": devices, "sessions": sessions,
+                    "messages": messages, "delivery": delivery}
+
+    def restore_state(self, state: Dict[str, Any]) -> None:
+        """Replace all in-memory state from a persisted (version-stripped) doc.
+
+        Raises :class:`ValueError` when the document is malformed; the current
+        in-memory state is only replaced after the whole document parses.
+        """
+        if not isinstance(state, dict):
+            raise ValueError("state document must be a JSON object")
+
+        raw_devices = state.get("devices", [])
+        raw_sessions = state.get("sessions", [])
+        raw_messages = state.get("messages", {})
+        raw_delivery = state.get("delivery", [])
+        if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
+                and isinstance(raw_messages, dict)
+                and isinstance(raw_delivery, list)):
+            raise ValueError("state document has a malformed top-level section")
+
+        devices: Dict[Tuple[str, str], Device] = {}
+        device_index: Dict[str, Tuple[str, str]] = {}
+        for index, raw in enumerate(raw_devices):
+            if not isinstance(raw, dict):
+                raise ValueError(f"devices[{index}] must be an object")
+            try:
+                prekeys = []
+                for pk in raw["prekeys"]:
+                    if not isinstance(pk, dict):
+                        raise ValueError("prekey must be an object")
+                    prekeys.append(SignedPreKey(
+                        key_id=pk["key_id"], public_key=pk["public_key"],
+                        revoked=bool(pk.get("revoked", False))))
+                device = Device(
+                    user_id=raw["user_id"], device_id=raw["device_id"],
+                    identity_key=raw["identity_key"],
+                    registered_at=raw["registered_at"],
+                    prekeys=prekeys, revoked=bool(raw.get("revoked", False)))
+            except KeyError as error:
+                raise ValueError(
+                    f"devices[{index}] missing field: {error.args[0]}") from None
+            key = (device.user_id, device.device_id)
+            if key in devices or device.device_id in device_index:
+                raise ValueError(
+                    f"duplicate device in state: {device.device_id}")
+            devices[key] = device
+            device_index[device.device_id] = key
+
+        sessions: Dict[str, Session] = {}
+        for index, raw in enumerate(raw_sessions):
+            if not isinstance(raw, dict):
+                raise ValueError(f"sessions[{index}] must be an object")
+            try:
+                session = Session(
+                    session_id=raw["session_id"],
+                    initiator_device_id=raw["initiator_device_id"],
+                    recipient_device_id=raw["recipient_device_id"],
+                    prekey_id=raw["prekey_id"],
+                    ephemeral_key=raw["ephemeral_key"],
+                    identity_key=raw["identity_key"],
+                    public_key=raw["public_key"],
+                    created_at=raw["created_at"])
+            except KeyError as error:
+                raise ValueError(
+                    f"sessions[{index}] missing field: {error.args[0]}") from None
+            if session.session_id in sessions:
+                raise ValueError(
+                    f"duplicate session in state: {session.session_id}")
+            sessions[session.session_id] = session
+
+        messages: Dict[str, List[Message]] = {}
+        for sid, stream in raw_messages.items():
+            if not isinstance(sid, str) or not isinstance(stream, list):
+                raise ValueError("messages must map session_id to a list")
+            parsed: List[Message] = []
+            for index, raw in enumerate(stream):
+                if not isinstance(raw, dict):
+                    raise ValueError(f"messages[{sid}][{index}] must be an object")
+                try:
+                    parsed.append(Message(
+                        session_id=raw["session_id"],
+                        sender_device_id=raw["sender_device_id"],
+                        message_id=raw["message_id"],
+                        sequence=raw["sequence"], nonce=raw["nonce"],
+                        ciphertext=raw["ciphertext"],
+                        created_at=raw["created_at"]))
+                except KeyError as error:
+                    raise ValueError(
+                        f"messages[{sid}][{index}] missing field: "
+                        f"{error.args[0]}") from None
+            messages[sid] = parsed
+
+        delivery: Dict[Tuple[str, str], MessageDelivery] = {}
+        for index, raw in enumerate(raw_delivery):
+            if not isinstance(raw, dict):
+                raise ValueError(f"delivery[{index}] must be an object")
+            try:
+                attempt_ids = raw["attempt_ids"]
+                if not isinstance(attempt_ids, list) or not all(
+                        isinstance(value, str) for value in attempt_ids):
+                    raise ValueError("attempt_ids must be a list of strings")
+                record = MessageDelivery(
+                    attempts=int(raw["attempts"]),
+                    attempt_ids=set(attempt_ids),
+                    acked=bool(raw["acked"]),
+                    ack_sequence=int(raw["ack_sequence"]))
+                dkey = (raw["session_id"], raw["message_id"])
+            except KeyError as error:
+                raise ValueError(
+                    f"delivery[{index}] missing field: {error.args[0]}") from None
+            if dkey in delivery:
+                raise ValueError(
+                    f"duplicate delivery record in state: {dkey}")
+            delivery[dkey] = record
+
+        with self._lock:
+            self._devices = devices
+            self._device_index = device_index
+            self._sessions = sessions
+            self._messages = messages
+            self._delivery = delivery

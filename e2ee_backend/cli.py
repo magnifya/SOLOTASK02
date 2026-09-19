@@ -9,12 +9,13 @@ import argparse
 import json
 import os
 import sys
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from .crypto import CryptoError, decrypt_message, encrypt_message
 from .http_app import create_server
+from .persistence import StateFileError, attach_persistence
 from .service import DeviceService
 
 _DEFAULT_BASE_URL = "http://127.0.0.1:8080"
@@ -149,6 +150,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_pull_messages.add_argument("--limit", type=int, default=100)
     p_pull_messages.set_defaults(handler=cmd_pull_messages)
 
+    p_retry = sub.add_parser(
+        "retry-message",
+        help="record a reliable-delivery retry attempt for a message")
+    p_retry.add_argument("session_id")
+    p_retry.add_argument("message_id")
+    p_retry.add_argument("--device-id", required=True)
+    p_retry.add_argument("--attempt-id", required=True)
+    p_retry.set_defaults(handler=cmd_retry_message)
+
+    p_ack = sub.add_parser(
+        "ack-message", help="acknowledge a message for a device")
+    p_ack.add_argument("session_id")
+    p_ack.add_argument("--device-id", required=True)
+    p_ack.add_argument("--message-id", required=True)
+    p_ack.add_argument("--sequence", required=True, type=int)
+    p_ack.set_defaults(handler=cmd_ack_message)
+
+    p_status = sub.add_parser(
+        "message-status", help="show a message's delivery status")
+    p_status.add_argument("session_id")
+    p_status.add_argument("message_id")
+    p_status.add_argument("--device-id", required=True)
+    p_status.set_defaults(handler=cmd_message_status)
+
     p_encrypt = sub.add_parser(
         "encrypt-message",
         help="encrypt a plaintext locally with AES-256-GCM (no server needed)")
@@ -177,8 +202,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
+    p_serve.add_argument(
+        "--data-file", default=None,
+        help="state file path (default: $E2EE_DATA_FILE; otherwise in-memory)")
     p_serve.set_defaults(handler=cmd_serve)
     return parser
+
+
+def _build_serve_service(data_file: Optional[str]) -> DeviceService:
+    """Build the service for ``serve``.
+
+    Uses *data_file* when given, else ``$E2EE_DATA_FILE``, else a purely
+    in-memory store. With a file, its contents are restored at startup and
+    every subsequent change is persisted atomically; a corrupt or
+    wrong-version file makes startup fail with :class:`StateFileError`.
+    """
+    path = data_file or os.environ.get("E2EE_DATA_FILE")
+    service = DeviceService()
+    if path:
+        attach_persistence(service, path)
+    return service
 
 
 def cmd_register(args: argparse.Namespace) -> int:
@@ -320,6 +363,60 @@ def cmd_pull_messages(args: argparse.Namespace) -> int:
     return 0 if status == 200 else 1
 
 
+def cmd_retry_message(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages/{sid}/retry/{mid}; 201 or 200 both succeed."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}/retry/"
+           f"{quote(args.message_id, safe='')}")
+    payload = {"device_id": args.device_id, "attempt_id": args.attempt_id}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_ack_message(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages/{sid}/acks; 201 or 200 both succeed."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}/acks")
+    payload = {"device_id": args.device_id,
+               "message_id": args.message_id,
+               "sequence": args.sequence}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_message_status(args: argparse.Namespace) -> int:
+    """Call GET /v1/messages/{sid}/status/{mid}?device_id=…."""
+    from urllib.parse import quote, urlencode
+
+    query = urlencode({"device_id": args.device_id})
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}/status/"
+           f"{quote(args.message_id, safe='')}?{query}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def _emit_api_response(status: int, response: Any) -> int:
+    """Print a 2xx response on stdout (exit 0), otherwise stderr (exit 1)."""
+    stream = sys.stdout if 200 <= status < 300 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False),
+          file=stream)
+    return 0 if 200 <= status < 300 else 1
+
+
 def _emit_crypto_error(error: CryptoError) -> int:
     """Print a local crypto failure as single-line JSON on stderr; exit 2."""
     print(json.dumps({"message": error.message, "field": error.field},
@@ -358,7 +455,15 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the HTTP server until interrupted."""
-    server, _ = create_server(args.host, args.port, DeviceService())
+    try:
+        service = _build_serve_service(args.data_file)
+    except StateFileError as error:
+        # Corrupt or wrong-version state file: refuse to start cleanly.
+        print(json.dumps({"message": str(error), "field": "data_file"},
+                         separators=(",", ":")),
+              file=sys.stderr)
+        return 1
+    server, _ = create_server(args.host, args.port, service)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

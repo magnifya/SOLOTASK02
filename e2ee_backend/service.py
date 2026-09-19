@@ -5,11 +5,16 @@ stores identifiers and public-key material only.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import is_nonempty_string, load_public_key
 from .models import Device, SignedPreKey
 from .storage import (
+    DELIVERY_BAD_SEQUENCE,
+    DELIVERY_DEVICE_INACTIVE,
+    DELIVERY_DEVICE_MISMATCH,
+    DELIVERY_MESSAGE_UNKNOWN,
+    DELIVERY_SESSION_UNKNOWN,
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
@@ -22,6 +27,7 @@ from .storage import (
     SESSION_RECIPIENT_REVOKED,
     SESSION_RECIPIENT_UNKNOWN,
     DeviceStore,
+    DeliveryError,
     MessageCreateError,
     MessageListError,
     SessionCreateError,
@@ -292,3 +298,97 @@ class DeviceService:
                                    "device_id", status_code=409)
             raise  # pragma: no cover - defensive
         return {"messages": messages, "next_after": next_after}
+
+    # -- reliable delivery -------------------------------------------------
+
+    #: Maps a delivery failure reason to (HTTP status, field name).
+    _DELIVERY_ERROR_MAP = {
+        DELIVERY_SESSION_UNKNOWN: (404, "session_id"),
+        DELIVERY_MESSAGE_UNKNOWN: (404, "message_id"),
+        DELIVERY_DEVICE_INACTIVE: (409, "device_id"),
+        DELIVERY_DEVICE_MISMATCH: (409, "device_id"),
+        DELIVERY_BAD_SEQUENCE: (409, "sequence"),
+    }
+
+    def _delivery_error(self, error: DeliveryError,
+                        session_id: str, message_id: str,
+                        sequence: Optional[int] = None) -> ServiceError:
+        """Translate a storage :class:`DeliveryError` into a ServiceError."""
+        status_code, field = self._DELIVERY_ERROR_MAP[error.reason]
+        if error.reason == DELIVERY_SESSION_UNKNOWN:
+            text = f"session not found: {session_id}"
+        elif error.reason == DELIVERY_MESSAGE_UNKNOWN:
+            text = f"message not found: {message_id}"
+        elif error.reason == DELIVERY_BAD_SEQUENCE:
+            text = f"sequence does not match the message (got {sequence})"
+        else:
+            text = "device_id is not the active recipient of this session"
+        return ServiceError(text, field, status_code=status_code)
+
+    def retry_message(self, session_id: str, message_id: str,
+                      payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and record one delivery attempt for a message.
+
+        Returns ``(body, 201)`` for the first attempt and ``(body, 200)`` for
+        a repeated attempt. A repeated ``attempt_id`` is not counted again;
+        retries after an ack still succeed with status ``acked``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("device_id", "attempt_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        try:
+            view, created = self.store.retry_message(
+                session_id, message_id,
+                payload["device_id"], payload["attempt_id"])
+        except DeliveryError as error:
+            raise self._delivery_error(error, session_id, message_id)
+        return view, 201 if created else 200
+
+    def ack_message(self, session_id: str, payload: object
+                    ) -> Tuple[Dict[str, Any], int]:
+        """Validate and record an acknowledgement.
+
+        The session is taken from the URL; the body carries ``device_id``,
+        ``message_id`` and the integer ``sequence``. The first ack returns 201
+        and marks the message acked; repeated acks return 200 and leave the
+        acked state in place.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("device_id", "message_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if "sequence" not in payload:
+            raise ServiceError("missing required field: sequence", "sequence")
+        sequence = payload["sequence"]
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            raise ServiceError("field must be an integer: sequence", "sequence")
+
+        try:
+            view, first_ack = self.store.ack_message(
+                session_id, payload["message_id"],
+                payload["device_id"], sequence)
+        except DeliveryError as error:
+            raise self._delivery_error(
+                error, session_id, payload["message_id"], sequence)
+        return view, 201 if first_ack else 200
+
+    def message_status(self, session_id: str, message_id: str,
+                       device_id: str) -> Dict[str, Any]:
+        """Return one message's delivery status for its active recipient."""
+        try:
+            return self.store.message_delivery_status(
+                session_id, message_id, device_id)
+        except DeliveryError as error:
+            raise self._delivery_error(error, session_id, message_id)

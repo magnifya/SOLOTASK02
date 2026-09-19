@@ -33,8 +33,30 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_post_message()
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
             self._route_revoke(path)
+        elif path.startswith(_MESSAGES_PATH + "/") and path.endswith("/acks"):
+            self._route_acks(path)
+        elif path.startswith(_MESSAGES_PATH + "/") and "/retry/" in path:
+            self._route_retry(path)
         else:
             self._send_json(404, {"message": f"not found: {path}"})
+
+    def _route_retry(self, path: str) -> None:
+        suffix = path[len(_MESSAGES_PATH) + 1:]
+        parts = suffix.split("/")
+        if len(parts) == 3 and parts[1] == "retry" and parts[0] and parts[2]:
+            self._handle_retry_message(unquote(parts[0]), unquote(parts[2]))
+        else:
+            self._send_json(404, {"message": "session not found",
+                                  "field": "session_id"})
+
+    def _route_acks(self, path: str) -> None:
+        suffix = path[len(_MESSAGES_PATH) + 1:-len("/acks")]
+        parts = suffix.split("/")
+        if len(parts) == 1 and parts[0]:
+            self._handle_ack_message(unquote(parts[0]))
+        else:
+            self._send_json(404, {"message": "session not found",
+                                  "field": "session_id"})
 
     def _route_revoke(self, path: str) -> None:
         # Split on raw slashes only; a percent-encoded slash inside a segment
@@ -69,7 +91,16 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_show_session(unquote(suffix))
         elif path.startswith(_MESSAGES_PATH + "/"):
             suffix = path[len(_MESSAGES_PATH) + 1:]
-            if not suffix or "/" in suffix:
+            if "/" in suffix:
+                parts = suffix.split("/")
+                if len(parts) == 3 and parts[1] == "status" and parts[0] and parts[2]:
+                    self._handle_message_status(
+                        unquote(parts[0]), unquote(parts[2]))
+                else:
+                    self._send_json(404, {"message": "session not found",
+                                          "field": "session_id"})
+                return
+            if not suffix:
                 self._send_json(404, {"message": "session not found",
                                       "field": "session_id"})
                 return
@@ -156,6 +187,55 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(200, body)
+
+    def _handle_retry_message(self, session_id: str, message_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.retry_message(
+                session_id, message_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_ack_message(self, session_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.ack_message(session_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_message_status(self, session_id: str, message_id: str) -> None:
+        device_id = self._required_device_param()
+        if device_id is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.message_status(
+                session_id, message_id, device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _required_device_param(self) -> Optional[str]:
+        """Validate the single required ``device_id`` query parameter.
+
+        Returns the value, or ``None`` after sending 400 when it is missing,
+        empty, or supplied more than once.
+        """
+        query = parse_qs(urlsplit(self.path).query)
+        values = query.get("device_id", [])
+        if len(values) != 1 or not values[0]:
+            self._send_json(400, {"message": "device_id is required",
+                                  "field": "device_id"})
+            return None
+        return values[0]
 
     def _message_query_params(self) -> Optional[Tuple[str, int, int]]:
         """Validate ``device_id``/``after``/``limit`` query parameters.

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List
+from typing import Dict, List, Set
 
 
 def utc_now_iso() -> str:
@@ -57,6 +57,22 @@ class Message:
     nonce: str
     ciphertext: str
     created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class MessageDelivery:
+    """Reliable-delivery state for one stored message of a session.
+
+    Tracks the recipient-side retry attempts (keyed/deduped by the client's
+    non-empty ``attempt_id``), whether the recipient has acknowledged the
+    message, and the per-recipient ack sequence cursor. Only identifiers and
+    counters are kept — never message plaintext or keys.
+    """
+
+    attempts: int = 0
+    attempt_ids: Set[str] = field(default_factory=set)
+    acked: bool = False
+    ack_sequence: int = 0
 
 
 @dataclass
