@@ -38,3 +38,24 @@ class Device:
     registered_at: str = field(default_factory=utc_now_iso)
     prekeys: List[SignedPreKey] = field(default_factory=list)
     revoked: bool = False
+
+
+@dataclass
+class Session:
+    """A negotiated session between an initiator and a recipient device.
+
+    Only public material is captured: the ephemeral public key sent by the
+    initiator, the recipient's identity public key, and the public key of the
+    signed pre-key that was used. Shared secrets, private keys and plaintext
+    messages are never stored. The snapshot is immutable once created, so a
+    later revocation does not alter it.
+    """
+
+    session_id: str
+    initiator_device_id: str
+    recipient_device_id: str
+    prekey_id: str
+    ephemeral_key: str
+    identity_key: str
+    public_key: str
+    created_at: str = field(default_factory=utc_now_iso)

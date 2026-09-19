@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-from .models import Device
+from .models import Device, Session
 
 
 class DeviceStore:
@@ -23,6 +23,7 @@ class DeviceStore:
         self._lock = threading.RLock()
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
+        self._sessions: Dict[str, Session] = {}
 
     def add_device(self, device: Device) -> bool:
         """Insert a device.
@@ -115,4 +116,58 @@ class DeviceStore:
                 "prekey_ids": [pk.key_id for pk in device.prekeys
                                if not pk.revoked],
                 "registered_at": device.registered_at,
+            }
+
+    # -- sessions ----------------------------------------------------------
+
+    def create_session(self, session: Session) -> Optional[Tuple[str, int]]:
+        """Validate and insert a session atomically.
+
+        Returns ``None`` on success; otherwise ``(field, status_code)``
+        describing the failure (404 for unknown device/pre-key, 409 for
+        revoked device/pre-key) and stores nothing. The whole check-and-insert
+        runs under the same lock as revocation, so a session either observes
+        the pre-revocation state (and is kept) or the post-revocation state
+        (and fails) — never an intermediate one.
+        """
+        with self._lock:
+            initiator = self._devices.get(
+                self._device_index.get(session.initiator_device_id, ("", "")))
+            if initiator is None:
+                return ("initiator_device_id", 404)
+            recipient = self._devices.get(
+                self._device_index.get(session.recipient_device_id, ("", "")))
+            if recipient is None:
+                return ("recipient_device_id", 404)
+            prekey = next((pk for pk in recipient.prekeys
+                           if pk.key_id == session.prekey_id), None)
+            if prekey is None:
+                return ("prekey_id", 404)
+            if initiator.revoked:
+                return ("initiator_device_id", 409)
+            if recipient.revoked:
+                return ("recipient_device_id", 409)
+            if prekey.revoked:
+                return ("prekey_id", 409)
+            # Copy public material so the snapshot survives later revocation.
+            session.identity_key = recipient.identity_key
+            session.public_key = prekey.public_key
+            self._sessions[session.session_id] = session
+            return None
+
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the immutable session snapshot, or ``None`` when unknown."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            return {
+                "initiator_device_id": session.initiator_device_id,
+                "recipient_device_id": session.recipient_device_id,
+                "prekey_id": session.prekey_id,
+                "ephemeral_key": session.ephemeral_key,
+                "session_id": session.session_id,
+                "identity_key": session.identity_key,
+                "public_key": session.public_key,
+                "created_at": session.created_at,
             }

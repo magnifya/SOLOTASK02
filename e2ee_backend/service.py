@@ -5,13 +5,16 @@ stores identifiers and public-key material only.
 """
 from __future__ import annotations
 
+import uuid
 from typing import Any, Dict, List, Optional
 
 from .crypto import is_nonempty_string, load_public_key
-from .models import Device, SignedPreKey
+from .models import Device, Session, SignedPreKey
 from .storage import DeviceStore
 
 _REQUIRED_SCALAR_FIELDS = ("user_id", "device_id", "identity_key")
+_SESSION_SCALAR_FIELDS = (
+    "initiator_device_id", "recipient_device_id", "prekey_id", "ephemeral_key")
 
 
 class ServiceError(Exception):
@@ -108,6 +111,58 @@ class DeviceService:
         if view is None:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
+        return view
+
+    # -- sessions ----------------------------------------------------------
+
+    def create_session(self, payload: object) -> Dict[str, Any]:
+        """Validate a session-negotiation payload and persist the session.
+
+        Returns the 201 body: the four request fields echoed back plus
+        ``session_id``, ``identity_key``, ``public_key`` and ``created_at``.
+        Nothing is stored when validation fails.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object", "request_body")
+
+        for name in _SESSION_SCALAR_FIELDS:
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(f"field must be a non-empty string: {name}", name)
+
+        if load_public_key(payload["ephemeral_key"]) is None:
+            raise ServiceError("field is not a valid public key: ephemeral_key",
+                               "ephemeral_key")
+
+        if payload["initiator_device_id"] == payload["recipient_device_id"]:
+            raise ServiceError(
+                "initiator and recipient must be different devices",
+                "recipient_device_id")
+
+        session = Session(
+            session_id=uuid.uuid4().hex,
+            initiator_device_id=payload["initiator_device_id"],
+            recipient_device_id=payload["recipient_device_id"],
+            prekey_id=payload["prekey_id"],
+            ephemeral_key=payload["ephemeral_key"],
+            identity_key="",
+            public_key="",
+        )
+        problem = self.store.create_session(session)
+        if problem is not None:
+            field, status_code = problem
+            if status_code == 404:
+                raise ServiceError(f"not found: {field}", field, status_code=404)
+            raise ServiceError(f"revoked: {field}", field, status_code=409)
+        return self.store.get_session(session.session_id)  # type: ignore[return-value]
+
+    def get_session(self, session_id: str) -> Dict[str, Any]:
+        """Return the session snapshot; raise :class:`ServiceError` if absent."""
+        view = self.store.get_session(session_id)
+        if view is None:
+            raise ServiceError(f"session not found: {session_id}",
+                               "session_id", status_code=404)
         return view
 
     # -- revocation --------------------------------------------------------

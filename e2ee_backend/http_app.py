@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlsplit
 from .service import DeviceService, ServiceError
 
 _DEVICES_PATH = "/v1/devices"
+_SESSIONS_PATH = "/v1/sessions"
 
 
 class DeviceHTTPHandler(BaseHTTPRequestHandler):
@@ -22,6 +23,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == _DEVICES_PATH:
             self._handle_register()
+        elif path == _SESSIONS_PATH:
+            self._handle_create_session()
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
             self._route_revoke(path)
         else:
@@ -51,32 +54,67 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                       "field": "device_id"})
                 return
             self._handle_show(unquote(suffix))
+        elif path.startswith(_SESSIONS_PATH + "/"):
+            suffix = path[len(_SESSIONS_PATH) + 1:]
+            if not suffix or "/" in suffix:
+                self._send_json(404, {"message": "session not found",
+                                      "field": "session_id"})
+                return
+            self._handle_show_session(unquote(suffix))
         else:
             self._send_json(404, {"message": f"not found: {path}"})
 
     # -- handlers ---------------------------------------------------------
 
-    def _handle_register(self) -> None:
+    def _read_json_body(self) -> Tuple[bool, Any]:
+        """Read and parse the request body.
+
+        Returns ``(True, payload)`` on success; on failure sends the 400
+        response itself and returns ``(False, None)``.
+        """
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             self._send_json(400, {"message": "invalid Content-Length header",
                                   "field": "Content-Length"})
-            return
+            return False, None
         raw = self.rfile.read(length) if length > 0 else b""
         try:
-            payload = json.loads(raw.decode("utf-8")) if raw else None
+            return True, json.loads(raw.decode("utf-8")) if raw else None
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._send_json(400, {"message": "request body must be valid JSON",
                                   "field": "request_body"})
-            return
+            return False, None
 
+    def _handle_register(self) -> None:
+        ok, payload = self._read_json_body()
+        if not ok:
+            return
         try:
             body = self.service.register(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(201, body)
+
+    def _handle_create_session(self) -> None:
+        ok, payload = self._read_json_body()
+        if not ok:
+            return
+        try:
+            body = self.service.create_session(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(201, body)
+
+    def _handle_show_session(self, session_id: str) -> None:
+        try:
+            body = self.service.get_session(session_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
 
     def _handle_show(self, device_id: str) -> None:
         try:
