@@ -30,10 +30,15 @@ class SignedPreKey:
 
 @dataclass
 class Device:
-    """A registered device belonging to a user."""
+    """A registered device belonging to a user.
+
+    A revoked device stays stored (its identity key and registration time
+    remain queryable) but publishes no active pre-keys.
+    """
 
     user_id: str
     device_id: str
     identity_key: str
     registered_at: str = field(default_factory=utc_now_iso)
     prekeys: List[SignedPreKey] = field(default_factory=list)
+    revoked: bool = False

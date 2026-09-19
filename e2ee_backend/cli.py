@@ -17,6 +17,11 @@ from .http_app import create_server
 from .service import DeviceService
 
 _DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+_REQUEST_TIMEOUT = 10.0
+
+
+class ServerUnreachable(Exception):
+    """The server could not be reached (connection failure or timeout)."""
 
 
 def _read_key_argument(value: str) -> str:
@@ -55,7 +60,7 @@ def _request_json(method: str, url: str, body: Any = None) -> Tuple[int, Any]:
         headers["Content-Type"] = "application/json"
     req = urllib_request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib_request.urlopen(req) as response:
+        with urllib_request.urlopen(req, timeout=_REQUEST_TIMEOUT) as response:
             status = response.status
             raw = response.read().decode("utf-8")
     except urllib_error.HTTPError as http_error:
@@ -64,7 +69,18 @@ def _request_json(method: str, url: str, body: Any = None) -> Tuple[int, Any]:
             return http_error.code, json.loads(raw)
         except json.JSONDecodeError:
             return http_error.code, {"message": raw}
+    except (urllib_error.URLError, OSError) as error:
+        raise ServerUnreachable(str(error)) from error
     return status, json.loads(raw)
+
+
+def _print_server_error(error: ServerUnreachable) -> int:
+    """Report a connection failure as single-line JSON on stderr."""
+    print(json.dumps({"message": f"server unreachable: {error}",
+                      "field": "server"}, separators=(",", ":"),
+                     ensure_ascii=False),
+          file=sys.stderr)
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,6 +108,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("device_id")
     p_show.set_defaults(handler=cmd_show)
 
+    p_revoke_device = sub.add_parser(
+        "revoke-device", help="revoke a device (publishes no pre-keys afterwards)")
+    p_revoke_device.add_argument("--device-id", required=True)
+    p_revoke_device.set_defaults(handler=cmd_revoke_device)
+
+    p_revoke_prekey = sub.add_parser(
+        "revoke-prekey", help="revoke one signed pre-key of a device")
+    p_revoke_prekey.add_argument("--device-id", required=True)
+    p_revoke_prekey.add_argument("--key-id", required=True)
+    p_revoke_prekey.set_defaults(handler=cmd_revoke_prekey)
+
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
@@ -114,8 +141,11 @@ def cmd_register(args: argparse.Namespace) -> int:
         "identity_key": _read_key_argument(args.identity_key),
         "signed_prekeys": prekeys,
     }
-    status, response = _request_json("POST", f"{args.base_url}/v1/devices",
-                                     body=payload)
+    try:
+        status, response = _request_json("POST", f"{args.base_url}/v1/devices",
+                                         body=payload)
+    except ServerUnreachable as error:
+        return _print_server_error(error)
     stream = sys.stdout if status == 201 else sys.stderr
     print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
     return 0 if status == 201 else 1
@@ -126,7 +156,39 @@ def cmd_show(args: argparse.Namespace) -> int:
     from urllib.parse import quote
 
     url = f"{args.base_url}/v1/devices/{quote(args.device_id, safe='')}"
-    status, response = _request_json("GET", url)
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnreachable as error:
+        return _print_server_error(error)
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def cmd_revoke_device(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/{device_id}/revoke and print the JSON response."""
+    from urllib.parse import quote
+
+    url = f"{args.base_url}/v1/devices/{quote(args.device_id, safe='')}/revoke"
+    try:
+        status, response = _request_json("POST", url)
+    except ServerUnreachable as error:
+        return _print_server_error(error)
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def cmd_revoke_prekey(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/{device_id}/prekeys/{key_id}/revoke."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/devices/{quote(args.device_id, safe='')}"
+           f"/prekeys/{quote(args.key_id, safe='')}/revoke")
+    try:
+        status, response = _request_json("POST", url)
+    except ServerUnreachable as error:
+        return _print_server_error(error)
     stream = sys.stdout if status == 200 else sys.stderr
     print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
     return 0 if status == 200 else 1

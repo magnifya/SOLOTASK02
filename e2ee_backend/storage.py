@@ -50,9 +50,38 @@ class DeviceStore:
             return self._devices.get(key) if key is not None else None
 
     def active_prekey_ids(self, device: Device) -> List[str]:
-        """Return key ids of non-revoked pre-keys, in stable insertion order."""
+        """Return key ids of non-revoked pre-keys, in stable insertion order.
+
+        A revoked device publishes no pre-keys at all.
+        """
         with self._lock:
+            if device.revoked:
+                return []
             return [pk.key_id for pk in device.prekeys if not pk.revoked]
+
+    def snapshot_device(self, device_id: str) -> Optional[dict]:
+        """Return a consistent public snapshot of the device, or ``None``.
+
+        The lookup and the pre-key listing happen under one lock hold, so a
+        concurrent revoke is observed either fully before or fully after.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                return None
+            prekey_ids = ([] if device.revoked else
+                          [pk.key_id for pk in device.prekeys if not pk.revoked])
+            return {
+                "identity_key": device.identity_key,
+                "prekey_ids": prekey_ids,
+                "registered_at": device.registered_at,
+            }
+
+    def revoke_device(self, device: Device) -> None:
+        """Mark the whole device revoked. Idempotent."""
+        with self._lock:
+            device.revoked = True
 
     def revoke_prekey(self, device: Device, key_id: str) -> bool:
         """Mark one of the device's pre-keys revoked. Return ``False`` if absent."""

@@ -104,12 +104,30 @@ class DeviceService:
 
     def get_device(self, device_id: str) -> Dict[str, Any]:
         """Return the public device record; raise :class:`ServiceError` if absent."""
+        snapshot = self.store.snapshot_device(device_id)
+        if snapshot is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return snapshot
+
+    # -- revocation --------------------------------------------------------
+
+    def revoke_device(self, device_id: str) -> Dict[str, Any]:
+        """Revoke a whole device. Idempotent: repeat calls succeed identically."""
         device = self.store.find_by_device_id(device_id)
         if device is None:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
-        return {
-            "identity_key": device.identity_key,
-            "prekey_ids": self.store.active_prekey_ids(device),
-            "registered_at": device.registered_at,
-        }
+        self.store.revoke_device(device)
+        return {"device_id": device_id, "revoked": True}
+
+    def revoke_prekey(self, device_id: str, key_id: str) -> Dict[str, Any]:
+        """Revoke one pre-key of a device. Idempotent on repeat calls."""
+        device = self.store.find_by_device_id(device_id)
+        if device is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        if not self.store.revoke_prekey(device, key_id):
+            raise ServiceError(f"prekey not found: {key_id}",
+                               "key_id", status_code=404)
+        return {"device_id": device_id, "key_id": key_id, "revoked": True}
