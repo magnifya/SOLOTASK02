@@ -10,7 +10,7 @@ import threading
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from .models import Device, Session
+from .models import Device, Message, Session
 
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
@@ -20,9 +20,34 @@ SESSION_INITIATOR_REVOKED = "initiator_revoked"
 SESSION_RECIPIENT_REVOKED = "recipient_revoked"
 SESSION_PREKEY_REVOKED = "prekey_revoked"
 
+#: Outcome codes for a failed atomic message append.
+MESSAGE_SESSION_UNKNOWN = "session_unknown"
+MESSAGE_SENDER_INACTIVE = "sender_inactive"
+MESSAGE_DUPLICATE_ID = "duplicate_message_id"
+MESSAGE_BAD_SEQUENCE = "bad_sequence"
+
+#: Outcome code for a failed message listing.
+MESSAGE_DEVICE_INACTIVE = "device_inactive"
+
 
 class SessionCreateError(Exception):
     """An atomic session lookup/revocation check failed (nothing was written)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class MessageCreateError(Exception):
+    """An atomic message append check failed (nothing was written)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class MessageListError(Exception):
+    """An atomic message listing check failed."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -41,6 +66,7 @@ class DeviceStore:
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
+        self._messages: Dict[str, List[Message]] = {}
 
     def add_device(self, device: Device) -> bool:
         """Insert a device.
@@ -203,3 +229,84 @@ class DeviceStore:
                 "public_key": session.public_key,
                 "created_at": session.created_at,
             }
+
+    # -- messages ----------------------------------------------------------
+
+    @staticmethod
+    def message_view(message: Message) -> Dict[str, Any]:
+        """Copy one message envelope into its public seven-field view."""
+        return {
+            "session_id": message.session_id,
+            "sender_device_id": message.sender_device_id,
+            "message_id": message.message_id,
+            "sequence": message.sequence,
+            "nonce": message.nonce,
+            "ciphertext": message.ciphertext,
+            "created_at": message.created_at,
+        }
+
+    def append_message(self, session_id: str, sender_device_id: str,
+                       message_id: str, sequence: int, nonce: str,
+                       ciphertext: str) -> Message:
+        """Atomically validate and append one message to a session's stream.
+
+        The session lookup, sender revocation check, duplicate-id check and
+        sequence-continuity check all happen while holding the store lock (the
+        same lock device revocations take), so a concurrent revocation is
+        linearized either wholly before this call (then it fails) or wholly
+        after it (then the message is retained). On any failure nothing is
+        written and :class:`MessageCreateError` carries the reason.
+        """
+        with self._lock:
+            if session_id not in self._sessions:
+                raise MessageCreateError(MESSAGE_SESSION_UNKNOWN)
+
+            sender_key = self._device_index.get(sender_device_id)
+            sender = (self._devices.get(sender_key)
+                      if sender_key is not None else None)
+            if sender is None or sender.revoked:
+                raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
+
+            stream = self._messages.setdefault(session_id, [])
+            if any(m.message_id == message_id for m in stream):
+                raise MessageCreateError(MESSAGE_DUPLICATE_ID)
+            expected = stream[-1].sequence + 1 if stream else 1
+            if sequence != expected:
+                raise MessageCreateError(MESSAGE_BAD_SEQUENCE)
+
+            message = Message(
+                session_id=session_id,
+                sender_device_id=sender_device_id,
+                message_id=message_id,
+                sequence=sequence,
+                nonce=nonce,
+                ciphertext=ciphertext,
+            )
+            stream.append(message)
+            return message
+
+    def message_page(self, session_id: str, device_id: str, after: int,
+                     limit: int) -> Tuple[List[Dict[str, Any]], int]:
+        """Atomically read one ascending page of a session's messages.
+
+        Returns ``(message_views, next_after)``: the envelopes with
+        ``sequence > after`` (ascending, at most *limit*) and the sequence to
+        resume from — the last returned sequence, or *after* itself when the
+        page is empty. The session lookup and the reader's revocation check
+        run under the store lock, so a concurrent revocation is linearized
+        either wholly before (then it fails) or wholly after this call.
+        """
+        with self._lock:
+            if session_id not in self._sessions:
+                raise MessageListError(MESSAGE_SESSION_UNKNOWN)
+
+            device_key = self._device_index.get(device_id)
+            device = (self._devices.get(device_key)
+                      if device_key is not None else None)
+            if device is None or device.revoked:
+                raise MessageListError(MESSAGE_DEVICE_INACTIVE)
+
+            stream = self._messages.get(session_id, [])
+            page = [m for m in stream if m.sequence > after][:limit]
+            next_after = page[-1].sequence if page else after
+            return [self.message_view(m) for m in page], next_after

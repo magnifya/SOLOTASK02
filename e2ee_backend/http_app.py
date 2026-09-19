@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional, Tuple
-from urllib.parse import unquote, urlsplit
+from typing import Any, Dict, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .service import DeviceService, ServiceError
 
 _DEVICES_PATH = "/v1/devices"
 _SESSIONS_PATH = "/v1/sessions"
+_MESSAGES_PATH = "/v1/messages"
 
 #: Sentinel meaning a 400 for a malformed body was already sent.
 _BAD_REQUEST = object()
@@ -28,6 +29,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_register()
         elif path == _SESSIONS_PATH:
             self._handle_create_session()
+        elif path == _MESSAGES_PATH:
+            self._handle_post_message()
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
             self._route_revoke(path)
         else:
@@ -64,6 +67,13 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                       "field": "session_id"})
                 return
             self._handle_show_session(unquote(suffix))
+        elif path.startswith(_MESSAGES_PATH + "/"):
+            suffix = path[len(_MESSAGES_PATH) + 1:]
+            if not suffix or "/" in suffix:
+                self._send_json(404, {"message": "session not found",
+                                      "field": "session_id"})
+                return
+            self._handle_list_messages(unquote(suffix))
         else:
             self._send_json(404, {"message": f"not found: {path}"})
 
@@ -122,6 +132,77 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(200, body)
+
+    def _handle_post_message(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.post_message(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(201, body)
+
+    def _handle_list_messages(self, session_id: str) -> None:
+        params = self._message_query_params()
+        if params is None:
+            return  # a 400 response was already sent
+        device_id, after, limit = params
+        try:
+            body = self.service.list_messages(session_id, device_id,
+                                              after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _message_query_params(self) -> Optional[Tuple[str, int, int]]:
+        """Validate ``device_id``/``after``/``limit`` query parameters.
+
+        Returns ``(device_id, after, limit)``, or ``None`` after sending the
+        400 response itself when a parameter is missing or malformed.
+        """
+        query = parse_qs(urlsplit(self.path).query)
+
+        device_ids = query.get("device_id", [])
+        if len(device_ids) != 1 or not device_ids[0]:
+            self._send_json(400, {"message": "device_id is required",
+                                  "field": "device_id"})
+            return None
+
+        after = self._int_param(query, "after", default=0, minimum=0)
+        if after is None:
+            return None
+        limit = self._int_param(query, "limit", default=100,
+                                minimum=1, maximum=100)
+        if limit is None:
+            return None
+        return device_ids[0], after, limit
+
+    def _int_param(self, query: Dict[str, list], name: str, default: int,
+                   minimum: int, maximum: Optional[int] = None
+                   ) -> Optional[int]:
+        """Parse one integer query parameter; send a 400 and return ``None``
+        when it is missing its single value, malformed, or out of range."""
+        values = query.get(name)
+        if not values:
+            return default
+        if len(values) != 1:
+            self._send_json(400, {"message": f"{name} must appear at most once",
+                                  "field": name})
+            return None
+        try:
+            value = int(values[0])
+        except ValueError:
+            self._send_json(400, {"message": f"{name} must be an integer",
+                                  "field": name})
+            return None
+        if value < minimum or (maximum is not None and value > maximum):
+            self._send_json(400, {"message": f"{name} is out of range",
+                                  "field": name})
+            return None
+        return value
 
     # -- plumbing ---------------------------------------------------------
 

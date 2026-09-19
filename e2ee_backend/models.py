@@ -41,6 +41,25 @@ class Device:
 
 
 @dataclass
+class Message:
+    """An encrypted message envelope stored inside a session.
+
+    Only the ciphertext and its metadata are retained: the server never sees
+    plaintext and never holds the keys that could produce it. ``sequence`` is
+    the sender-chosen position in the session's message stream (starting at 1,
+    strictly consecutive); ``created_at`` is the server's receive timestamp.
+    """
+
+    session_id: str
+    sender_device_id: str
+    message_id: str
+    sequence: int
+    nonce: str
+    ciphertext: str
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class Session:
     """An immutable snapshot of a negotiated session.
 

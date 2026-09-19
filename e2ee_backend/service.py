@@ -10,6 +10,11 @@ from typing import Any, Dict, List, Optional
 from .crypto import is_nonempty_string, load_public_key
 from .models import Device, SignedPreKey
 from .storage import (
+    MESSAGE_BAD_SEQUENCE,
+    MESSAGE_DEVICE_INACTIVE,
+    MESSAGE_DUPLICATE_ID,
+    MESSAGE_SENDER_INACTIVE,
+    MESSAGE_SESSION_UNKNOWN,
     SESSION_INITIATOR_REVOKED,
     SESSION_INITIATOR_UNKNOWN,
     SESSION_PREKEY_REVOKED,
@@ -17,12 +22,24 @@ from .storage import (
     SESSION_RECIPIENT_REVOKED,
     SESSION_RECIPIENT_UNKNOWN,
     DeviceStore,
+    MessageCreateError,
+    MessageListError,
     SessionCreateError,
 )
 
 _REQUIRED_SCALAR_FIELDS = ("user_id", "device_id", "identity_key")
 _SESSION_SCALAR_FIELDS = (
     "initiator_device_id", "recipient_device_id", "prekey_id", "ephemeral_key")
+_MESSAGE_STRING_FIELDS = (
+    "session_id", "sender_device_id", "message_id", "nonce", "ciphertext")
+
+#: Maps a storage-level message-append failure reason to (HTTP status, field).
+_MESSAGE_CREATE_ERROR_MAP = {
+    MESSAGE_SESSION_UNKNOWN: (404, "session_id"),
+    MESSAGE_SENDER_INACTIVE: (409, "sender_device_id"),
+    MESSAGE_DUPLICATE_ID: (409, "message_id"),
+    MESSAGE_BAD_SEQUENCE: (409, "sequence"),
+}
 
 #: Maps a storage-level session failure reason to (HTTP status, field name).
 _SESSION_ERROR_MAP = {
@@ -208,3 +225,70 @@ class DeviceService:
             raise ServiceError(f"session not found: {session_id}",
                                "session_id", status_code=404)
         return view
+
+    # -- messages ----------------------------------------------------------
+
+    def post_message(self, payload: object) -> Dict[str, Any]:
+        """Validate a message-send payload and atomically append the message.
+
+        ``sequence`` must continue the session's stream (starting at 1, no
+        gaps or duplicates) and ``message_id`` must be unique within the
+        session; violations are 409s, as is a revoked/unknown sender device.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+
+        for name in _MESSAGE_STRING_FIELDS:
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        if "sequence" not in payload:
+            raise ServiceError("missing required field: sequence", "sequence")
+        sequence = payload["sequence"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            raise ServiceError("field must be an integer: sequence", "sequence")
+
+        try:
+            message = self.store.append_message(
+                payload["session_id"],
+                payload["sender_device_id"],
+                payload["message_id"],
+                sequence,
+                payload["nonce"],
+                payload["ciphertext"])
+        except MessageCreateError as error:
+            status_code, field = _MESSAGE_CREATE_ERROR_MAP[error.reason]
+            if error.reason == MESSAGE_SESSION_UNKNOWN:
+                message_text = f"session not found: {payload['session_id']}"
+            elif error.reason == MESSAGE_SENDER_INACTIVE:
+                message_text = "sender_device_id is not an active device"
+            elif error.reason == MESSAGE_DUPLICATE_ID:
+                message_text = (f"message_id already exists in session: "
+                                f"{payload['message_id']}")
+            else:
+                message_text = (f"sequence must continue the session stream "
+                                f"(got {sequence})")
+            raise ServiceError(message_text, field, status_code=status_code)
+
+        return self.store.message_view(message)
+
+    def list_messages(self, session_id: str, device_id: str, after: int,
+                      limit: int) -> Dict[str, Any]:
+        """Return one page of a session's messages plus the resume cursor."""
+        try:
+            messages, next_after = self.store.message_page(
+                session_id, device_id, after, limit)
+        except MessageListError as error:
+            if error.reason == MESSAGE_SESSION_UNKNOWN:
+                raise ServiceError(f"session not found: {session_id}",
+                                   "session_id", status_code=404)
+            if error.reason == MESSAGE_DEVICE_INACTIVE:
+                raise ServiceError("device_id is not an active device",
+                                   "device_id", status_code=409)
+            raise  # pragma: no cover - defensive
+        return {"messages": messages, "next_after": next_after}

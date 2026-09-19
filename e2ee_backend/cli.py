@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from .crypto import CryptoError, decrypt_message, encrypt_message
 from .http_app import create_server
 from .service import DeviceService
 
@@ -130,6 +131,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_show_session.add_argument("session_id")
     p_show_session.set_defaults(handler=cmd_show_session)
 
+    p_send_message = sub.add_parser(
+        "send-message", help="send an encrypted message envelope into a session")
+    p_send_message.add_argument("--session-id", required=True)
+    p_send_message.add_argument("--sender-device-id", required=True)
+    p_send_message.add_argument("--message-id", required=True)
+    p_send_message.add_argument("--sequence", required=True, type=int)
+    p_send_message.add_argument("--nonce", required=True)
+    p_send_message.add_argument("--ciphertext", required=True)
+    p_send_message.set_defaults(handler=cmd_send_message)
+
+    p_pull_messages = sub.add_parser(
+        "pull-messages", help="pull a page of messages from a session")
+    p_pull_messages.add_argument("session_id")
+    p_pull_messages.add_argument("--device-id", required=True)
+    p_pull_messages.add_argument("--after", type=int, default=0)
+    p_pull_messages.add_argument("--limit", type=int, default=100)
+    p_pull_messages.set_defaults(handler=cmd_pull_messages)
+
+    p_encrypt = sub.add_parser(
+        "encrypt-message",
+        help="encrypt a plaintext locally with AES-256-GCM (no server needed)")
+    p_encrypt.add_argument("--session-id", required=True)
+    p_encrypt.add_argument(
+        "--key", required=True,
+        help="base64-encoded 32-byte AES key, or @path to read it from a file")
+    p_encrypt.add_argument(
+        "--plaintext", required=True,
+        help="UTF-8 plaintext, or @path to read it from a file")
+    p_encrypt.set_defaults(handler=cmd_encrypt_message)
+
+    p_decrypt = sub.add_parser(
+        "decrypt-message",
+        help="decrypt an AES-256-GCM payload locally (no server needed)")
+    p_decrypt.add_argument("--session-id", required=True)
+    p_decrypt.add_argument(
+        "--key", required=True,
+        help="base64-encoded 32-byte AES key, or @path to read it from a file")
+    p_decrypt.add_argument("--nonce", required=True,
+                           help="base64-encoded 12-byte nonce")
+    p_decrypt.add_argument("--ciphertext", required=True,
+                           help="base64-encoded ciphertext with appended GCM tag")
+    p_decrypt.set_defaults(handler=cmd_decrypt_message)
+
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
@@ -237,6 +281,79 @@ def cmd_show_session(args: argparse.Namespace) -> int:
     stream = sys.stdout if status == 200 else sys.stderr
     print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
     return 0 if status == 200 else 1
+
+
+def cmd_send_message(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages and print the single-line JSON response."""
+    payload = {
+        "session_id": args.session_id,
+        "sender_device_id": args.sender_device_id,
+        "message_id": args.message_id,
+        "sequence": args.sequence,
+        "nonce": args.nonce,
+        "ciphertext": args.ciphertext,
+    }
+    try:
+        status, response = _request_json("POST", f"{args.base_url}/v1/messages",
+                                         body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 201 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 201 else 1
+
+
+def cmd_pull_messages(args: argparse.Namespace) -> int:
+    """Call GET /v1/messages/{session_id} and print the single-line JSON."""
+    from urllib.parse import quote, urlencode
+
+    query = urlencode({"device_id": args.device_id,
+                       "after": args.after, "limit": args.limit})
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}?{query}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def _emit_crypto_error(error: CryptoError) -> int:
+    """Print a local crypto failure as single-line JSON on stderr; exit 2."""
+    print(json.dumps({"message": error.message, "field": error.field},
+                     separators=(",", ":")),
+          file=sys.stderr)
+    return 2
+
+
+def cmd_encrypt_message(args: argparse.Namespace) -> int:
+    """Encrypt locally and print ``session_id``/``nonce``/``ciphertext``."""
+    try:
+        result = encrypt_message(args.session_id,
+                                 _read_key_argument(args.key),
+                                 _read_key_argument(args.plaintext))
+    except OSError as error:
+        return _emit_crypto_error(CryptoError(str(error), "plaintext"))
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def cmd_decrypt_message(args: argparse.Namespace) -> int:
+    """Decrypt locally and print ``session_id``/``plaintext``."""
+    try:
+        result = decrypt_message(args.session_id,
+                                 _read_key_argument(args.key),
+                                 args.nonce, args.ciphertext)
+    except OSError as error:
+        return _emit_crypto_error(CryptoError(str(error), "key"))
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

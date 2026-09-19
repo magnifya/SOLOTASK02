@@ -17,6 +17,10 @@
 - `GET /v1/sessions/{session_id}`：返回与创建时一致的八字段快照；未知会话 `404/field=session_id`。快照创建后冻结，设备/预密钥撤销不改变它。
 - 会话创建与设备/预密钥撤销共享同一把锁、线性化执行：撤销先行则创建得 `409` 且不写，创建先行则得 `201` 且会话保留，不存在中间态。
 - 撤销与查询共享同一把锁、线性化执行：并发的 `GET` 只能看到某次撤销操作前或后的完整快照，不会观察到中间态。
+- `POST /v1/messages`：向会话投递加密消息信封。请求体含 `session_id`、`sender_device_id`、`message_id`、`sequence`、`nonce`、`ciphertext`；`sequence` 从 1 开始逐条连续。未知会话 `404/field=session_id`；发送方设备不存在或已撤销 `409/field=sender_device_id`；`message_id` 在会话内重复 `409/field=message_id`；序号不连续 `409/field=sequence`；字段缺失或类型错误 `400/field=对应字段`。成功 `201`，响应为完整信封（六入参回显）加 `created_at`（UTC ISO-8601，`+00:00`）。失败不写入任何消息，序号游标不前进。
+- `GET /v1/messages/{session_id}`：分页拉取会话消息。查询参数 `device_id` 必填，`after` 默认 0（须 ≥0），`limit` 默认 100（1..100）；未知会话 `404/field=session_id`，`device_id` 非活跃设备 `409/field=device_id`，参数缺失/非法 `400/field=对应参数`。返回 `messages`（与 POST 响应同构的信封数组，筛 `sequence > after` 升序）与 `next_after`（空页等于 `after`，否则为末条序号）。消息读取与设备撤销共享同一把锁，不观察中间态；已存消息在发送方被撤销后仍可读取。
+- 命令行 `send-message` / `pull-messages` 与上述两个接口一一对应，同样打印单行 JSON。
+- 命令行 `encrypt-message` / `decrypt-message` 为纯本地 AES-256-GCM 加解密（不访问服务器）：`--session-id`、`--key`（base64 编码的 32 字节密钥）、`--plaintext`（UTF-8）→ 输出 `session_id`/`nonce`（12 字节，base64）/`ciphertext`（base64，末尾附 16 字节 GCM tag）；`decrypt-message` 额外接收 `--nonce`/`--ciphertext` → 输出 `session_id`/`plaintext`。`session_id` 的 UTF-8 字节作为 AAD 参与认证。任何失败在 stderr 打印带 `field` 的单行 JSON 并以非零码退出。
 - 服务端仅保存标识与公开密钥（identity key、signed pre-key、临时公钥均为公钥），不保存私钥、共享秘密或明文消息。存储为进程内、线程安全。
 
 ## 安装依赖
@@ -70,6 +74,28 @@ python3 -m e2ee_backend create-session \
 # 查询会话快照
 python3 -m e2ee_backend show-session SESSION_ID
 # => 同样的八个字段，单行 JSON
+
+# 投递加密消息信封（sequence 从 1 开始逐条连续）
+python3 -m e2ee_backend send-message \
+  --session-id SESSION_ID --sender-device-id laptop \
+  --message-id msg-1 --sequence 1 \
+  --nonce BASE64_NONCE --ciphertext BASE64_CIPHERTEXT
+# => {"session_id":"…","sender_device_id":"laptop","message_id":"msg-1",
+#     "sequence":1,"nonce":"…","ciphertext":"…",
+#     "created_at":"2026-09-19T10:13:01.123456+00:00"}
+
+# 分页拉取会话消息（--after 默认 0，--limit 默认 100）
+python3 -m e2ee_backend pull-messages SESSION_ID --device-id phone --after 0 --limit 100
+# => {"messages":[…],"next_after":1}
+
+# 本地 AES-256-GCM 加解密（不访问服务器；--key 为 base64 编码的 32 字节密钥）
+python3 -m e2ee_backend encrypt-message \
+  --session-id SESSION_ID --key BASE64_32BYTE_KEY --plaintext "hello"
+# => {"session_id":"…","nonce":"…","ciphertext":"…"}   # nonce 12B，ciphertext 附 16B tag
+python3 -m e2ee_backend decrypt-message \
+  --session-id SESSION_ID --key BASE64_32BYTE_KEY \
+  --nonce BASE64_NONCE --ciphertext BASE64_CIPHERTEXT
+# => {"session_id":"…","plaintext":"hello"}
 ```
 
 默认服务地址为 `http://127.0.0.1:8080`，可用全局参数 `--base-url` 或环境变量 `E2EE_BASE_URL` 覆盖。
@@ -80,17 +106,17 @@ python3 -m e2ee_backend show-session SESSION_ID
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：公钥解析、注册成功/409 冲突/各类 400（指明字段）、查询/404、`prekey_ids` 顺序稳定与撤销过滤、设备与单预密钥撤销（200、幂等、404 及对应 field、同用户设备隔离）、撤销与查询并发线性化、会话协商成功（八字段、四入参回显、接收方公钥、唯一 session_id、重复 POST 新建）、会话各类 400/404/409（对应 field、失败不写）、会话快照在撤销后不变、创建与撤销并发原子线性化（撤销先行 409/创建先行 201 两种顺序均被观察到）、HTTP 全链路（真实 socket）、CLI 子命令（真实子进程，含连接失败 `field=server`、非零退出、无 traceback）。
+测试覆盖：公钥解析、注册成功/409 冲突/各类 400（指明字段）、查询/404、`prekey_ids` 顺序稳定与撤销过滤、设备与单预密钥撤销（200、幂等、404 及对应 field、同用户设备隔离）、撤销与查询并发线性化、会话协商成功（八字段、四入参回显、接收方公钥、唯一 session_id、重复 POST 新建）、会话各类 400/404/409（对应 field、失败不写）、会话快照在撤销后不变、创建与撤销并发原子线性化（撤销先行 409/创建先行 201 两种顺序均被观察到）、消息投递（信封回显与 created_at、sequence 从 1 连续、重复 message_id/错序/发送方撤销/未知会话的 400/404/409 及对应 field、失败不推进序号、会话间序号独立）、消息拉取（分页升序、next_after 语义、参数校验、读取方撤销 409、发送方撤销后已存消息仍可读）、AES-256-GCM 加解密（UTF-8 回环、随机 nonce、AAD 绑定 session_id、密钥/nonce/密文长度与编码校验、篡改与错密钥认证失败）、HTTP 全链路（真实 socket）、CLI 子命令（真实子进程，含连接失败 `field=server`、非零退出、无 traceback）。
 
 ## 代码结构
 
 ```
 e2ee_backend/
-  crypto.py    # cryptography 公钥解析/校验（PEM、DER、原始曲线点）
-  models.py    # Device / SignedPreKey / Session 数据模型
-  storage.py   # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建）
-  service.py   # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话）
-  http_app.py  # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询）
-  cli.py       # register/show/revoke-*/create-session/show-session/serve 命令行入口
+  crypto.py    # cryptography 公钥解析/校验（PEM、DER、原始曲线点）与 AES-256-GCM 本地加解密
+  models.py    # Device / SignedPreKey / Session / Message 数据模型
+  storage.py   # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、消息原子追加与分页）
+  service.py   # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/消息）
+  http_app.py  # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、消息投递与拉取）
+  cli.py       # register/show/revoke-*/create-session/show-session/send-message/pull-messages/encrypt-message/decrypt-message/serve 命令行入口
 tests/         # unittest 测试
 ```
