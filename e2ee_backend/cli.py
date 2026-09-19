@@ -149,6 +149,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_pull_messages.add_argument("--limit", type=int, default=100)
     p_pull_messages.set_defaults(handler=cmd_pull_messages)
 
+    p_retry = sub.add_parser(
+        "retry-message", help="record a delivery retry for a message")
+    p_retry.add_argument("--session-id", required=True)
+    p_retry.add_argument("--message-id", required=True)
+    p_retry.add_argument("--device-id", required=True,
+                         help="recipient device the delivery is attempted on")
+    p_retry.add_argument("--attempt-id", required=True,
+                         help="idempotency token for this delivery attempt")
+    p_retry.set_defaults(handler=cmd_retry_message)
+
+    p_ack = sub.add_parser("ack-message", help="acknowledge a message")
+    p_ack.add_argument("--session-id", required=True)
+    p_ack.add_argument("--device-id", required=True,
+                       help="recipient device acknowledging the message")
+    p_ack.add_argument("--message-id", required=True)
+    p_ack.add_argument("--sequence", required=True, type=int)
+    p_ack.set_defaults(handler=cmd_ack_message)
+
+    p_status = sub.add_parser(
+        "message-status", help="show a message's delivery status")
+    p_status.add_argument("--session-id", required=True)
+    p_status.add_argument("--message-id", required=True)
+    p_status.add_argument("--device-id", required=True,
+                          help="session participant device")
+    p_status.set_defaults(handler=cmd_message_status)
+
     p_encrypt = sub.add_parser(
         "encrypt-message",
         help="encrypt a plaintext locally with AES-256-GCM (no server needed)")
@@ -177,6 +203,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
+    p_serve.add_argument(
+        "--data-file", default=os.environ.get("E2EE_DATA_FILE"),
+        help="JSON state file for durable storage "
+             "(default: $E2EE_DATA_FILE, else in-memory)")
     p_serve.set_defaults(handler=cmd_serve)
     return parser
 
@@ -320,6 +350,60 @@ def cmd_pull_messages(args: argparse.Namespace) -> int:
     return 0 if status == 200 else 1
 
 
+def cmd_retry_message(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages/{sid}/retry/{mid} and print the JSON response."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}/retry/"
+           f"{quote(args.message_id, safe='')}")
+    payload = {"device_id": args.device_id, "attempt_id": args.attempt_id}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    ok = status in (200, 201)
+    stream = sys.stdout if ok else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if ok else 1
+
+
+def cmd_ack_message(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages/{sid}/acks and print the JSON response."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}/acks")
+    payload = {"device_id": args.device_id,
+               "message_id": args.message_id,
+               "sequence": args.sequence}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    ok = status in (200, 201)
+    stream = sys.stdout if ok else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if ok else 1
+
+
+def cmd_message_status(args: argparse.Namespace) -> int:
+    """Call GET /v1/messages/{sid}/status/{mid} and print the JSON response."""
+    from urllib.parse import quote, urlencode
+
+    query = urlencode({"device_id": args.device_id})
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}/status/"
+           f"{quote(args.message_id, safe='')}?{query}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
 def _emit_crypto_error(error: CryptoError) -> int:
     """Print a local crypto failure as single-line JSON on stderr; exit 2."""
     print(json.dumps({"message": error.message, "field": error.field},
@@ -357,8 +441,30 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """Run the HTTP server until interrupted."""
-    server, _ = create_server(args.host, args.port, DeviceService())
+    """Run the HTTP server until interrupted.
+
+    With ``--data-file`` (or ``$E2EE_DATA_FILE``) the store is durable: a
+    missing file is created, a corrupt or wrong-version file refuses to
+    start, and every mutation is persisted by atomically replacing the file.
+    """
+    from .persistence import FilePersister, PersistenceError, load_store
+
+    if args.data_file:
+        try:
+            store = load_store(args.data_file)
+        except PersistenceError as error:
+            print(json.dumps({"message": str(error), "field": "data_file"},
+                             separators=(",", ":")),
+                  file=sys.stderr)
+            return 1
+        persister = FilePersister(args.data_file)
+        store.attach_persister(persister)
+        if not os.path.exists(args.data_file):
+            persister.save(store.snapshot())  # create the missing data file
+        service = DeviceService(store)
+    else:
+        service = DeviceService()
+    server, _ = create_server(args.host, args.port, service)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

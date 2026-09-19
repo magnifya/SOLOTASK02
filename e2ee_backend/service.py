@@ -5,11 +5,14 @@ stores identifiers and public-key material only.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import is_nonempty_string, load_public_key
 from .models import Device, SignedPreKey
 from .storage import (
+    DELIVERY_BAD_SEQUENCE,
+    DELIVERY_DEVICE_INACTIVE,
+    DELIVERY_MESSAGE_UNKNOWN,
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
@@ -21,6 +24,7 @@ from .storage import (
     SESSION_PREKEY_UNKNOWN,
     SESSION_RECIPIENT_REVOKED,
     SESSION_RECIPIENT_UNKNOWN,
+    DeliveryError,
     DeviceStore,
     MessageCreateError,
     MessageListError,
@@ -32,6 +36,8 @@ _SESSION_SCALAR_FIELDS = (
     "initiator_device_id", "recipient_device_id", "prekey_id", "ephemeral_key")
 _MESSAGE_STRING_FIELDS = (
     "session_id", "sender_device_id", "message_id", "nonce", "ciphertext")
+_RETRY_STRING_FIELDS = ("device_id", "attempt_id")
+_ACK_STRING_FIELDS = ("device_id", "message_id")
 
 #: Maps a storage-level message-append failure reason to (HTTP status, field).
 _MESSAGE_CREATE_ERROR_MAP = {
@@ -292,3 +298,91 @@ class DeviceService:
                                    "device_id", status_code=409)
             raise  # pragma: no cover - defensive
         return {"messages": messages, "next_after": next_after}
+
+    # -- reliable delivery (retry / ack / status) ----------------------------
+
+    @staticmethod
+    def _require_object(payload: object) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        return payload
+
+    @staticmethod
+    def _require_nonempty_strings(payload: Dict[str, Any],
+                                  fields: Tuple[str, ...]) -> None:
+        for name in fields:
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+    @staticmethod
+    def _require_integer(payload: Dict[str, Any], name: str) -> int:
+        if name not in payload:
+            raise ServiceError(f"missing required field: {name}", name)
+        value = payload[name]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ServiceError(f"field must be an integer: {name}", name)
+        return value
+
+    @staticmethod
+    def _delivery_error(error: DeliveryError, session_id: str,
+                        message_id: str) -> ServiceError:
+        if error.reason == MESSAGE_SESSION_UNKNOWN:
+            return ServiceError(f"session not found: {session_id}",
+                                "session_id", status_code=404)
+        if error.reason == DELIVERY_MESSAGE_UNKNOWN:
+            return ServiceError(f"message not found: {message_id}",
+                                "message_id", status_code=404)
+        if error.reason == DELIVERY_DEVICE_INACTIVE:
+            return ServiceError("device_id is not the active recipient",
+                                "device_id", status_code=409)
+        if error.reason == DELIVERY_BAD_SEQUENCE:
+            return ServiceError("sequence does not match the message",
+                                "sequence", status_code=409)
+        raise  # pragma: no cover - defensive
+
+    def retry_message(self, session_id: str, message_id: str,
+                      payload: object) -> Tuple[Dict[str, Any], bool]:
+        """Record one delivery attempt; return ``(body, created)``.
+
+        ``created`` is ``True`` (HTTP 201) only for a new ``attempt_id`` on a
+        pending message; duplicate attempts and retries after acknowledgement
+        return ``created=False`` (HTTP 200) without incrementing ``attempts``.
+        """
+        body = self._require_object(payload)
+        self._require_nonempty_strings(body, _RETRY_STRING_FIELDS)
+        try:
+            return self.store.record_attempt(
+                session_id, message_id, body["device_id"], body["attempt_id"])
+        except DeliveryError as error:
+            raise self._delivery_error(error, session_id, message_id)
+
+    def ack_message(self, session_id: str,
+                    payload: object) -> Tuple[Dict[str, Any], bool]:
+        """Acknowledge one message; return ``(body, created)``.
+
+        The first acknowledgement flips the message to ``acked`` (HTTP 201);
+        repeats are idempotent (HTTP 200). ``sequence`` must match the
+        message's own sequence number.
+        """
+        body = self._require_object(payload)
+        self._require_nonempty_strings(body, _ACK_STRING_FIELDS)
+        sequence = self._require_integer(body, "sequence")
+        try:
+            return self.store.ack_message(
+                session_id, body["device_id"], body["message_id"], sequence)
+        except DeliveryError as error:
+            raise self._delivery_error(
+                error, session_id, str(body.get("message_id", "")))
+
+    def message_status(self, session_id: str, message_id: str,
+                       device_id: str) -> Dict[str, Any]:
+        """Return one message's delivery state (status/attempts/sequence)."""
+        try:
+            return self.store.delivery_status(session_id, message_id, device_id)
+        except DeliveryError as error:
+            raise self._delivery_error(error, session_id, message_id)

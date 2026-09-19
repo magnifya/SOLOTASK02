@@ -48,6 +48,12 @@ class Message:
     plaintext and never holds the keys that could produce it. ``sequence`` is
     the sender-chosen position in the session's message stream (starting at 1,
     strictly consecutive); ``created_at`` is the server's receive timestamp.
+
+    Reliable-delivery state travels with the envelope: ``attempts`` counts
+    distinct delivery attempts (retries), ``attempt_ids`` remembers the
+    idempotency tokens already seen (so a duplicate retry never double
+    counts), and ``acked`` flips to ``True`` once the recipient acknowledges
+    the message.
     """
 
     session_id: str
@@ -57,6 +63,9 @@ class Message:
     nonce: str
     ciphertext: str
     created_at: str = field(default_factory=utc_now_iso)
+    attempts: int = 0
+    attempt_ids: List[str] = field(default_factory=list)
+    acked: bool = False
 
 
 @dataclass

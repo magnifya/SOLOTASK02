@@ -10,7 +10,7 @@ import threading
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from .models import Device, Message, Session
+from .models import Device, Message, Session, SignedPreKey
 
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
@@ -28,6 +28,11 @@ MESSAGE_BAD_SEQUENCE = "bad_sequence"
 
 #: Outcome code for a failed message listing.
 MESSAGE_DEVICE_INACTIVE = "device_inactive"
+
+#: Outcome codes for failed reliable-delivery operations (retry/ack/status).
+DELIVERY_MESSAGE_UNKNOWN = "message_unknown"
+DELIVERY_DEVICE_INACTIVE = "device_inactive"
+DELIVERY_BAD_SEQUENCE = "bad_sequence"
 
 
 class SessionCreateError(Exception):
@@ -54,6 +59,14 @@ class MessageListError(Exception):
         self.reason = reason
 
 
+class DeliveryError(Exception):
+    """An atomic retry/ack/status check failed (nothing was written)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class DeviceStore:
     """In-memory store keyed by ``(user_id, device_id)``.
 
@@ -67,6 +80,129 @@ class DeviceStore:
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
         self._messages: Dict[str, List[Message]] = {}
+        self._persister: Any = None
+
+    # -- persistence hooks ---------------------------------------------------
+
+    def attach_persister(self, persister: Any) -> None:
+        """Attach a persister called with a full snapshot after every write.
+
+        The persister only needs a ``save(snapshot: dict)`` method; it is
+        invoked while the store lock is held, so snapshots are serialized and
+        never interleave with a concurrent mutation.
+        """
+        with self._lock:
+            self._persister = persister
+
+    def _persist_locked(self) -> None:
+        if self._persister is not None:
+            self._persister.save(self.snapshot())
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a JSON-serializable snapshot of the entire store."""
+        with self._lock:
+            return {
+                "version": 1,
+                "devices": [
+                    {
+                        "user_id": device.user_id,
+                        "device_id": device.device_id,
+                        "identity_key": device.identity_key,
+                        "registered_at": device.registered_at,
+                        "revoked": device.revoked,
+                        "prekeys": [
+                            {"key_id": pk.key_id, "public_key": pk.public_key,
+                             "revoked": pk.revoked}
+                            for pk in device.prekeys
+                        ],
+                    }
+                    for device in self._devices.values()
+                ],
+                "sessions": [
+                    {
+                        "session_id": s.session_id,
+                        "initiator_device_id": s.initiator_device_id,
+                        "recipient_device_id": s.recipient_device_id,
+                        "prekey_id": s.prekey_id,
+                        "ephemeral_key": s.ephemeral_key,
+                        "identity_key": s.identity_key,
+                        "public_key": s.public_key,
+                        "created_at": s.created_at,
+                    }
+                    for s in self._sessions.values()
+                ],
+                "messages": {
+                    session_id: [
+                        {
+                            "session_id": m.session_id,
+                            "sender_device_id": m.sender_device_id,
+                            "message_id": m.message_id,
+                            "sequence": m.sequence,
+                            "nonce": m.nonce,
+                            "ciphertext": m.ciphertext,
+                            "created_at": m.created_at,
+                            "attempts": m.attempts,
+                            "attempt_ids": list(m.attempt_ids),
+                            "acked": m.acked,
+                        }
+                        for m in stream
+                    ]
+                    for session_id, stream in self._messages.items()
+                },
+            }
+
+    @classmethod
+    def from_snapshot(cls, data: Dict[str, Any]) -> "DeviceStore":
+        """Rebuild a store from :meth:`snapshot` data.
+
+        Raises ``ValueError`` when the shape is not a version-1 snapshot.
+        """
+        if not isinstance(data, dict) or data.get("version") != 1:
+            raise ValueError("unsupported snapshot version")
+        store = cls()
+        for record in data["devices"]:
+            device = Device(
+                user_id=record["user_id"],
+                device_id=record["device_id"],
+                identity_key=record["identity_key"],
+                registered_at=record["registered_at"],
+                prekeys=[SignedPreKey(pk["key_id"], pk["public_key"],
+                                      pk.get("revoked", False))
+                         for pk in record["prekeys"]],
+                revoked=record.get("revoked", False),
+            )
+            key = (device.user_id, device.device_id)
+            store._devices[key] = device
+            store._device_index[device.device_id] = key
+        for record in data["sessions"]:
+            session = Session(
+                session_id=record["session_id"],
+                initiator_device_id=record["initiator_device_id"],
+                recipient_device_id=record["recipient_device_id"],
+                prekey_id=record["prekey_id"],
+                ephemeral_key=record["ephemeral_key"],
+                identity_key=record["identity_key"],
+                public_key=record["public_key"],
+                created_at=record["created_at"],
+            )
+            store._sessions[session.session_id] = session
+        for session_id, stream in data["messages"].items():
+            store._messages[session_id] = [
+                Message(
+                    session_id=record["session_id"],
+                    sender_device_id=record["sender_device_id"],
+                    message_id=record["message_id"],
+                    sequence=record["sequence"],
+                    nonce=record["nonce"],
+                    ciphertext=record["ciphertext"],
+                    created_at=record["created_at"],
+                    attempts=record.get("attempts", 0),
+                    attempt_ids=list(record.get("attempt_ids", [])),
+                    acked=record.get("acked", False),
+                )
+                for record in stream
+            ]
+        return store
 
     def add_device(self, device: Device) -> bool:
         """Insert a device.
@@ -80,6 +216,7 @@ class DeviceStore:
                 return False
             self._devices[key] = device
             self._device_index[device.device_id] = key
+            self._persist_locked()
             return True
 
     def get_device(self, user_id: str, device_id: str) -> Optional[Device]:
@@ -104,6 +241,7 @@ class DeviceStore:
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
                     prekey.revoked = True
+                    self._persist_locked()
                     return True
             return False
 
@@ -121,6 +259,7 @@ class DeviceStore:
             device.revoked = True
             for prekey in device.prekeys:
                 prekey.revoked = True
+            self._persist_locked()
             return device
 
     def revoke_prekey_by_id(self, device_id: str,
@@ -139,6 +278,7 @@ class DeviceStore:
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
                     prekey.revoked = True
+                    self._persist_locked()
                     return device, True
             return device, False
 
@@ -207,6 +347,7 @@ class DeviceStore:
                 public_key=used_prekey.public_key,
             )
             self._sessions[session.session_id] = session
+            self._persist_locked()
             return session
 
     def session_view(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -283,6 +424,7 @@ class DeviceStore:
                 ciphertext=ciphertext,
             )
             stream.append(message)
+            self._persist_locked()
             return message
 
     def message_page(self, session_id: str, device_id: str, after: int,
@@ -310,3 +452,97 @@ class DeviceStore:
             page = [m for m in stream if m.sequence > after][:limit]
             next_after = page[-1].sequence if page else after
             return [self.message_view(m) for m in page], next_after
+
+    # -- reliable delivery (retry / ack / status) ----------------------------
+
+    @staticmethod
+    def delivery_view(message: Message) -> Dict[str, Any]:
+        """Copy one message's delivery state into its public five-field view."""
+        return {
+            "session_id": message.session_id,
+            "message_id": message.message_id,
+            "status": "acked" if message.acked else "pending",
+            "attempts": message.attempts,
+            "sequence": message.sequence,
+        }
+
+    def _find_message_locked(self, session_id: str,
+                             message_id: str) -> Tuple[Session, Message]:
+        """Look up session and message; raise :class:`DeliveryError` if absent."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise DeliveryError(MESSAGE_SESSION_UNKNOWN)
+        stream = self._messages.get(session_id, [])
+        message = next((m for m in stream if m.message_id == message_id), None)
+        if message is None:
+            raise DeliveryError(DELIVERY_MESSAGE_UNKNOWN)
+        return session, message
+
+    def _check_recipient_locked(self, session: Session, device_id: str) -> None:
+        """Require *device_id* to be the session's active recipient device."""
+        if device_id != session.recipient_device_id:
+            raise DeliveryError(DELIVERY_DEVICE_INACTIVE)
+        key = self._device_index.get(device_id)
+        device = self._devices.get(key) if key is not None else None
+        if device is None or device.revoked:
+            raise DeliveryError(DELIVERY_DEVICE_INACTIVE)
+
+    def record_attempt(self, session_id: str, message_id: str,
+                       device_id: str, attempt_id: str
+                       ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically record one delivery attempt for a message.
+
+        Returns ``(view, created)``: ``created`` is ``True`` (HTTP 201) only
+        for a brand-new *attempt_id* on a not-yet-acked message; a repeated
+        *attempt_id* and any retry after acknowledgement return ``False``
+        (HTTP 200) without incrementing ``attempts``. All checks run under
+        the store lock, linearized with revocations and acks.
+        """
+        with self._lock:
+            session, message = self._find_message_locked(session_id, message_id)
+            self._check_recipient_locked(session, device_id)
+            if message.acked or attempt_id in message.attempt_ids:
+                return self.delivery_view(message), False
+            message.attempt_ids.append(attempt_id)
+            message.attempts += 1
+            self._persist_locked()
+            return self.delivery_view(message), True
+
+    def ack_message(self, session_id: str, device_id: str,
+                    message_id: str, sequence: int
+                    ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically acknowledge one message.
+
+        Returns ``(view, created)``: ``created`` is ``True`` (HTTP 201) for
+        the first acknowledgement; repeats return ``False`` (HTTP 200). The
+        supplied *sequence* must match the message's own sequence.
+        """
+        with self._lock:
+            session, message = self._find_message_locked(session_id, message_id)
+            self._check_recipient_locked(session, device_id)
+            if sequence != message.sequence:
+                raise DeliveryError(DELIVERY_BAD_SEQUENCE)
+            if message.acked:
+                return self.delivery_view(message), False
+            message.acked = True
+            self._persist_locked()
+            return self.delivery_view(message), True
+
+    def delivery_status(self, session_id: str, message_id: str,
+                        device_id: str) -> Dict[str, Any]:
+        """Atomically read one message's delivery state.
+
+        The caller's device must be an active participant of the session
+        (initiator or recipient); anything else is a 409 at the API layer.
+        """
+        with self._lock:
+            session, message = self._find_message_locked(session_id, message_id)
+            participants = (session.initiator_device_id,
+                            session.recipient_device_id)
+            if device_id not in participants:
+                raise DeliveryError(DELIVERY_DEVICE_INACTIVE)
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None or device.revoked:
+                raise DeliveryError(DELIVERY_DEVICE_INACTIVE)
+            return self.delivery_view(message)

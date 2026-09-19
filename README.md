@@ -20,6 +20,11 @@
 - `POST /v1/messages`：向会话投递加密消息信封。请求体含 `session_id`、`sender_device_id`、`message_id`、`sequence`、`nonce`、`ciphertext`；`sequence` 从 1 开始逐条连续。未知会话 `404/field=session_id`；发送方设备不存在或已撤销 `409/field=sender_device_id`；`message_id` 在会话内重复 `409/field=message_id`；序号不连续 `409/field=sequence`；字段缺失或类型错误 `400/field=对应字段`。成功 `201`，响应为完整信封（六入参回显）加 `created_at`（UTC ISO-8601，`+00:00`）。失败不写入任何消息，序号游标不前进。
 - `GET /v1/messages/{session_id}`：分页拉取会话消息。查询参数 `device_id` 必填，`after` 默认 0（须 ≥0），`limit` 默认 100（1..100）；未知会话 `404/field=session_id`，`device_id` 非活跃设备 `409/field=device_id`，参数缺失/非法 `400/field=对应参数`。返回 `messages`（与 POST 响应同构的信封数组，筛 `sequence > after` 升序）与 `next_after`（空页等于 `after`，否则为末条序号）。消息读取与设备撤销共享同一把锁，不观察中间态；已存消息在发送方被撤销后仍可读取。
 - 命令行 `send-message` / `pull-messages` 与上述两个接口一一对应，同样打印单行 JSON。
+- `POST /v1/messages/{sid}/retry/{mid}`：记录一次投递重试。请求体含非空字符串 `device_id`、`attempt_id`；`device_id` 必须是会话的活跃接收方设备，设备不符、未知或已撤销返回 `409/field=device_id`；未知会话/消息分别返回 `404/field=session_id`、`404/field=message_id`；字段缺失或类型错误返回 `400/field=对应字段`。首次重试返回 `201` 且 `attempts` 加一；相同 `attempt_id` 的重复请求返回 `200` 且不重复计数；消息被确认后再重试仍返回 `200` 且不计数。响应含 `session_id`、`message_id`、`status`（`pending`/`acked`）、`attempts`、`sequence` 五个字段。
+- `POST /v1/messages/{sid}/acks`：接收方确认消息。请求体含 `device_id`、`message_id`（非空字符串）与整数 `sequence`；权限与未知资源的错误码同上，`sequence` 与消息自身序号不符返回 `409/field=sequence`。首次确认返回 `201` 并将消息置为 `acked`，重复确认幂等返回 `200`；响应与 retry 相同的五字段。
+- `GET /v1/messages/{sid}/status/{mid}?device_id=...`：查询消息投递状态。`device_id` 缺失或取多个值返回 `400/field=device_id`；未知会话/消息返回 `404`；`device_id` 不是会话的活跃参与方（发起方或接收方）返回 `409/field=device_id`；成功 `200` 返回同样的五字段。
+- 命令行 `retry-message` / `ack-message` / `message-status` 与上述三个接口一一对应，成功（`200`/`201`）在 stdout 打印单行 JSON，失败在 stderr 打印单行 JSON 并以非零码退出。
+- `serve` 支持 `--data-file`（缺省取环境变量 `E2EE_DATA_FILE`，再缺省为纯内存）。数据文件为 `version: 1` 的 JSON 快照：文件缺失时自动创建；文件损坏或版本不符时拒绝启动（stderr 单行 JSON、非零退出）；每次变更先写临时文件再原子替换，崩溃不会留下半截文件；重启后消息去重、序号游标、设备/预密钥撤销与 ack 状态全部恢复。
 - 命令行 `encrypt-message` / `decrypt-message` 为纯本地 AES-256-GCM 加解密（不访问服务器）：`--session-id`、`--key`（base64 编码的 32 字节密钥）、`--plaintext`（UTF-8）→ 输出 `session_id`/`nonce`（12 字节，base64）/`ciphertext`（base64，末尾附 16 字节 GCM tag）；`decrypt-message` 额外接收 `--nonce`/`--ciphertext` → 输出 `session_id`/`plaintext`。`session_id` 的 UTF-8 字节作为 AAD 参与认证。任何失败在 stderr 打印带 `field` 的单行 JSON 并以非零码退出。
 - 服务端仅保存标识与公开密钥（identity key、signed pre-key、临时公钥均为公钥），不保存私钥、共享秘密或明文消息。存储为进程内、线程安全。
 
@@ -36,8 +41,11 @@ python3 -m pip install -e .
 ## 启动方式
 
 ```bash
-# 直接运行 HTTP 服务（默认 127.0.0.1:8080）
+# 直接运行 HTTP 服务（默认 127.0.0.1:8080，纯内存）
 python3 -m e2ee_backend serve --host 0.0.0.0 --port 8080
+
+# 持久化到数据文件（缺省取 $E2EE_DATA_FILE；缺失自动创建，损坏/版本错拒启）
+python3 -m e2ee_backend serve --port 8080 --data-file /var/lib/e2ee/state.json
 ```
 
 命令行调用（公钥支持 PEM 文本、base64/hex 编码的 DER，或 base64/hex 编码的 32 字节 X25519/Ed25519 原始点；也可用 `@路径` 从文件读取）：
@@ -88,6 +96,22 @@ python3 -m e2ee_backend send-message \
 python3 -m e2ee_backend pull-messages SESSION_ID --device-id phone --after 0 --limit 100
 # => {"messages":[…],"next_after":1}
 
+# 记录一次投递重试（--attempt-id 为幂等令牌；重复不计数，acked 后仍 200）
+python3 -m e2ee_backend retry-message \
+  --session-id SESSION_ID --message-id msg-1 \
+  --device-id phone --attempt-id attempt-1
+# => {"session_id":"…","message_id":"msg-1","status":"pending","attempts":1,"sequence":1}
+
+# 接收方确认消息（--sequence 须与消息序号一致；重复确认幂等）
+python3 -m e2ee_backend ack-message \
+  --session-id SESSION_ID --device-id phone --message-id msg-1 --sequence 1
+# => {"session_id":"…","message_id":"msg-1","status":"acked","attempts":1,"sequence":1}
+
+# 查询投递状态（device_id 须为会话参与方设备）
+python3 -m e2ee_backend message-status \
+  --session-id SESSION_ID --message-id msg-1 --device-id laptop
+# => {"session_id":"…","message_id":"msg-1","status":"acked","attempts":1,"sequence":1}
+
 # 本地 AES-256-GCM 加解密（不访问服务器；--key 为 base64 编码的 32 字节密钥）
 python3 -m e2ee_backend encrypt-message \
   --session-id SESSION_ID --key BASE64_32BYTE_KEY --plaintext "hello"
@@ -106,17 +130,18 @@ python3 -m e2ee_backend decrypt-message \
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：公钥解析、注册成功/409 冲突/各类 400（指明字段）、查询/404、`prekey_ids` 顺序稳定与撤销过滤、设备与单预密钥撤销（200、幂等、404 及对应 field、同用户设备隔离）、撤销与查询并发线性化、会话协商成功（八字段、四入参回显、接收方公钥、唯一 session_id、重复 POST 新建）、会话各类 400/404/409（对应 field、失败不写）、会话快照在撤销后不变、创建与撤销并发原子线性化（撤销先行 409/创建先行 201 两种顺序均被观察到）、消息投递（信封回显与 created_at、sequence 从 1 连续、重复 message_id/错序/发送方撤销/未知会话的 400/404/409 及对应 field、失败不推进序号、会话间序号独立）、消息拉取（分页升序、next_after 语义、参数校验、读取方撤销 409、发送方撤销后已存消息仍可读）、AES-256-GCM 加解密（UTF-8 回环、随机 nonce、AAD 绑定 session_id、密钥/nonce/密文长度与编码校验、篡改与错密钥认证失败）、HTTP 全链路（真实 socket）、CLI 子命令（真实子进程，含连接失败 `field=server`、非零退出、无 traceback）。
+测试覆盖：公钥解析、注册成功/409 冲突/各类 400（指明字段）、查询/404、`prekey_ids` 顺序稳定与撤销过滤、设备与单预密钥撤销（200、幂等、404 及对应 field、同用户设备隔离）、撤销与查询并发线性化、会话协商成功（八字段、四入参回显、接收方公钥、唯一 session_id、重复 POST 新建）、会话各类 400/404/409（对应 field、失败不写）、会话快照在撤销后不变、创建与撤销并发原子线性化（撤销先行 409/创建先行 201 两种顺序均被观察到）、消息投递（信封回显与 created_at、sequence 从 1 连续、重复 message_id/错序/发送方撤销/未知会话的 400/404/409 及对应 field、失败不推进序号、会话间序号独立）、消息拉取（分页升序、next_after 语义、参数校验、读取方撤销 409、发送方撤销后已存消息仍可读）、可靠投递（retry 首次 201/重复 200 不增/acked 后仍 200、ack 首次 201 置 acked/重复 200/序号不符 409、status 五字段、三类接口的 400/404/409 及对应 field）、持久化（缺失创建、version=1、损坏/版本错拒载、原子替换无残留临时文件、重启后去重/序号/撤销/ack 恢复）、AES-256-GCM 加解密（UTF-8 回环、随机 nonce、AAD 绑定 session_id、密钥/nonce/密文长度与编码校验、篡改与错密钥认证失败）、HTTP 全链路（真实 socket）、CLI 子命令（真实子进程，含连接失败 `field=server`、非零退出、无 traceback）。
 
 ## 代码结构
 
 ```
 e2ee_backend/
-  crypto.py    # cryptography 公钥解析/校验（PEM、DER、原始曲线点）与 AES-256-GCM 本地加解密
-  models.py    # Device / SignedPreKey / Session / Message 数据模型
-  storage.py   # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、消息原子追加与分页）
-  service.py   # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/消息）
-  http_app.py  # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、消息投递与拉取）
-  cli.py       # register/show/revoke-*/create-session/show-session/send-message/pull-messages/encrypt-message/decrypt-message/serve 命令行入口
-tests/         # unittest 测试
+  crypto.py       # cryptography 公钥解析/校验（PEM、DER、原始曲线点）与 AES-256-GCM 本地加解密
+  models.py       # Device / SignedPreKey / Session / Message 数据模型（含投递状态）
+  storage.py      # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、消息原子追加与分页、retry/ack/status 原子操作、快照导入导出）
+  persistence.py  # version=1 JSON 数据文件：缺失创建、损坏/版本错拒载、原子替换
+  service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/消息/可靠投递）
+  http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、消息投递与拉取、retry/acks/status）
+  cli.py          # register/show/revoke-*/create-session/show-session/send-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
+tests/            # unittest 测试
 ```

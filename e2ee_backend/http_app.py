@@ -31,8 +31,22 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_create_session()
         elif path == _MESSAGES_PATH:
             self._handle_post_message()
+        elif path.startswith(_MESSAGES_PATH + "/"):
+            self._route_message_action(path)
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
             self._route_revoke(path)
+        else:
+            self._send_json(404, {"message": f"not found: {path}"})
+
+    def _route_message_action(self, path: str) -> None:
+        # Split on raw slashes only; a percent-encoded slash inside a segment
+        # is part of the id, mirroring the GET routes.
+        suffix = path[len(_MESSAGES_PATH) + 1:]
+        parts = suffix.split("/")
+        if len(parts) == 3 and parts[1] == "retry":
+            self._handle_retry_message(unquote(parts[0]), unquote(parts[2]))
+        elif len(parts) == 2 and parts[1] == "acks":
+            self._handle_ack_message(unquote(parts[0]))
         else:
             self._send_json(404, {"message": f"not found: {path}"})
 
@@ -69,9 +83,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_show_session(unquote(suffix))
         elif path.startswith(_MESSAGES_PATH + "/"):
             suffix = path[len(_MESSAGES_PATH) + 1:]
-            if not suffix or "/" in suffix:
+            if not suffix:
                 self._send_json(404, {"message": "session not found",
                                       "field": "session_id"})
+                return
+            if "/" in suffix:
+                parts = suffix.split("/")
+                if len(parts) == 3 and parts[1] == "status" and parts[0] and parts[2]:
+                    self._handle_message_status(unquote(parts[0]),
+                                                unquote(parts[2]))
+                else:
+                    self._send_json(404, {"message": f"not found: {path}"})
                 return
             self._handle_list_messages(unquote(suffix))
         else:
@@ -152,6 +174,44 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body = self.service.list_messages(session_id, device_id,
                                               after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_retry_message(self, session_id: str, message_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, created = self.service.retry_message(
+                session_id, message_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(201 if created else 200, body)
+
+    def _handle_ack_message(self, session_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, created = self.service.ack_message(session_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(201 if created else 200, body)
+
+    def _handle_message_status(self, session_id: str, message_id: str) -> None:
+        query = parse_qs(urlsplit(self.path).query)
+        device_ids = query.get("device_id", [])
+        if len(device_ids) != 1 or not device_ids[0]:
+            self._send_json(400, {"message": "device_id is required",
+                                  "field": "device_id"})
+            return
+        try:
+            body = self.service.message_status(session_id, message_id,
+                                               device_ids[0])
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
