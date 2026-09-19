@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "e2ee-backend"
+version = "0.1.0"
+description = "End-to-end encrypted messaging backend: device registration and signed pre-key publishing"
+requires-python = ">=3.10"
+dependencies = ["cryptography>=3.4"]
+
+[project.scripts]
+e2ee-backend = "e2ee_backend.cli:main"
+
+[tool.setuptools]
+packages = ["e2ee_backend"]

@@ -4,4 +4,65 @@
 
 ## 当前状态
 
-上述接口尚未实现。实现完成后，请在此补充安装依赖、启动方式与基础测试命令。
+接口已实现（纯标准库 HTTP 服务 + `cryptography` 校验公钥），并带有单元/集成测试。
+
+- `POST /v1/devices`：注册设备并发布签名预密钥；成功 `201`，冲突 `409`，校验失败 `400`（错误体带 `field` 指明字段，数组元素使用 `signed_prekeys[i].key_id` 这样的路径）。
+- `GET /v1/devices/{device_id}`：返回 `identity_key`、`prekey_ids`（仅未撤销，顺序与注册时一致且重复请求完全相同）、`registered_at`；不存在返回 `404`。
+- 命令行 `register` / `show` 与两个接口一一对应，成功时在 stdout 打印单行 JSON，字段名与 HTTP 一致；失败时在 stderr 打印单行 JSON 错误。
+- 服务端仅保存标识与公开密钥（identity key、signed pre-key 均为公钥），不保存私钥或明文消息。存储为进程内、线程安全。
+
+## 安装依赖
+
+需要 Python 3.10+。
+
+```bash
+python3 -m pip install -r requirements.txt
+# 或者安装为包（提供 e2ee-backend 命令）
+python3 -m pip install -e .
+```
+
+## 启动方式
+
+```bash
+# 直接运行 HTTP 服务（默认 127.0.0.1:8080）
+python3 -m e2ee_backend serve --host 0.0.0.0 --port 8080
+```
+
+命令行调用（公钥支持 PEM 文本、base64/hex 编码的 DER，或 base64/hex 编码的 32 字节 X25519/Ed25519 原始点；也可用 `@路径` 从文件读取）：
+
+```bash
+# 注册（--prekey 可重复，格式为 KEY_ID:PUBLIC_KEY，或 @文件 读取 JSON 对象）
+python3 -m e2ee_backend register \
+  --user-id alice --device-id laptop \
+  --identity-key  BASE64_OR_PEM_PUBLIC_KEY \
+  --prekey 1:BASE64_OR_PEM_PUBLIC_KEY \
+  --prekey 2:BASE64_OR_PEM_PUBLIC_KEY
+# => {"device_id":"laptop","registered_at":"2026-09-19T10:10:50.232732+00:00"}
+
+# 查询
+python3 -m e2ee_backend show laptop
+# => {"identity_key":"...","prekey_ids":["1","2"],"registered_at":"..."}
+```
+
+默认服务地址为 `http://127.0.0.1:8080`，可用全局参数 `--base-url` 或环境变量 `E2EE_BASE_URL` 覆盖。
+
+## 基础测试命令
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+测试覆盖：公钥解析、注册成功/409 冲突/各类 400（指明字段）、查询/404、`prekey_ids` 顺序稳定与撤销过滤、同一 user_id 下多设备隔离、HTTP 全链路（真实 socket）、CLI 子命令（真实子进程），以及并发注册同一设备恰好一个成功。
+
+## 代码结构
+
+```
+e2ee_backend/
+  crypto.py    # cryptography 公钥解析/校验（PEM、DER、原始曲线点）
+  models.py    # Device / SignedPreKey 数据模型
+  storage.py   # 线程安全的进程内存储（插入顺序、撤销过滤、设备隔离）
+  service.py   # 业务逻辑与字段校验（400/404/409）
+  http_app.py  # POST/GET 路由与 JSON 响应
+  cli.py       # register / show / serve 命令行入口
+tests/         # unittest 测试
+```
