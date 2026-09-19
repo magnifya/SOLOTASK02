@@ -1,33 +1,7 @@
-# SOLOTASK02
+# SOLOTASK02 端到端加密通信后端
 
-端到端加密通信后端的设备注册与预密钥发布。Python 实现，密码学部分使用 cryptography，对外提供 HTTP 服务与命令行入口，两者能力一致。
-
-## 运行
-
-    python -m app --port <port>      # 启动 HTTP 服务
-    python -m app <subcommand>       # 命令行入口，输出单行 JSON
-
-## 公开接口
-
-POST /v1/devices
-  请求：user_id、device_id、identity_key、signed_prekey[]
-        每个 signed_prekey 含 key_id 与 public_key
-  成功：201 -> device_id、registered_at
-
-GET /v1/devices/{device_id}
-  成功：200 -> identity_key、prekey key_id 列表、registered_at
-
-## 约定
-
-- 同一 user_id 下 device_id 必须唯一；重复注册：409
-- 字段缺失：400，需指明缺少哪个字段
-- 设备不存在：404
-- 已撤销的预密钥不得出现在列表中
-- 同一设备的列表顺序每次一致
-- 服务端只保存公开密钥与标识，不保存明文消息或私钥
-- 同一用户的多台设备相互独立，一台的状态变化不影响另一台
-- 服务重启后已注册设备仍可查询；重复提交同一组预密钥不产生重复条目
+要实现端到端加密通信后端的设备注册与预密钥发布，用 Python 加 cryptography，同时提供 HTTP 服务和命令行入口。注册走 POST /v1/devices，请求体是 JSON，含 user_id、device_id、identity_key 三个字符串字段，以及数组 signed_prekeys，每个元素含 key_id 与 public_key；成功返回 201，响应含 device_id 与 registered_at。同一 user_id 下 device_id 已存在时返回 409。任一必填字段缺失或 signed_prekeys 元素结构不符时返回 400，并指明是哪个字段。查询走 GET /v1/devices/{device_id}，返回 identity_key、prekey_ids 数组与 registered_at；设备不存在返回 404；prekey_ids 只列出未被撤销的预密钥，同一请求重复返回的顺序完全一致。命令行提供 register 与 show 两个子命令，与上述两个接口一一对应，打印单行 JSON 且字段名与 HTTP 响应一致。服务端只保存公开密钥与标识，不保存明文消息或私钥。同一 user_id 下多台设备互不影响，一台设备的状态变化不影响另一台。
 
 ## 当前状态
 
-接口尚未实现；实现完成后需在此补充安装依赖、启动方式与基础测试命令。
+上述接口尚未实现。实现完成后，请在此补充安装依赖、启动方式与基础测试命令。
