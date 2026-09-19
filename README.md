@@ -4,4 +4,38 @@
 
 ## 当前状态
 
-上述接口尚未实现。实现完成后，请在此补充安装依赖、启动方式与基础测试命令。
+接口已实现，代码位于 `e2e_backend/`：
+
+- `store.py` — 线程安全的内存设备存储，只保存公开密钥与标识
+- `server.py` — HTTP 服务（标准库 `http.server`），`POST /v1/devices` 与 `GET /v1/devices/{device_id}`
+- `cli.py` — 命令行入口，`register` / `show` 子命令，输出单行 JSON
+- `keyutil.py` — 基于 `cryptography` 的公钥解析与指纹工具
+
+### 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 启动服务
+
+```bash
+python3 -m e2e_backend.server --host 127.0.0.1 --port 8000
+```
+
+### 命令行用法
+
+```bash
+# 注册设备（服务地址可用 --server 或环境变量 E2E_SERVER 指定）
+python3 -m e2e_backend.cli register --user-id alice --device-id phone \
+    --identity-key IK_ALICE --prekey k1:PK1 --prekey k2:PK2
+
+# 查询设备
+python3 -m e2e_backend.cli show phone
+```
+
+### 运行测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```
