@@ -2,6 +2,7 @@
 import base64
 import threading
 import unittest
+from datetime import datetime
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -265,6 +266,293 @@ class StorageIsolationTest(unittest.TestCase):
         store.revoke_prekey(a, "ka")
         self.assertEqual(store.active_prekey_ids(a), [])
         self.assertEqual(store.active_prekey_ids(b), ["kb"])
+
+
+class _SessionTestBase(unittest.TestCase):
+    """Registers an initiator ``da`` and a recipient ``db`` with one pre-key."""
+
+    INITIATOR = "da"
+    RECIPIENT = "db"
+    PREKEY = "pk"
+
+    def setUp(self) -> None:
+        self.service = DeviceService()
+        self.init_identity = _raw_key_b64()
+        self.recp_identity = _raw_key_b64()
+        self.recp_prekey = _raw_key_b64()
+        self.service.register({
+            "user_id": "u1", "device_id": self.INITIATOR,
+            "identity_key": self.init_identity,
+            "signed_prekeys": [{"key_id": "ki", "public_key": _raw_key_b64()}]})
+        self.service.register({
+            "user_id": "u2", "device_id": self.RECIPIENT,
+            "identity_key": self.recp_identity,
+            "signed_prekeys": [{"key_id": self.PREKEY,
+                                "public_key": self.recp_prekey}]})
+
+    def _session_payload(self, **overrides: object) -> dict:
+        payload = {
+            "initiator_device_id": self.INITIATOR,
+            "recipient_device_id": self.RECIPIENT,
+            "prekey_id": self.PREKEY,
+            "ephemeral_key": _raw_key_b64(),
+        }
+        payload.update(overrides)
+        return payload
+
+
+class SessionNegotiationTest(_SessionTestBase):
+    def test_created_session_has_exactly_eight_fields(self) -> None:
+        body = self.service.create_session(self._session_payload())
+        self.assertEqual(set(body), {
+            "session_id", "initiator_device_id", "recipient_device_id",
+            "prekey_id", "ephemeral_key", "identity_key", "public_key",
+            "created_at"})
+
+    def test_echoes_four_input_fields(self) -> None:
+        ephemeral = _raw_key_b64()
+        body = self.service.create_session(self._session_payload(
+            ephemeral_key=ephemeral))
+        self.assertEqual(body["initiator_device_id"], self.INITIATOR)
+        self.assertEqual(body["recipient_device_id"], self.RECIPIENT)
+        self.assertEqual(body["prekey_id"], self.PREKEY)
+        self.assertEqual(body["ephemeral_key"], ephemeral)
+
+    def test_identity_and_public_key_come_from_recipient(self) -> None:
+        body = self.service.create_session(self._session_payload())
+        self.assertEqual(body["identity_key"], self.recp_identity)
+        self.assertEqual(body["public_key"], self.recp_prekey)
+
+    def test_session_id_is_unique_and_nonempty(self) -> None:
+        first = self.service.create_session(self._session_payload())
+        second = self.service.create_session(self._session_payload())
+        self.assertTrue(first["session_id"])
+        self.assertNotEqual(first["session_id"], second["session_id"])
+
+    def test_repeated_post_creates_a_new_session(self) -> None:
+        payload = self._session_payload()
+        first = self.service.create_session(payload)
+        second = self.service.create_session(payload)
+        self.assertNotEqual(first["session_id"], second["session_id"])
+        self.assertEqual(self.service.get_session(first["session_id"])["session_id"],
+                         first["session_id"])
+        self.assertEqual(self.service.get_session(second["session_id"])["session_id"],
+                         second["session_id"])
+
+    def test_created_at_is_utc_iso8601_with_zulu_offset(self) -> None:
+        from datetime import timedelta
+
+        body = self.service.create_session(self._session_payload())
+        stamp = body["created_at"]
+        self.assertTrue(stamp.endswith("+00:00"))
+        parsed = datetime.fromisoformat(stamp)
+        self.assertEqual(parsed.utcoffset(), timedelta(0))
+
+
+class SessionValidationTest(_SessionTestBase):
+    def _assert_400(self, payload: object, field: str) -> None:
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.create_session(payload)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.field, field)
+
+    def test_body_must_be_object(self) -> None:
+        self._assert_400(["nope"], "request_body")
+        self._assert_400("nope", "request_body")
+
+    def test_missing_fields(self) -> None:
+        for name in ("initiator_device_id", "recipient_device_id",
+                     "prekey_id", "ephemeral_key"):
+            payload = self._session_payload()
+            del payload[name]
+            self._assert_400(payload, name)
+
+    def test_fields_must_be_nonempty_strings(self) -> None:
+        self._assert_400(self._session_payload(initiator_device_id=""),
+                         "initiator_device_id")
+        self._assert_400(self._session_payload(recipient_device_id=7),
+                         "recipient_device_id")
+        self._assert_400(self._session_payload(prekey_id=None), "prekey_id")
+        self._assert_400(self._session_payload(ephemeral_key=["x"]),
+                         "ephemeral_key")
+
+    def test_ephemeral_key_must_use_public_key_encoding(self) -> None:
+        self._assert_400(self._session_payload(ephemeral_key="not-a-key"),
+                         "ephemeral_key")
+
+    def test_initiator_equal_recipient_is_400_on_recipient_field(self) -> None:
+        self._assert_400(
+            self._session_payload(recipient_device_id=self.INITIATOR),
+            "recipient_device_id")
+
+
+class SessionLookupTest(_SessionTestBase):
+    def test_unknown_initiator_is_404(self) -> None:
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.create_session(
+                self._session_payload(initiator_device_id="ghost"))
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.field, "initiator_device_id")
+
+    def test_unknown_recipient_is_404(self) -> None:
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.create_session(
+                self._session_payload(recipient_device_id="ghost"))
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.field, "recipient_device_id")
+
+    def test_unknown_prekey_is_404(self) -> None:
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.create_session(
+                self._session_payload(prekey_id="ghost"))
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.field, "prekey_id")
+
+    def test_revoked_initiator_is_409(self) -> None:
+        self.service.revoke_device(self.INITIATOR)
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.create_session(self._session_payload())
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.field, "initiator_device_id")
+
+    def test_revoked_recipient_is_409(self) -> None:
+        self.service.revoke_device(self.RECIPIENT)
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.create_session(self._session_payload())
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.field, "recipient_device_id")
+
+    def test_revoked_prekey_is_409(self) -> None:
+        self.service.revoke_prekey(self.RECIPIENT, self.PREKEY)
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.create_session(self._session_payload())
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.field, "prekey_id")
+
+    def test_failed_creation_writes_nothing(self) -> None:
+        cases = (
+            self._session_payload(initiator_device_id="ghost"),
+            self._session_payload(recipient_device_id="ghost"),
+            self._session_payload(prekey_id="ghost"),
+        )
+        for payload in cases:
+            with self.assertRaises(ServiceError):
+                self.service.create_session(payload)
+        self.service.revoke_prekey(self.RECIPIENT, self.PREKEY)
+        with self.assertRaises(ServiceError):
+            self.service.create_session(self._session_payload())
+        self.assertEqual(self.service.store._sessions, {})
+
+
+class SessionSnapshotTest(_SessionTestBase):
+    def test_get_unknown_session_is_404(self) -> None:
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.get_session("deadbeef")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.field, "session_id")
+
+    def test_get_returns_same_snapshot_as_create(self) -> None:
+        created = self.service.create_session(self._session_payload())
+        fetched = self.service.get_session(created["session_id"])
+        self.assertEqual(fetched, created)
+
+    def test_revocation_does_not_change_snapshot(self) -> None:
+        created = self.service.create_session(self._session_payload())
+        self.service.revoke_prekey(self.RECIPIENT, self.PREKEY)
+        self.service.revoke_device(self.RECIPIENT)
+        self.service.revoke_device(self.INITIATOR)
+        self.assertEqual(self.service.get_session(created["session_id"]), created)
+
+
+class SessionAtomicityTest(unittest.TestCase):
+    """Creation and revocation are linearized under one lock: revoke-first
+    makes creation fail (409, nothing written); create-first succeeds and the
+    session snapshot is retained despite the subsequent revocation.
+
+    The atomic contract is the storage-level critical section, so the race
+    pits ``store.create_session`` directly against the revocation, with tiny
+    randomized stalls so both orderings are actually exercised.
+    """
+
+    def test_create_vs_device_revoke(self) -> None:
+        self._race(lambda store: store.revoke_device("db"),
+                   "recipient_revoked", "recipient_device_id")
+
+    def test_create_vs_prekey_revoke(self) -> None:
+        self._race(lambda store: store.revoke_prekey_by_id("db", "pk"),
+                   "prekey_revoked", "prekey_id")
+
+    def _race(self, revoke: object, revoked_reason: str,
+              conflict_field: str) -> None:
+        import random
+        import time
+
+        from e2ee_backend.storage import SessionCreateError
+
+        rng = random.Random(0xC0FFEE)
+        seen_created = 0
+        seen_conflict = 0
+        for _ in range(500):
+            service = DeviceService()
+            service.register({
+                "user_id": "u1", "device_id": "da",
+                "identity_key": _raw_key_b64(),
+                "signed_prekeys": []})
+            service.register({
+                "user_id": "u2", "device_id": "db",
+                "identity_key": _raw_key_b64(),
+                "signed_prekeys": [{"key_id": "pk",
+                                    "public_key": _raw_key_b64()}]})
+            store = service.store
+            ephemeral = _raw_key_b64()
+
+            barrier = threading.Barrier(2)
+            outcome: list = []
+
+            def create() -> None:
+                barrier.wait()
+                time.sleep(rng.random() * 25e-6)
+                try:
+                    session = store.create_session(
+                        "da", "db", "pk", ephemeral)
+                    outcome.append(("created", session.session_id))
+                except SessionCreateError as error:
+                    outcome.append(("conflict", error.reason))
+
+            def do_revoke() -> None:
+                barrier.wait()
+                time.sleep(rng.random() * 25e-6)
+                revoke(store)
+
+            threads = [threading.Thread(target=create),
+                       threading.Thread(target=do_revoke)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            kind, value = outcome[0]
+            if kind == "created":
+                seen_created += 1
+                # Create linearized first: one session exists and its snapshot
+                # survives the revocation that landed afterwards.
+                self.assertEqual(len(store._sessions), 1)
+                view = service.get_session(value)
+                self.assertEqual(view["session_id"], value)
+                self.assertEqual(view["ephemeral_key"], ephemeral)
+            else:
+                seen_conflict += 1
+                # Revocation linearized first: correct reason, nothing written.
+                self.assertEqual(value, revoked_reason)
+                self.assertEqual(store._sessions, {})
+
+            if seen_created and seen_conflict:
+                break
+
+        self.assertGreater(seen_created, 0,
+                           "create-first ordering never observed")
+        self.assertGreater(seen_conflict, 0,
+                           "revoke-first ordering never observed")
 
 
 if __name__ == "__main__":

@@ -9,9 +9,30 @@ from typing import Any, Dict, List, Optional
 
 from .crypto import is_nonempty_string, load_public_key
 from .models import Device, SignedPreKey
-from .storage import DeviceStore
+from .storage import (
+    SESSION_INITIATOR_REVOKED,
+    SESSION_INITIATOR_UNKNOWN,
+    SESSION_PREKEY_REVOKED,
+    SESSION_PREKEY_UNKNOWN,
+    SESSION_RECIPIENT_REVOKED,
+    SESSION_RECIPIENT_UNKNOWN,
+    DeviceStore,
+    SessionCreateError,
+)
 
 _REQUIRED_SCALAR_FIELDS = ("user_id", "device_id", "identity_key")
+_SESSION_SCALAR_FIELDS = (
+    "initiator_device_id", "recipient_device_id", "prekey_id", "ephemeral_key")
+
+#: Maps a storage-level session failure reason to (HTTP status, field name).
+_SESSION_ERROR_MAP = {
+    SESSION_INITIATOR_UNKNOWN: (404, "initiator_device_id"),
+    SESSION_RECIPIENT_UNKNOWN: (404, "recipient_device_id"),
+    SESSION_PREKEY_UNKNOWN: (404, "prekey_id"),
+    SESSION_INITIATOR_REVOKED: (409, "initiator_device_id"),
+    SESSION_RECIPIENT_REVOKED: (409, "recipient_device_id"),
+    SESSION_PREKEY_REVOKED: (409, "prekey_id"),
+}
 
 
 class ServiceError(Exception):
@@ -130,3 +151,60 @@ class DeviceService:
             raise ServiceError(f"pre-key not found: {key_id}",
                                "key_id", status_code=404)
         return {"device_id": device.device_id, "key_id": key_id, "revoked": True}
+
+    # -- sessions ----------------------------------------------------------
+
+    def create_session(self, payload: object) -> Dict[str, Any]:
+        """Validate a session-negotiation payload and atomically create it.
+
+        Every request creates a fresh session (a new ``session_id``); repeated
+        POSTs are never deduplicated.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+
+        for name in _SESSION_SCALAR_FIELDS:
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        if load_public_key(payload["ephemeral_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: ephemeral_key",
+                "ephemeral_key")
+
+        if payload["initiator_device_id"] == payload["recipient_device_id"]:
+            raise ServiceError(
+                "recipient_device_id must differ from initiator_device_id",
+                "recipient_device_id")
+
+        try:
+            session = self.store.create_session(
+                payload["initiator_device_id"],
+                payload["recipient_device_id"],
+                payload["prekey_id"],
+                payload["ephemeral_key"])
+        except SessionCreateError as error:
+            status_code, field = _SESSION_ERROR_MAP[error.reason]
+            if status_code == 404:
+                if field == "prekey_id":
+                    message = f"pre-key not found: {payload['prekey_id']}"
+                else:
+                    device_id = payload[field]
+                    message = f"device not found: {device_id}"
+            else:
+                message = f"{field} is revoked"
+            raise ServiceError(message, field, status_code=status_code)
+
+        return self.store.session_view(session.session_id)  # type: ignore[return-value]
+
+    def get_session(self, session_id: str) -> Dict[str, Any]:
+        """Return the immutable eight-field session snapshot; 404 if unknown."""
+        view = self.store.session_view(session_id)
+        if view is None:
+            raise ServiceError(f"session not found: {session_id}",
+                               "session_id", status_code=404)
+        return view

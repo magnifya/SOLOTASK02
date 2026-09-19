@@ -166,7 +166,11 @@ class CLITest(unittest.TestCase):
                           ["revoke-prekey", "--device-id", "d1",
                            "--key-id", "k1"],
                           ["register", "--user-id", "u1", "--device-id", "dx",
-                           "--identity-key", _raw_key_b64()]):
+                           "--identity-key", _raw_key_b64()],
+                          ["create-session", "--initiator-device-id", "da",
+                           "--recipient-device-id", "db", "--prekey-id", "pk",
+                           "--ephemeral-key", _raw_key_b64()],
+                          ["show-session", "sid"]):
             result = subprocess.run(
                 [_sys.executable, "-m", "e2ee_backend",
                  "--base-url", "http://127.0.0.1:1", *arguments],
@@ -175,6 +179,103 @@ class CLITest(unittest.TestCase):
             self.assertEqual(json.loads(result.stderr.strip())["field"],
                              "server", arguments)
             self.assertNotIn("Traceback", result.stderr)
+
+
+class CLISessionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server, _ = create_server("127.0.0.1", 0)
+        self.port = self.server.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _run(self, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "e2ee_backend", "--base-url", self.base_url,
+             *arguments],
+            capture_output=True, text=True, timeout=15)
+
+    def _register(self, device_id: str) -> None:
+        result = self._run(
+            "register", "--user-id", f"u-{device_id}", "--device-id", device_id,
+            "--identity-key", _raw_key_b64(),
+            "--prekey", f"pk:{_raw_key_b64()}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _create_session(self) -> dict:
+        result = self._run(
+            "create-session", "--initiator-device-id", "da",
+            "--recipient-device-id", "db", "--prekey-id", "pk",
+            "--ephemeral-key", _raw_key_b64())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = result.stdout.strip()
+        self.assertEqual(line.count("\n"), 0)
+        return json.loads(line)
+
+    def test_create_session_prints_single_line_eight_field_json(self) -> None:
+        self._register("da")
+        self._register("db")
+        body = self._create_session()
+        self.assertEqual(set(body), {
+            "session_id", "initiator_device_id", "recipient_device_id",
+            "prekey_id", "ephemeral_key", "identity_key", "public_key",
+            "created_at"})
+
+    def test_show_session_prints_identical_snapshot(self) -> None:
+        self._register("da")
+        self._register("db")
+        created = self._create_session()
+        result = self._run("show-session", created["session_id"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.strip()), created)
+        repeated = self._run("show-session", created["session_id"])
+        self.assertEqual(repeated.stdout, result.stdout)
+
+    def test_show_session_unknown_is_error_json(self) -> None:
+        result = self._run("show-session", "ghost")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.strip(), "")
+        self.assertEqual(json.loads(result.stderr.strip())["field"],
+                         "session_id")
+
+    def test_create_session_validation_error_names_field(self) -> None:
+        self._register("da")
+        self._register("db")
+        result = self._run(
+            "create-session", "--initiator-device-id", "da",
+            "--recipient-device-id", "db", "--prekey-id", "pk",
+            "--ephemeral-key", "garbage")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr.strip())["field"],
+                         "ephemeral_key")
+
+    def test_create_session_unknown_recipient_is_404_json(self) -> None:
+        self._register("da")
+        result = self._run(
+            "create-session", "--initiator-device-id", "da",
+            "--recipient-device-id", "ghost", "--prekey-id", "pk",
+            "--ephemeral-key", _raw_key_b64())
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr.strip())["field"],
+                         "recipient_device_id")
+
+    def test_create_session_revoked_recipient_is_409_json(self) -> None:
+        self._register("da")
+        self._register("db")
+        revoked = self._run("revoke-device", "--device-id", "db")
+        self.assertEqual(revoked.returncode, 0, revoked.stderr)
+        result = self._run(
+            "create-session", "--initiator-device-id", "da",
+            "--recipient-device-id", "db", "--prekey-id", "pk",
+            "--ephemeral-key", _raw_key_b64())
+        self.assertEqual(result.returncode, 1)
+        body = json.loads(result.stderr.strip())
+        self.assertEqual(body["field"], "recipient_device_id")
 
 
 if __name__ == "__main__":

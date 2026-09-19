@@ -7,9 +7,26 @@ order, so repeated requests list them identically.
 from __future__ import annotations
 
 import threading
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from .models import Device
+from .models import Device, Session
+
+#: Outcome codes for a failed atomic session creation.
+SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
+SESSION_RECIPIENT_UNKNOWN = "recipient_unknown"
+SESSION_PREKEY_UNKNOWN = "prekey_unknown"
+SESSION_INITIATOR_REVOKED = "initiator_revoked"
+SESSION_RECIPIENT_REVOKED = "recipient_revoked"
+SESSION_PREKEY_REVOKED = "prekey_revoked"
+
+
+class SessionCreateError(Exception):
+    """An atomic session lookup/revocation check failed (nothing was written)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class DeviceStore:
@@ -23,6 +40,7 @@ class DeviceStore:
         self._lock = threading.RLock()
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
+        self._sessions: Dict[str, Session] = {}
 
     def add_device(self, device: Device) -> bool:
         """Insert a device.
@@ -115,4 +133,73 @@ class DeviceStore:
                 "prekey_ids": [pk.key_id for pk in device.prekeys
                                if not pk.revoked],
                 "registered_at": device.registered_at,
+            }
+
+    # -- sessions ----------------------------------------------------------
+
+    def create_session(self, initiator_device_id: str, recipient_device_id: str,
+                       prekey_id: str, ephemeral_key: str) -> Session:
+        """Atomically validate and create one session.
+
+        Lookups, revocation checks and the insert all happen while holding the
+        store lock (the same lock device/pre-key revocations take), so a
+        concurrent revocation is linearized either wholly before this call
+        (then it fails) or wholly after it (then the session is retained).
+        On any failure nothing is written and :class:`SessionCreateError`
+        carries the reason.
+        """
+        with self._lock:
+            initiator = self._device_index.get(initiator_device_id)
+            initiator = self._devices.get(initiator) if initiator is not None else None
+            if initiator is None:
+                raise SessionCreateError(SESSION_INITIATOR_UNKNOWN)
+            if initiator.revoked:
+                raise SessionCreateError(SESSION_INITIATOR_REVOKED)
+
+            recipient_key = self._device_index.get(recipient_device_id)
+            recipient = (self._devices.get(recipient_key)
+                         if recipient_key is not None else None)
+            if recipient is None:
+                raise SessionCreateError(SESSION_RECIPIENT_UNKNOWN)
+            if recipient.revoked:
+                raise SessionCreateError(SESSION_RECIPIENT_REVOKED)
+
+            used_prekey = next((pk for pk in recipient.prekeys
+                                if pk.key_id == prekey_id), None)
+            if used_prekey is None:
+                raise SessionCreateError(SESSION_PREKEY_UNKNOWN)
+            if used_prekey.revoked:
+                raise SessionCreateError(SESSION_PREKEY_REVOKED)
+
+            session = Session(
+                session_id=uuid.uuid4().hex,
+                initiator_device_id=initiator_device_id,
+                recipient_device_id=recipient_device_id,
+                prekey_id=prekey_id,
+                ephemeral_key=ephemeral_key,
+                identity_key=recipient.identity_key,
+                public_key=used_prekey.public_key,
+            )
+            self._sessions[session.session_id] = session
+            return session
+
+    def session_view(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the immutable eight-field snapshot of a session, or ``None``.
+
+        The values are copied under the lock; session records are never
+        mutated after creation, so revocations cannot change this view.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            return {
+                "session_id": session.session_id,
+                "initiator_device_id": session.initiator_device_id,
+                "recipient_device_id": session.recipient_device_id,
+                "prekey_id": session.prekey_id,
+                "ephemeral_key": session.ephemeral_key,
+                "identity_key": session.identity_key,
+                "public_key": session.public_key,
+                "created_at": session.created_at,
             }

@@ -244,5 +244,210 @@ class HTTPRevokeTest(unittest.TestCase):
         self.assertEqual(body["device_id"], device_id)
 
 
+class HTTPSessionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server, _ = create_server("127.0.0.1", 0)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _request(self, method: str, path: str, body: object = None):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps(body) if body is not None else None
+        headers = {"Content-Type": "application/json"} if payload is not None else {}
+        connection.request(method, path, body=payload, headers=headers)
+        response = connection.getresponse()
+        data = response.read().decode("utf-8")
+        connection.close()
+        return response.status, json.loads(data)
+
+    def _register(self, device_id: str, prekey_ids=("pk",)) -> None:
+        status, _ = self._request("POST", "/v1/devices", {
+            "user_id": f"u-{device_id}", "device_id": device_id,
+            "identity_key": _raw_key_b64(),
+            "signed_prekeys": [{"key_id": key_id, "public_key": _raw_key_b64()}
+                               for key_id in prekey_ids]})
+        self.assertEqual(status, 201)
+
+    def _session_payload(self, **overrides: object) -> dict:
+        payload = {
+            "initiator_device_id": "da",
+            "recipient_device_id": "db",
+            "prekey_id": "pk",
+            "ephemeral_key": _raw_key_b64(),
+        }
+        payload.update(overrides)
+        return payload
+
+    def _create_session(self) -> dict:
+        self._register("da")
+        self._register("db")
+        status, body = self._request("POST", "/v1/sessions",
+                                     self._session_payload())
+        self.assertEqual(status, 201, body)
+        return body
+
+    def test_create_session_201_with_eight_fields(self) -> None:
+        body = self._create_session()
+        self.assertEqual(set(body), {
+            "session_id", "initiator_device_id", "recipient_device_id",
+            "prekey_id", "ephemeral_key", "identity_key", "public_key",
+            "created_at"})
+        self.assertTrue(body["session_id"])
+        self.assertTrue(body["created_at"].endswith("+00:00"))
+
+    def test_echo_and_recipient_key_material(self) -> None:
+        recp_identity = _raw_key_b64()
+        recp_prekey = _raw_key_b64()
+        status, _ = self._request("POST", "/v1/devices", {
+            "user_id": "u-db", "device_id": "db",
+            "identity_key": recp_identity,
+            "signed_prekeys": [{"key_id": "pk", "public_key": recp_prekey}]})
+        self.assertEqual(status, 201)
+        self._register("da")
+        ephemeral = _raw_key_b64()
+        status, body = self._request(
+            "POST", "/v1/sessions",
+            self._session_payload(ephemeral_key=ephemeral))
+        self.assertEqual(status, 201)
+        self.assertEqual(body["initiator_device_id"], "da")
+        self.assertEqual(body["recipient_device_id"], "db")
+        self.assertEqual(body["prekey_id"], "pk")
+        self.assertEqual(body["ephemeral_key"], ephemeral)
+        self.assertEqual(body["identity_key"], recp_identity)
+        self.assertEqual(body["public_key"], recp_prekey)
+
+    def test_repeated_post_creates_distinct_sessions(self) -> None:
+        body = self._create_session()
+        status, second = self._request(
+            "POST", "/v1/sessions",
+            self._session_payload(ephemeral_key=_raw_key_b64()))
+        self.assertEqual(status, 201)
+        self.assertNotEqual(body["session_id"], second["session_id"])
+
+    def test_get_session_200_matches_create(self) -> None:
+        created = self._create_session()
+        status, fetched = self._request(
+            "GET", f"/v1/sessions/{created['session_id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched, created)
+
+    def test_get_unknown_session_is_404_field_session_id(self) -> None:
+        status, body = self._request("GET", "/v1/sessions/nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["field"], "session_id")
+
+    def test_session_missing_field_is_400(self) -> None:
+        self._register("da")
+        self._register("db")
+        for name in ("initiator_device_id", "recipient_device_id",
+                     "prekey_id", "ephemeral_key"):
+            payload = self._session_payload()
+            del payload[name]
+            status, body = self._request("POST", "/v1/sessions", payload)
+            self.assertEqual(status, 400, name)
+            self.assertEqual(body["field"], name, name)
+
+    def test_session_bad_field_type_is_400(self) -> None:
+        self._register("da")
+        self._register("db")
+        status, body = self._request(
+            "POST", "/v1/sessions",
+            self._session_payload(recipient_device_id=42))
+        self.assertEqual(status, 400)
+        self.assertEqual(body["field"], "recipient_device_id")
+
+    def test_ephemeral_key_bad_encoding_is_400(self) -> None:
+        self._register("da")
+        self._register("db")
+        status, body = self._request(
+            "POST", "/v1/sessions",
+            self._session_payload(ephemeral_key="garbage"))
+        self.assertEqual(status, 400)
+        self.assertEqual(body["field"], "ephemeral_key")
+
+    def test_session_body_not_json_is_400(self) -> None:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("POST", "/v1/sessions", body=b"{bad",
+                           headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        connection.close()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(body["field"], "request_body")
+
+    def test_same_initiator_and_recipient_is_400(self) -> None:
+        self._register("da")
+        status, body = self._request(
+            "POST", "/v1/sessions",
+            self._session_payload(recipient_device_id="da"))
+        self.assertEqual(status, 400)
+        self.assertEqual(body["field"], "recipient_device_id")
+
+    def test_unknown_devices_and_prekey_are_404(self) -> None:
+        self._register("da")
+        self._register("db")
+        cases = (
+            (self._session_payload(initiator_device_id="ghost"),
+             "initiator_device_id"),
+            (self._session_payload(recipient_device_id="ghost"),
+             "recipient_device_id"),
+            (self._session_payload(prekey_id="ghost"), "prekey_id"),
+        )
+        for payload, field in cases:
+            status, body = self._request("POST", "/v1/sessions", payload)
+            self.assertEqual(status, 404, field)
+            self.assertEqual(body["field"], field, field)
+
+    def test_revoked_parties_are_409(self) -> None:
+        self._register("da")
+        self._register("db")
+        self._register("dc")
+
+        self.assertEqual(self._request("POST", "/v1/devices/da/revoke")[0], 200)
+        status, body = self._request("POST", "/v1/sessions",
+                                     self._session_payload())
+        self.assertEqual(status, 409)
+        self.assertEqual(body["field"], "initiator_device_id")
+
+        # Fresh initiator dc; now revoke the recipient db.
+        self.assertEqual(self._request("POST", "/v1/devices/db/revoke")[0], 200)
+        status, body = self._request(
+            "POST", "/v1/sessions",
+            self._session_payload(initiator_device_id="dc"))
+        self.assertEqual(status, 409)
+        self.assertEqual(body["field"], "recipient_device_id")
+
+    def test_revoked_prekey_is_409(self) -> None:
+        self._register("da")
+        self._register("db")
+        self.assertEqual(
+            self._request("POST", "/v1/devices/db/prekeys/pk/revoke")[0], 200)
+        status, body = self._request("POST", "/v1/sessions",
+                                     self._session_payload())
+        self.assertEqual(status, 409)
+        self.assertEqual(body["field"], "prekey_id")
+
+    def test_snapshot_survives_later_revocations(self) -> None:
+        created = self._create_session()
+        self.assertEqual(
+            self._request("POST", "/v1/devices/db/prekeys/pk/revoke")[0], 200)
+        self.assertEqual(self._request("POST", "/v1/devices/db/revoke")[0], 200)
+        status, fetched = self._request(
+            "GET", f"/v1/sessions/{created['session_id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched, created)
+
+    def test_session_id_with_slash_subpath_is_404(self) -> None:
+        status, body = self._request("GET", "/v1/sessions/a/b")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["field"], "session_id")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
-"""Command-line entry point: ``register`` / ``show`` (plus ``serve``).
+"""Command-line entry point: device and session API commands (plus ``serve``).
 
-Both API commands talk to an HTTP server and print the server's JSON response
+All API commands talk to an HTTP server and print the server's JSON response
 on a single line, with exactly the field names used over HTTP.
 """
 from __future__ import annotations
@@ -116,6 +116,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_revoke_prekey.add_argument("--key-id", required=True)
     p_revoke_prekey.set_defaults(handler=cmd_revoke_prekey)
 
+    p_create_session = sub.add_parser(
+        "create-session", help="negotiate a session between two devices")
+    p_create_session.add_argument("--initiator-device-id", required=True)
+    p_create_session.add_argument("--recipient-device-id", required=True)
+    p_create_session.add_argument("--prekey-id", required=True)
+    p_create_session.add_argument(
+        "--ephemeral-key", required=True,
+        help="ephemeral public key (string), or @path to read it from a file")
+    p_create_session.set_defaults(handler=cmd_create_session)
+
+    p_show_session = sub.add_parser("show-session", help="show a session snapshot")
+    p_show_session.add_argument("session_id")
+    p_show_session.set_defaults(handler=cmd_show_session)
+
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
@@ -186,6 +200,38 @@ def cmd_revoke_prekey(args: argparse.Namespace) -> int:
            f"{quote(args.key_id, safe='')}/revoke")
     try:
         status, response = _request_json("POST", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def cmd_create_session(args: argparse.Namespace) -> int:
+    """Call POST /v1/sessions and print the single-line JSON response."""
+    payload = {
+        "initiator_device_id": args.initiator_device_id,
+        "recipient_device_id": args.recipient_device_id,
+        "prekey_id": args.prekey_id,
+        "ephemeral_key": _read_key_argument(args.ephemeral_key),
+    }
+    try:
+        status, response = _request_json("POST", f"{args.base_url}/v1/sessions",
+                                         body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 201 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 201 else 1
+
+
+def cmd_show_session(args: argparse.Namespace) -> int:
+    """Call GET /v1/sessions/{session_id} and print the single-line JSON."""
+    from urllib.parse import quote
+
+    url = f"{args.base_url}/v1/sessions/{quote(args.session_id, safe='')}"
+    try:
+        status, response = _request_json("GET", url)
     except ServerUnavailable:
         return _emit_server_error()
     stream = sys.stdout if status == 200 else sys.stderr
