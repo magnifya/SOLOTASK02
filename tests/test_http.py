@@ -449,5 +449,193 @@ class HTTPSessionTest(unittest.TestCase):
         self.assertEqual(body["field"], "session_id")
 
 
+class HTTPMessageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server, _ = create_server("127.0.0.1", 0)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _request(self, method: str, path: str, body: object = None):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps(body) if body is not None else None
+        headers = {"Content-Type": "application/json"} if payload is not None else {}
+        connection.request(method, path, body=payload, headers=headers)
+        response = connection.getresponse()
+        data = response.read().decode("utf-8")
+        connection.close()
+        return response.status, json.loads(data)
+
+    def _setup_session(self) -> str:
+        self._request("POST", "/v1/devices", {
+            "user_id": "u1", "device_id": "da",
+            "identity_key": _raw_key_b64(), "signed_prekeys": []})
+        self._request("POST", "/v1/devices", {
+            "user_id": "u2", "device_id": "db",
+            "identity_key": _raw_key_b64(),
+            "signed_prekeys": [{"key_id": "pk",
+                                "public_key": _raw_key_b64()}]})
+        status, session = self._request("POST", "/v1/sessions", {
+            "initiator_device_id": "da", "recipient_device_id": "db",
+            "prekey_id": "pk", "ephemeral_key": _raw_key_b64()})
+        self.assertEqual(status, 201)
+        return session["session_id"]
+
+    def _message(self, session_id: str, sequence: int,
+                 message_id: str = "m", sender: str = "da") -> dict:
+        return {"session_id": session_id, "sender_device_id": sender,
+                "message_id": message_id, "sequence": sequence,
+                "nonce": f"nonce-{sequence}",
+                "ciphertext": f"ciphertext-{sequence}"}
+
+    def test_send_is_201_with_created_at(self) -> None:
+        session_id = self._setup_session()
+        status, body = self._request(
+            "POST", "/v1/messages", self._message(session_id, 1, "m1"))
+        self.assertEqual(status, 201)
+        self.assertEqual(set(body), {
+            "session_id", "sender_device_id", "message_id", "sequence",
+            "nonce", "ciphertext", "created_at"})
+        self.assertTrue(body["created_at"].endswith("+00:00"))
+
+    def test_pull_returns_messages_and_next_after(self) -> None:
+        session_id = self._setup_session()
+        for sequence in (1, 2, 3):
+            status, _ = self._request(
+                "POST", "/v1/messages",
+                self._message(session_id, sequence, f"m{sequence}"))
+            self.assertEqual(status, 201)
+        status, body = self._request(
+            "GET", f"/v1/messages/{session_id}?device_id=db")
+        self.assertEqual(status, 200)
+        self.assertEqual([m["sequence"] for m in body["messages"]], [1, 2, 3])
+        self.assertEqual(body["next_after"], 3)
+
+    def test_pull_paging(self) -> None:
+        session_id = self._setup_session()
+        for sequence in (1, 2, 3):
+            self._request("POST", "/v1/messages",
+                          self._message(session_id, sequence, f"m{sequence}"))
+        status, body = self._request(
+            "GET", f"/v1/messages/{session_id}?device_id=db&after=1&limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual([m["sequence"] for m in body["messages"]], [2])
+        self.assertEqual(body["next_after"], 2)
+        status, body = self._request(
+            "GET", f"/v1/messages/{session_id}?device_id=db&after=3")
+        self.assertEqual(body, {"messages": [], "next_after": 3})
+
+    def test_pull_empty_session(self) -> None:
+        session_id = self._setup_session()
+        status, body = self._request(
+            "GET", f"/v1/messages/{session_id}?device_id=da")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"messages": [], "next_after": 0})
+
+    def test_send_unknown_session_is_404(self) -> None:
+        self._setup_session()
+        status, body = self._request(
+            "POST", "/v1/messages", self._message("ghost", 1))
+        self.assertEqual(status, 404)
+        self.assertEqual(body["field"], "session_id")
+
+    def test_pull_unknown_session_is_404(self) -> None:
+        status, body = self._request(
+            "GET", "/v1/messages/ghost?device_id=da")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["field"], "session_id")
+
+    def test_send_inactive_sender_is_409(self) -> None:
+        session_id = self._setup_session()
+        status, body = self._request(
+            "POST", "/v1/messages",
+            self._message(session_id, 1, "m1", sender="ghost"))
+        self.assertEqual(status, 409)
+        self.assertEqual(body["field"], "sender_device_id")
+
+    def test_duplicate_id_and_bad_sequence_are_409(self) -> None:
+        session_id = self._setup_session()
+        self._request("POST", "/v1/messages",
+                      self._message(session_id, 1, "m1"))
+        status, body = self._request(
+            "POST", "/v1/messages",
+            self._message(session_id, 2, "m1"))
+        self.assertEqual(status, 409)
+        self.assertEqual(body["field"], "message_id")
+        status, body = self._request(
+            "POST", "/v1/messages",
+            self._message(session_id, 9, "m9"))
+        self.assertEqual(status, 409)
+        self.assertEqual(body["field"], "sequence")
+
+    def test_send_missing_and_typed_fields_are_400(self) -> None:
+        session_id = self._setup_session()
+        for name in ("session_id", "sender_device_id", "message_id",
+                     "sequence", "nonce", "ciphertext"):
+            payload = self._message(session_id, 1)
+            del payload[name]
+            status, body = self._request("POST", "/v1/messages", payload)
+            self.assertEqual(status, 400, name)
+            self.assertEqual(body["field"], name, name)
+        status, body = self._request(
+            "POST", "/v1/messages",
+            self._message(session_id, 1, sender=42))
+        self.assertEqual(status, 400)
+        self.assertEqual(body["field"], "sender_device_id")
+        bad = self._message(session_id, 1)
+        bad["sequence"] = "1"
+        status, body = self._request("POST", "/v1/messages", bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["field"], "sequence")
+
+    def test_pull_requires_device_id(self) -> None:
+        session_id = self._setup_session()
+        status, body = self._request(
+            "GET", f"/v1/messages/{session_id}")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["field"], "device_id")
+
+    def test_pull_inactive_device_is_409(self) -> None:
+        session_id = self._setup_session()
+        status, body = self._request(
+            "GET", f"/v1/messages/{session_id}?device_id=ghost")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["field"], "device_id")
+
+    def test_pull_bad_params_are_400(self) -> None:
+        session_id = self._setup_session()
+        for query, field in (
+                ("after=-1", "after"),
+                ("after=x", "after"),
+                ("limit=0", "limit"),
+                ("limit=101", "limit"),
+                ("limit=x", "limit")):
+            status, body = self._request(
+                "GET", f"/v1/messages/{session_id}?device_id=da&{query}")
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body["field"], field, query)
+
+    def test_message_body_not_json_is_400(self) -> None:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("POST", "/v1/messages", body=b"{bad",
+                           headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        connection.close()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(body["field"], "request_body")
+
+    def test_message_subpath_is_404(self) -> None:
+        status, body = self._request("GET", "/v1/messages/a/b?device_id=da")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["field"], "session_id")
+
+
 if __name__ == "__main__":
     unittest.main()

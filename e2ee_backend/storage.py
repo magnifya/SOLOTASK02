@@ -10,7 +10,7 @@ import threading
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from .models import Device, Session
+from .models import Device, Message, Session
 
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
@@ -20,9 +20,24 @@ SESSION_INITIATOR_REVOKED = "initiator_revoked"
 SESSION_RECIPIENT_REVOKED = "recipient_revoked"
 SESSION_PREKEY_REVOKED = "prekey_revoked"
 
+#: Outcome codes for a failed message append / pull.
+MESSAGE_SESSION_UNKNOWN = "session_unknown"
+MESSAGE_SENDER_INACTIVE = "sender_inactive"
+MESSAGE_DEVICE_INACTIVE = "device_inactive"
+MESSAGE_DUPLICATE_ID = "duplicate_message_id"
+MESSAGE_BAD_SEQUENCE = "bad_sequence"
+
 
 class SessionCreateError(Exception):
     """An atomic session lookup/revocation check failed (nothing was written)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class MessageError(Exception):
+    """An atomic message append/pull failed (nothing was written)."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -41,6 +56,7 @@ class DeviceStore:
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
+        self._messages: Dict[str, List[Message]] = {}
 
     def add_device(self, device: Device) -> bool:
         """Insert a device.
@@ -203,3 +219,72 @@ class DeviceStore:
                 "public_key": session.public_key,
                 "created_at": session.created_at,
             }
+
+    # -- messages ----------------------------------------------------------
+
+    def _active_device(self, device_id: str) -> Optional[Device]:
+        """Return the device if it exists and is not revoked, else ``None``."""
+        key = self._device_index.get(device_id)
+        device = self._devices.get(key) if key is not None else None
+        if device is None or device.revoked:
+            return None
+        return device
+
+    def append_message(self, session_id: str, sender_device_id: str,
+                       message_id: str, sequence: int, nonce: str,
+                       ciphertext: str) -> Message:
+        """Atomically validate and append one message.
+
+        Sequences are contiguous starting at 1 and ``message_id`` is unique
+        within the session. The session lookup, sender activity check,
+        duplicate/sequence checks and the insert all happen under the store
+        lock, so concurrent appends are linearized: exactly one sender wins
+        each sequence number and a duplicate id never slips through. Raises
+        :class:`MessageError` (nothing written) on any failure.
+        """
+        with self._lock:
+            if session_id not in self._sessions:
+                raise MessageError(MESSAGE_SESSION_UNKNOWN)
+            if self._active_device(sender_device_id) is None:
+                raise MessageError(MESSAGE_SENDER_INACTIVE)
+
+            messages = self._messages.setdefault(session_id, [])
+            if any(message.message_id == message_id for message in messages):
+                raise MessageError(MESSAGE_DUPLICATE_ID)
+            expected = len(messages) + 1
+            if sequence != expected:
+                raise MessageError(MESSAGE_BAD_SEQUENCE)
+
+            message = Message(
+                session_id=session_id,
+                sender_device_id=sender_device_id,
+                message_id=message_id,
+                sequence=sequence,
+                nonce=nonce,
+                ciphertext=ciphertext,
+            )
+            messages.append(message)
+            return message
+
+    def message_page(self, session_id: str, device_id: str,
+                     after: int, limit: int) -> Tuple[List[Message], int]:
+        """Return up to *limit* messages with ``sequence > after``, ascending.
+
+        The pulling device must be active (registered and not revoked); the
+        contract does not further require it to be a session participant.
+        Returns ``(messages, next_after)`` where ``next_after`` is *after*
+        unchanged when the page is empty, otherwise the sequence of the last
+        returned message. Values are read under the store lock, so a
+        concurrent append is observed either wholly before or after this read.
+        """
+        with self._lock:
+            if session_id not in self._sessions:
+                raise MessageError(MESSAGE_SESSION_UNKNOWN)
+            if self._active_device(device_id) is None:
+                raise MessageError(MESSAGE_DEVICE_INACTIVE)
+
+            messages = self._messages.get(session_id, [])
+            page = [message for message in messages
+                    if message.sequence > after][:limit]
+            next_after = page[-1].sequence if page else after
+            return page, next_after

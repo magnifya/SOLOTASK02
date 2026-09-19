@@ -170,7 +170,12 @@ class CLITest(unittest.TestCase):
                           ["create-session", "--initiator-device-id", "da",
                            "--recipient-device-id", "db", "--prekey-id", "pk",
                            "--ephemeral-key", _raw_key_b64()],
-                          ["show-session", "sid"]):
+                          ["show-session", "sid"],
+                          ["send-message", "--session-id", "sid",
+                           "--sender-device-id", "da", "--message-id", "m1",
+                           "--sequence", "1", "--nonce", "n",
+                           "--ciphertext", "c"],
+                          ["pull-messages", "sid", "--device-id", "da"]):
             result = subprocess.run(
                 [_sys.executable, "-m", "e2ee_backend",
                  "--base-url", "http://127.0.0.1:1", *arguments],
@@ -276,6 +281,173 @@ class CLISessionTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         body = json.loads(result.stderr.strip())
         self.assertEqual(body["field"], "recipient_device_id")
+
+
+class CLIMessageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server, _ = create_server("127.0.0.1", 0)
+        self.port = self.server.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _run(self, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "e2ee_backend", "--base-url", self.base_url,
+             *arguments],
+            capture_output=True, text=True, timeout=15)
+
+    def _register(self, device_id: str) -> None:
+        result = self._run(
+            "register", "--user-id", f"u-{device_id}", "--device-id", device_id,
+            "--identity-key", _raw_key_b64(),
+            "--prekey", f"pk:{_raw_key_b64()}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _session(self) -> str:
+        self._register("da")
+        self._register("db")
+        result = self._run(
+            "create-session", "--initiator-device-id", "da",
+            "--recipient-device-id", "db", "--prekey-id", "pk",
+            "--ephemeral-key", _raw_key_b64())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout.strip())["session_id"]
+
+    def test_send_and_pull_single_line_json(self) -> None:
+        session_id = self._session()
+        send = self._run(
+            "send-message", "--session-id", session_id,
+            "--sender-device-id", "da", "--message-id", "m1",
+            "--sequence", "1", "--nonce", "bm9uY2U=",
+            "--ciphertext", "Y3Q=")
+        self.assertEqual(send.returncode, 0, send.stderr)
+        line = send.stdout.strip()
+        self.assertEqual(line.count("\n"), 0)
+        body = json.loads(line)
+        self.assertEqual(set(body), {
+            "session_id", "sender_device_id", "message_id", "sequence",
+            "nonce", "ciphertext", "created_at"})
+        self.assertTrue(body["created_at"].endswith("+00:00"))
+
+        pull = self._run("pull-messages", session_id, "--device-id", "db")
+        self.assertEqual(pull.returncode, 0, pull.stderr)
+        page = json.loads(pull.stdout.strip())
+        self.assertEqual(set(page), {"messages", "next_after"})
+        self.assertEqual([m["message_id"] for m in page["messages"]], ["m1"])
+        self.assertEqual(page["next_after"], 1)
+        self.assertEqual(page["messages"][0]["ciphertext"], "Y3Q=")
+
+    def test_send_conflict_is_stderr_json_nonzero(self) -> None:
+        session_id = self._session()
+        first = self._run(
+            "send-message", "--session-id", session_id,
+            "--sender-device-id", "da", "--message-id", "dup",
+            "--sequence", "1", "--nonce", "n", "--ciphertext", "c")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        # Reusing the id with the next sequence is a duplicate-id conflict.
+        result = self._run(
+            "send-message", "--session-id", session_id,
+            "--sender-device-id", "da", "--message-id", "dup",
+            "--sequence", "2", "--nonce", "n2", "--ciphertext", "c2")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.strip(), "")
+        self.assertEqual(json.loads(result.stderr.strip())["field"],
+                         "message_id")
+
+    def test_send_non_integer_sequence_fails_locally(self) -> None:
+        session_id = self._session()
+        result = self._run(
+            "send-message", "--session-id", session_id,
+            "--sender-device-id", "da", "--message-id", "m1",
+            "--sequence", "abc", "--nonce", "n", "--ciphertext", "c")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stderr.strip())["field"],
+                         "sequence")
+
+    def test_pull_unknown_session_is_stderr_json(self) -> None:
+        result = self._run("pull-messages", "ghost", "--device-id", "da")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr.strip())["field"],
+                         "session_id")
+
+    def test_pull_paging_query_params(self) -> None:
+        session_id = self._session()
+        for sequence in range(1, 4):
+            result = self._run(
+                "send-message", "--session-id", session_id,
+                "--sender-device-id", "da", "--message-id", f"m{sequence}",
+                "--sequence", str(sequence),
+                "--nonce", f"n{sequence}", "--ciphertext", f"c{sequence}")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        result = self._run("pull-messages", session_id, "--device-id", "db",
+                           "--after", "1", "--limit", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = json.loads(result.stdout.strip())
+        self.assertEqual([m["sequence"] for m in page["messages"]], [2])
+        self.assertEqual(page["next_after"], 2)
+
+
+class CLIEnvelopeTest(unittest.TestCase):
+    """The encrypt/decrypt commands run locally and never touch the server."""
+
+    def _run(self, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "e2ee_backend", *arguments],
+            capture_output=True, text=True, timeout=15)
+
+    def test_encrypt_decrypt_roundtrip(self) -> None:
+        import base64 as _b64
+        import os as _os
+
+        key = _b64.b64encode(_os.urandom(32)).decode()
+        encrypted = self._run(
+            "encrypt-message", "--session-id", "s1", "--key", key,
+            "--plaintext", "héllo 世界")
+        self.assertEqual(encrypted.returncode, 0, encrypted.stderr)
+        envelope = json.loads(encrypted.stdout.strip())
+        self.assertEqual(set(envelope),
+                         {"session_id", "nonce", "ciphertext"})
+        self.assertEqual(len(_b64.b64decode(envelope["nonce"])), 12)
+
+        decrypted = self._run(
+            "decrypt-message", "--session-id", "s1", "--key", key,
+            "--nonce", envelope["nonce"],
+            "--ciphertext", envelope["ciphertext"])
+        self.assertEqual(decrypted.returncode, 0, decrypted.stderr)
+        self.assertEqual(json.loads(decrypted.stdout.strip()),
+                         {"session_id": "s1", "plaintext": "héllo 世界"})
+
+    def test_decrypt_wrong_session_reports_ciphertext(self) -> None:
+        import base64 as _b64
+        import os as _os
+
+        key = _b64.b64encode(_os.urandom(32)).decode()
+        envelope = json.loads(self._run(
+            "encrypt-message", "--session-id", "s1", "--key", key,
+            "--plaintext", "secret").stdout.strip())
+        result = self._run(
+            "decrypt-message", "--session-id", "s2", "--key", key,
+            "--nonce", envelope["nonce"],
+            "--ciphertext", envelope["ciphertext"])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.strip(), "")
+        self.assertEqual(json.loads(result.stderr.strip())["field"],
+                         "ciphertext")
+
+    def test_encrypt_bad_key_reports_field_key(self) -> None:
+        result = self._run(
+            "encrypt-message", "--session-id", "s1", "--key", "AAAA",
+            "--plaintext", "x")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr.strip())["field"], "key")
+        self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

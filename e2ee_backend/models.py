@@ -59,3 +59,22 @@ class Session:
     identity_key: str
     public_key: str
     created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class Message:
+    """An E2EE message envelope stored for delivery.
+
+    Only ciphertext is kept: the server never sees the plaintext or the
+    symmetric key. Messages within a session are ordered by ``sequence``
+    starting at 1; ``message_id`` is client-chosen and must be unique within
+    the session (duplicates are rejected).
+    """
+
+    session_id: str
+    sender_device_id: str
+    message_id: str
+    sequence: int
+    nonce: str
+    ciphertext: str
+    created_at: str = field(default_factory=utc_now_iso)

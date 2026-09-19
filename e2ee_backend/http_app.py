@@ -4,12 +4,13 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional, Tuple
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .service import DeviceService, ServiceError
 
 _DEVICES_PATH = "/v1/devices"
 _SESSIONS_PATH = "/v1/sessions"
+_MESSAGES_PATH = "/v1/messages"
 
 #: Sentinel meaning a 400 for a malformed body was already sent.
 _BAD_REQUEST = object()
@@ -28,6 +29,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_register()
         elif path == _SESSIONS_PATH:
             self._handle_create_session()
+        elif path == _MESSAGES_PATH:
+            self._handle_send_message()
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
             self._route_revoke(path)
         else:
@@ -64,6 +67,15 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                       "field": "session_id"})
                 return
             self._handle_show_session(unquote(suffix))
+        elif path == _MESSAGES_PATH:
+            self._send_json(404, {"message": f"not found: {path}"})
+        elif path.startswith(_MESSAGES_PATH + "/"):
+            suffix = path[len(_MESSAGES_PATH) + 1:]
+            if not suffix or "/" in suffix:
+                self._send_json(404, {"message": "session not found",
+                                      "field": "session_id"})
+                return
+            self._handle_pull_messages(unquote(suffix))
         else:
             self._send_json(404, {"message": f"not found: {path}"})
 
@@ -118,6 +130,31 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_show_session(self, session_id: str) -> None:
         try:
             body = self.service.get_session(session_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_send_message(self) -> None:
+        """POST /v1/messages: store an encrypted envelope, return 201."""
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.send_message(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(201, body)
+
+    def _handle_pull_messages(self, session_id: str) -> None:
+        """GET /v1/messages/{session_id}: return a page of envelopes."""
+        from urllib.parse import parse_qs
+
+        query = urlsplit(self.path).query
+        params = parse_qs(query, keep_blank_values=True)
+        try:
+            body = self.service.pull_messages(session_id, params)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

@@ -83,7 +83,7 @@ def _emit_server_error() -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Construct the top-level argument parser with register/show subcommands."""
+    """Construct the top-level argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
         prog="e2ee-backend",
         description="End-to-end encrypted messaging backend CLI.")
@@ -129,6 +129,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_show_session = sub.add_parser("show-session", help="show a session snapshot")
     p_show_session.add_argument("session_id")
     p_show_session.set_defaults(handler=cmd_show_session)
+
+    p_send_message = sub.add_parser(
+        "send-message", help="post an encrypted message envelope to a session")
+    p_send_message.add_argument("--session-id", required=True)
+    p_send_message.add_argument("--sender-device-id", required=True)
+    p_send_message.add_argument("--message-id", required=True)
+    p_send_message.add_argument("--sequence", required=True)
+    p_send_message.add_argument("--nonce", required=True)
+    p_send_message.add_argument("--ciphertext", required=True)
+    p_send_message.set_defaults(handler=cmd_send_message)
+
+    p_pull_messages = sub.add_parser(
+        "pull-messages", help="pull stored message envelopes from a session")
+    p_pull_messages.add_argument("session_id")
+    p_pull_messages.add_argument("--device-id", required=True)
+    p_pull_messages.add_argument("--after")
+    p_pull_messages.add_argument("--limit")
+    p_pull_messages.set_defaults(handler=cmd_pull_messages)
+
+    p_encrypt_message = sub.add_parser(
+        "encrypt-message", help="locally AES-GCM encrypt a plaintext message")
+    p_encrypt_message.add_argument("--session-id", required=True)
+    p_encrypt_message.add_argument("--key", required=True)
+    p_encrypt_message.add_argument("--plaintext", required=True)
+    p_encrypt_message.set_defaults(handler=cmd_encrypt_message)
+
+    p_decrypt_message = sub.add_parser(
+        "decrypt-message", help="locally AES-GCM decrypt a message envelope")
+    p_decrypt_message.add_argument("--session-id", required=True)
+    p_decrypt_message.add_argument("--key", required=True)
+    p_decrypt_message.add_argument("--nonce", required=True)
+    p_decrypt_message.add_argument("--ciphertext", required=True)
+    p_decrypt_message.set_defaults(handler=cmd_decrypt_message)
 
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
@@ -239,6 +272,94 @@ def cmd_show_session(args: argparse.Namespace) -> int:
     return 0 if status == 200 else 1
 
 
+def cmd_send_message(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages and print the single-line JSON response."""
+    try:
+        sequence = int(args.sequence)
+    except (TypeError, ValueError):
+        print(json.dumps({"message": "sequence must be an integer",
+                          "field": "sequence"}, separators=(",", ":")),
+              file=sys.stderr)
+        return 2
+    payload = {
+        "session_id": args.session_id,
+        "sender_device_id": args.sender_device_id,
+        "message_id": args.message_id,
+        "sequence": sequence,
+        "nonce": args.nonce,
+        "ciphertext": args.ciphertext,
+    }
+    try:
+        status, response = _request_json("POST", f"{args.base_url}/v1/messages",
+                                         body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 201 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 201 else 1
+
+
+def cmd_pull_messages(args: argparse.Namespace) -> int:
+    """Call GET /v1/messages/{session_id} and print the single-line JSON."""
+    from urllib.parse import quote, urlencode
+
+    query = {"device_id": args.device_id}
+    if args.after is not None:
+        query["after"] = args.after
+    if args.limit is not None:
+        query["limit"] = args.limit
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}?{urlencode(query)}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def _emit_envelope_error(error: "EnvelopeError") -> int:
+    """Print a local crypto error as single-line JSON on stderr; exit non-zero."""
+    print(json.dumps(error.to_body(), separators=(",", ":"),
+                     ensure_ascii=False),
+          file=sys.stderr)
+    return 1
+
+
+def cmd_encrypt_message(args: argparse.Namespace) -> int:
+    """Locally AES-GCM encrypt; print session_id/nonce/ciphertext as JSON."""
+    from .envelope import EnvelopeError, seal_message
+
+    try:
+        response = seal_message({
+            "session_id": args.session_id,
+            "key": args.key,
+            "plaintext": args.plaintext,
+        })
+    except EnvelopeError as error:
+        return _emit_envelope_error(error)
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def cmd_decrypt_message(args: argparse.Namespace) -> int:
+    """Locally AES-GCM decrypt; print session_id/plaintext as JSON."""
+    from .envelope import EnvelopeError, open_message
+
+    try:
+        response = open_message({
+            "session_id": args.session_id,
+            "key": args.key,
+            "nonce": args.nonce,
+            "ciphertext": args.ciphertext,
+        })
+    except EnvelopeError as error:
+        return _emit_envelope_error(error)
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the HTTP server until interrupted."""
     server, _ = create_server(args.host, args.port, DeviceService())
@@ -251,7 +372,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _force_utf8_streams() -> None:
+    """Always emit stdout/stderr as UTF-8.
+
+    JSON bodies can contain non-ASCII text (notably a decrypted plaintext).
+    When stdout is piped under a non-UTF-8 locale the default encoding would
+    otherwise be ASCII and printing it would raise UnicodeEncodeError with a
+    traceback instead of the single-line JSON the contract promises.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _force_utf8_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.handler(args)

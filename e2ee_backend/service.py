@@ -8,8 +8,13 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .crypto import is_nonempty_string, load_public_key
-from .models import Device, SignedPreKey
+from .models import Device, Message, SignedPreKey
 from .storage import (
+    MESSAGE_BAD_SEQUENCE,
+    MESSAGE_DEVICE_INACTIVE,
+    MESSAGE_DUPLICATE_ID,
+    MESSAGE_SENDER_INACTIVE,
+    MESSAGE_SESSION_UNKNOWN,
     SESSION_INITIATOR_REVOKED,
     SESSION_INITIATOR_UNKNOWN,
     SESSION_PREKEY_REVOKED,
@@ -18,6 +23,7 @@ from .storage import (
     SESSION_RECIPIENT_UNKNOWN,
     DeviceStore,
     SessionCreateError,
+    MessageError,
 )
 
 _REQUIRED_SCALAR_FIELDS = ("user_id", "device_id", "identity_key")
@@ -208,3 +214,138 @@ class DeviceService:
             raise ServiceError(f"session not found: {session_id}",
                                "session_id", status_code=404)
         return view
+
+    # -- messages ----------------------------------------------------------
+
+    def _message_view(self, message: Message) -> Dict[str, Any]:
+        """Serialize a stored message with the same body returned on POST."""
+        return {
+            "session_id": message.session_id,
+            "sender_device_id": message.sender_device_id,
+            "message_id": message.message_id,
+            "sequence": message.sequence,
+            "nonce": message.nonce,
+            "ciphertext": message.ciphertext,
+            "created_at": message.created_at,
+        }
+
+    def send_message(self, payload: object) -> Dict[str, Any]:
+        """Validate a message envelope and atomically store it.
+
+        Fields are checked in the order the contract names them
+        (``session_id``, ``sender_device_id``, ``message_id``, ``sequence``,
+        ``nonce``, ``ciphertext``); ``sequence`` must be a positive integer
+        and every other field a non-empty string. The server relays the
+        opaque ``nonce``/``ciphertext`` strings without inspecting them.
+        Returns the stored message with ``created_at``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+
+        for name in ("session_id", "sender_device_id", "message_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        if "sequence" not in payload:
+            raise ServiceError("missing required field: sequence", "sequence")
+        sequence = payload["sequence"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            raise ServiceError("field must be an integer: sequence", "sequence")
+        if sequence < 1:
+            raise ServiceError("field must be >= 1: sequence", "sequence")
+
+        for name in ("nonce", "ciphertext"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        try:
+            message = self.store.append_message(
+                payload["session_id"], payload["sender_device_id"],
+                payload["message_id"], sequence,
+                payload["nonce"], payload["ciphertext"])
+        except MessageError as error:
+            raise self._map_message_error(error.reason, payload) from None
+        return self._message_view(message)
+
+    @staticmethod
+    def _map_message_error(reason: str, payload: Dict[str, Any]) -> ServiceError:
+        if reason == MESSAGE_SESSION_UNKNOWN:
+            return ServiceError(
+                f"session not found: {payload['session_id']}",
+                "session_id", status_code=404)
+        if reason == MESSAGE_SENDER_INACTIVE:
+            return ServiceError(
+                f"sender device is not active: {payload['sender_device_id']}",
+                "sender_device_id", status_code=409)
+        if reason == MESSAGE_DUPLICATE_ID:
+            return ServiceError(
+                f"duplicate message_id: {payload['message_id']}",
+                "message_id", status_code=409)
+        if reason == MESSAGE_BAD_SEQUENCE:
+            return ServiceError(
+                "sequence must be contiguous starting at 1",
+                "sequence", status_code=409)
+        return ServiceError("message rejected", status_code=400)
+
+    def pull_messages(self, session_id: str,
+                      params: Dict[str, List[str]]) -> Dict[str, Any]:
+        """Validate query params and return a page of stored envelopes.
+
+        ``device_id`` is required; ``after`` defaults to 0 and ``limit`` to
+        100 (clamped to 1..100). Messages with ``sequence > after`` come back
+        in ascending order with ``next_after`` for the next page.
+        """
+        device_values = params.get("device_id", [])
+        device_id = device_values[0] if device_values else ""
+        if not is_nonempty_string(device_id):
+            raise ServiceError(
+                "missing required query parameter: device_id", "device_id")
+
+        after = self._parse_int_param(params, "after", default=0, minimum=0)
+        limit = self._parse_int_param(params, "limit", default=100,
+                                      minimum=1, maximum=100)
+
+        try:
+            page, next_after = self.store.message_page(
+                session_id, device_id, after, limit)
+        except MessageError as error:
+            if error.reason == MESSAGE_SESSION_UNKNOWN:
+                raise ServiceError(f"session not found: {session_id}",
+                                   "session_id", status_code=404) from None
+            if error.reason == MESSAGE_DEVICE_INACTIVE:
+                raise ServiceError(
+                    f"device is not active: {device_id}",
+                    "device_id", status_code=409) from None
+            raise
+        return {
+            "messages": [self._message_view(message) for message in page],
+            "next_after": next_after,
+        }
+
+    @staticmethod
+    def _parse_int_param(params: Dict[str, List[str]], name: str,
+                         default: int, minimum: int,
+                         maximum: Optional[int] = None) -> int:
+        """Parse a non-negative decimal query parameter, or raise 400/name."""
+        values = params.get(name)
+        if not values:
+            return default
+        raw = values[0]
+        if not isinstance(raw, str) or not raw.isdigit():
+            raise ServiceError(f"query parameter must be an integer: {name}",
+                               name)
+        value = int(raw)
+        if value < minimum or (maximum is not None and value > maximum):
+            upper = f"..{maximum}" if maximum is not None else ".."
+            raise ServiceError(
+                f"query parameter out of range ({minimum}{upper}): {name}",
+                name)
+        return value
