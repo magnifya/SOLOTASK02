@@ -1,5 +1,6 @@
 """Tests for the service layer: validation, status codes and isolation."""
 import base64
+import threading
 import unittest
 
 from cryptography.hazmat.primitives import serialization
@@ -161,6 +162,95 @@ class ServiceQueryTest(unittest.TestCase):
         self.assertEqual(service.get_device("d1")["prekey_ids"], ["k2"])
         # d2 under the same user must be untouched.
         self.assertEqual(service.get_device("d2")["prekey_ids"], ["k1", "k2"])
+
+
+class ServiceRevocationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = DeviceService()
+        self.service.register(_payload(device_id="d1", user_id="u1"))
+        self.service.register(_payload(device_id="d2", user_id="u1"))
+
+    def test_revoke_device_body(self) -> None:
+        body = self.service.revoke_device("d1")
+        self.assertEqual(body, {"device_id": "d1", "revoked": True})
+
+    def test_revoke_device_is_idempotent(self) -> None:
+        first = self.service.revoke_device("d1")
+        second = self.service.revoke_device("d1")
+        self.assertEqual(first, second)
+
+    def test_revoke_unknown_device_is_404(self) -> None:
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.revoke_device("ghost")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.field, "device_id")
+
+    def test_revoked_device_has_empty_prekeys_but_kept_identity_and_timestamp(self) -> None:
+        before = self.service.get_device("d1")
+        self.service.revoke_device("d1")
+        after = self.service.get_device("d1")
+        self.assertEqual(after["prekey_ids"], [])
+        self.assertEqual(after["identity_key"], before["identity_key"])
+        self.assertEqual(after["registered_at"], before["registered_at"])
+
+    def test_revoke_single_prekey_excludes_only_target(self) -> None:
+        body = self.service.revoke_prekey("d1", "k1")
+        self.assertEqual(body,
+                         {"device_id": "d1", "key_id": "k1", "revoked": True})
+        self.assertEqual(self.service.get_device("d1")["prekey_ids"], ["k2"])
+        # Other device under the same user is untouched, order preserved.
+        self.assertEqual(self.service.get_device("d2")["prekey_ids"], ["k1", "k2"])
+
+    def test_revoke_prekey_is_idempotent(self) -> None:
+        first = self.service.revoke_prekey("d1", "k1")
+        second = self.service.revoke_prekey("d1", "k1")
+        self.assertEqual(first, second)
+        self.assertEqual(self.service.get_device("d1")["prekey_ids"], ["k2"])
+
+    def test_revoke_prekey_unknown_device_is_404(self) -> None:
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.revoke_prekey("ghost", "k1")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.field, "device_id")
+
+    def test_revoke_unknown_prekey_is_404_and_leaves_keys_intact(self) -> None:
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.revoke_prekey("d1", "nope")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.field, "key_id")
+        self.assertEqual(self.service.get_device("d1")["prekey_ids"], ["k1", "k2"])
+
+    def test_revoke_device_after_single_prekey_still_lists_empty(self) -> None:
+        self.service.revoke_prekey("d1", "k1")
+        self.service.revoke_device("d1")
+        self.assertEqual(self.service.get_device("d1")["prekey_ids"], [])
+
+
+class ServiceConcurrencyTest(unittest.TestCase):
+    def test_gets_observe_only_before_or_after_snapshots(self) -> None:
+        service = DeviceService()
+        service.register(_payload(device_id="d1", user_id="u1"))
+
+        observed = []
+        stop = threading.Event()
+
+        def reader() -> None:
+            while not stop.is_set():
+                ids = tuple(service.get_device("d1")["prekey_ids"])
+                observed.append(ids)
+
+        threads = [threading.Thread(target=reader) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        service.revoke_device("d1")
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        # Only the full pre-revoke list or the empty post-revoke list may
+        # appear: a partially-revoked snapshot would violate linearizability.
+        self.assertTrue(observed)
+        self.assertTrue(set(observed) <= {("k1", "k2"), ()})
 
 
 class StorageIsolationTest(unittest.TestCase):

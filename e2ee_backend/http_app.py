@@ -22,8 +22,23 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == _DEVICES_PATH:
             self._handle_register()
+        elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
+            self._route_revoke(path)
         else:
             self._send_json(404, {"message": f"not found: {path}"})
+
+    def _route_revoke(self, path: str) -> None:
+        # Split on raw slashes only; a percent-encoded slash inside a segment
+        # is part of the id, mirroring the GET route.
+        suffix = path[len(_DEVICES_PATH) + 1:-len("/revoke")]
+        parts = suffix.split("/")
+        if len(parts) == 1:
+            self._handle_revoke_device(unquote(parts[0]))
+        elif len(parts) == 3 and parts[1] == "prekeys":
+            self._handle_revoke_prekey(unquote(parts[0]), unquote(parts[2]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
@@ -66,6 +81,22 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_show(self, device_id: str) -> None:
         try:
             body = self.service.get_device(device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_revoke_device(self, device_id: str) -> None:
+        try:
+            body = self.service.revoke_device(device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_revoke_prekey(self, device_id: str, key_id: str) -> None:
+        try:
+            body = self.service.revoke_prekey(device_id, key_id)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

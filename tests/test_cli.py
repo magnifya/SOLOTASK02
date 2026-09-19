@@ -93,6 +93,89 @@ class CLITest(unittest.TestCase):
         self.assertEqual(json.loads(result.stderr.strip())["field"],
                          "signed_prekeys")
 
+    def _register_device(self, device_id: str = "d1") -> None:
+        result = self._run(
+            "register", "--user-id", "u1", "--device-id", device_id,
+            "--identity-key", _raw_key_b64(),
+            "--prekey", f"k1:{_raw_key_b64()}",
+            "--prekey", f"k2:{_raw_key_b64()}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_revoke_device_success_and_idempotent(self) -> None:
+        self._register_device()
+        result = self._run("revoke-device", "--device-id", "d1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = result.stdout.strip()
+        self.assertEqual(line.count("\n"), 0)
+        self.assertEqual(json.loads(line),
+                         {"device_id": "d1", "revoked": True})
+        again = self._run("revoke-device", "--device-id", "d1")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(again.stdout, result.stdout)
+        shown = self._run("show", "d1")
+        self.assertEqual(json.loads(shown.stdout.strip())["prekey_ids"], [])
+
+    def test_revoke_device_unknown_is_error_json(self) -> None:
+        result = self._run("revoke-device", "--device-id", "ghost")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.strip(), "")
+        self.assertEqual(json.loads(result.stderr.strip())["field"],
+                         "device_id")
+
+    def test_revoke_prekey_success_and_idempotent(self) -> None:
+        self._register_device()
+        result = self._run("revoke-prekey", "--device-id", "d1",
+                           "--key-id", "k1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = result.stdout.strip()
+        self.assertEqual(line.count("\n"), 0)
+        self.assertEqual(json.loads(line),
+                         {"device_id": "d1", "key_id": "k1", "revoked": True})
+        again = self._run("revoke-prekey", "--device-id", "d1",
+                          "--key-id", "k1")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(again.stdout, result.stdout)
+        shown = self._run("show", "d1")
+        self.assertEqual(json.loads(shown.stdout.strip())["prekey_ids"], ["k2"])
+
+    def test_revoke_prekey_unknown_device_and_key(self) -> None:
+        self._register_device()
+        no_device = self._run("revoke-prekey", "--device-id", "ghost",
+                              "--key-id", "k1")
+        self.assertEqual(no_device.returncode, 1)
+        self.assertEqual(json.loads(no_device.stderr.strip())["field"],
+                         "device_id")
+        no_key = self._run("revoke-prekey", "--device-id", "d1",
+                           "--key-id", "nope")
+        self.assertEqual(no_key.returncode, 1)
+        self.assertEqual(json.loads(no_key.stderr.strip())["field"], "key_id")
+
+    def test_connection_failure_reports_field_server_without_traceback(self) -> None:
+        import sys as _sys
+        dead = subprocess.run(
+            [_sys.executable, "-m", "e2ee_backend",
+             "--base-url", "http://127.0.0.1:1", "show", "d1"],
+            capture_output=True, text=True, timeout=15)
+        self.assertEqual(dead.returncode, 1)
+        self.assertEqual(dead.stdout.strip(), "")
+        body = json.loads(dead.stderr.strip())
+        self.assertEqual(body["field"], "server")
+        self.assertNotIn("Traceback", dead.stderr)
+
+        for arguments in (["revoke-device", "--device-id", "d1"],
+                          ["revoke-prekey", "--device-id", "d1",
+                           "--key-id", "k1"],
+                          ["register", "--user-id", "u1", "--device-id", "dx",
+                           "--identity-key", _raw_key_b64()]):
+            result = subprocess.run(
+                [_sys.executable, "-m", "e2ee_backend",
+                 "--base-url", "http://127.0.0.1:1", *arguments],
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 1, arguments)
+            self.assertEqual(json.loads(result.stderr.strip())["field"],
+                             "server", arguments)
+            self.assertNotIn("Traceback", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

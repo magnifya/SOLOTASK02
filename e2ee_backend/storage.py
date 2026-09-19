@@ -7,7 +7,7 @@ order, so repeated requests list them identically.
 from __future__ import annotations
 
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import Device
 
@@ -62,3 +62,57 @@ class DeviceStore:
                     prekey.revoked = True
                     return True
             return False
+
+    def revoke_device(self, device_id: str) -> Optional[Device]:
+        """Mark the device (and its pre-keys) revoked.
+
+        Idempotent: a previously revoked device stays revoked. Returns the
+        device or ``None`` when the id is unknown.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                return None
+            device.revoked = True
+            for prekey in device.prekeys:
+                prekey.revoked = True
+            return device
+
+    def revoke_prekey_by_id(self, device_id: str,
+                            key_id: str) -> Tuple[Optional[Device], bool]:
+        """Revoke one pre-key of a globally-addressed device.
+
+        Returns ``(device, key_found)``: ``device`` is ``None`` for an unknown
+        device; otherwise ``key_found`` says whether *key_id* existed. Revoking
+        an already-revoked key is idempotent and reports it as found.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                return None, False
+            for prekey in device.prekeys:
+                if prekey.key_id == key_id:
+                    prekey.revoked = True
+                    return device, True
+            return device, False
+
+    def public_view(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """Atomically build the public snapshot of a device.
+
+        The active pre-key id list is copied under the lock together with the
+        rest of the record, so a concurrent revocation can never be observed
+        half-applied.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                return None
+            return {
+                "identity_key": device.identity_key,
+                "prekey_ids": [pk.key_id for pk in device.prekeys
+                               if not pk.revoked],
+                "registered_at": device.registered_at,
+            }

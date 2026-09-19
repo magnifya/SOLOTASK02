@@ -104,12 +104,29 @@ class DeviceService:
 
     def get_device(self, device_id: str) -> Dict[str, Any]:
         """Return the public device record; raise :class:`ServiceError` if absent."""
-        device = self.store.find_by_device_id(device_id)
+        view = self.store.public_view(device_id)
+        if view is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return view
+
+    # -- revocation --------------------------------------------------------
+
+    def revoke_device(self, device_id: str) -> Dict[str, Any]:
+        """Revoke a device (and its pre-keys); idempotent, 404 when unknown."""
+        device = self.store.revoke_device(device_id)
         if device is None:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
-        return {
-            "identity_key": device.identity_key,
-            "prekey_ids": self.store.active_prekey_ids(device),
-            "registered_at": device.registered_at,
-        }
+        return {"device_id": device.device_id, "revoked": True}
+
+    def revoke_prekey(self, device_id: str, key_id: str) -> Dict[str, Any]:
+        """Revoke one pre-key; idempotent, 404 on unknown device/key."""
+        device, key_found = self.store.revoke_prekey_by_id(device_id, key_id)
+        if device is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        if not key_found:
+            raise ServiceError(f"pre-key not found: {key_id}",
+                               "key_id", status_code=404)
+        return {"device_id": device.device_id, "key_id": key_id, "revoked": True}

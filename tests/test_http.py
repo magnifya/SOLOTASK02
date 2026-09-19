@@ -124,5 +124,125 @@ class HTTPApiTest(unittest.TestCase):
         self.assertIn("prekey_ids", body)
 
 
+class HTTPRevokeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server, _ = create_server("127.0.0.1", 0)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _request(self, method: str, path: str, body: object = None):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps(body) if body is not None else None
+        headers = {"Content-Type": "application/json"} if payload is not None else {}
+        connection.request(method, path, body=payload, headers=headers)
+        response = connection.getresponse()
+        data = response.read().decode("utf-8")
+        connection.close()
+        return response.status, json.loads(data)
+
+    @staticmethod
+    def _payload(device_id: str = "d1", user_id: str = "u1") -> dict:
+        return {
+            "user_id": user_id,
+            "device_id": device_id,
+            "identity_key": _raw_key_b64(),
+            "signed_prekeys": [
+                {"key_id": "k1", "public_key": _raw_key_b64()},
+                {"key_id": "k2", "public_key": _raw_key_b64()},
+            ],
+        }
+
+    def _register(self, device_id: str = "d1", user_id: str = "u1") -> None:
+        status, _ = self._request("POST", "/v1/devices",
+                                  self._payload(device_id, user_id))
+        self.assertEqual(status, 201)
+
+    def test_revoke_device_200_and_idempotent(self) -> None:
+        self._register()
+        status, body = self._request("POST", "/v1/devices/d1/revoke")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"device_id": "d1", "revoked": True})
+        status, again = self._request("POST", "/v1/devices/d1/revoke")
+        self.assertEqual(status, 200)
+        self.assertEqual(again, body)
+
+    def test_revoke_unknown_device_is_404(self) -> None:
+        status, body = self._request("POST", "/v1/devices/ghost/revoke")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["field"], "device_id")
+
+    def test_revoked_device_get_lists_empty_keeps_rest(self) -> None:
+        self._register()
+        before_status, before = self._request("GET", "/v1/devices/d1")
+        self.assertEqual(before_status, 200)
+        self.assertEqual(before["prekey_ids"], ["k1", "k2"])
+        self.assertEqual(self._request("POST", "/v1/devices/d1/revoke")[0], 200)
+        status, after = self._request("GET", "/v1/devices/d1")
+        self.assertEqual(status, 200)
+        self.assertEqual(after["prekey_ids"], [])
+        self.assertEqual(after["identity_key"], before["identity_key"])
+        self.assertEqual(after["registered_at"], before["registered_at"])
+
+    def test_revoke_prekey_200_and_idempotent(self) -> None:
+        self._register()
+        status, body = self._request(
+            "POST", "/v1/devices/d1/prekeys/k1/revoke")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"device_id": "d1", "key_id": "k1",
+                                "revoked": True})
+        status, again = self._request(
+            "POST", "/v1/devices/d1/prekeys/k1/revoke")
+        self.assertEqual(status, 200)
+        self.assertEqual(again, body)
+
+    def test_revoke_prekey_excludes_only_target(self) -> None:
+        self._register("d1", "u1")
+        self._register("d2", "u1")
+        self.assertEqual(
+            self._request("POST", "/v1/devices/d1/prekeys/k1/revoke")[0], 200)
+        _, d1 = self._request("GET", "/v1/devices/d1")
+        _, d2 = self._request("GET", "/v1/devices/d2")
+        self.assertEqual(d1["prekey_ids"], ["k2"])
+        self.assertEqual(d2["prekey_ids"], ["k1", "k2"])
+
+    def test_revoke_prekey_unknown_device_404_field_device(self) -> None:
+        status, body = self._request(
+            "POST", "/v1/devices/ghost/prekeys/k1/revoke")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["field"], "device_id")
+
+    def test_revoke_prekey_unknown_key_404_field_key(self) -> None:
+        self._register()
+        status, body = self._request(
+            "POST", "/v1/devices/d1/prekeys/nope/revoke")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["field"], "key_id")
+        _, d1 = self._request("GET", "/v1/devices/d1")
+        self.assertEqual(d1["prekey_ids"], ["k1", "k2"])
+
+    def test_malformed_revoke_routes_are_404(self) -> None:
+        status, body = self._request("POST", "/v1/devices/d1/prekeys/revoke")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["field"], "device_id")
+        status, body = self._request(
+            "POST", "/v1/devices/d1/prekeys/k1/extra/revoke")
+        self.assertEqual(status, 404)
+
+    def test_revoke_prekey_url_encoded_device_id(self) -> None:
+        device_id = "dev x/y"
+        self._register(device_id, "u9")
+        encoded = quote(device_id, safe="")
+        status, body = self._request(
+            "POST", f"/v1/devices/{encoded}/prekeys/k1/revoke")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["device_id"], device_id)
+
+
 if __name__ == "__main__":
     unittest.main()

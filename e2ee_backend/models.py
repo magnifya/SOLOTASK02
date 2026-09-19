@@ -37,3 +37,4 @@ class Device:
     identity_key: str
     registered_at: str = field(default_factory=utc_now_iso)
     prekeys: List[SignedPreKey] = field(default_factory=list)
+    revoked: bool = False
