@@ -11,6 +11,8 @@ from .service import DeviceService, ServiceError
 _DEVICES_PATH = "/v1/devices"
 _SESSIONS_PATH = "/v1/sessions"
 _MESSAGES_PATH = "/v1/messages"
+_GROUPS_PATH = "/v1/groups"
+_GROUP_SESSIONS_PATH = "/v1/group-sessions"
 
 #: Sentinel meaning a 400 for a malformed body was already sent.
 _BAD_REQUEST = object()
@@ -31,6 +33,12 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_create_session()
         elif path == _MESSAGES_PATH:
             self._handle_post_message()
+        elif path == _GROUPS_PATH:
+            self._handle_create_group()
+        elif path == _GROUP_SESSIONS_PATH:
+            self._handle_create_group_session()
+        elif path.startswith(_GROUPS_PATH + "/"):
+            self._route_group_member(path)
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
             self._route_revoke(path)
         elif path.startswith(_DEVICES_PATH + "/") \
@@ -62,6 +70,22 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"message": "session not found",
                                   "field": "session_id"})
+
+    def _route_group_member(self, path: str) -> None:
+        suffix = path[len(_GROUPS_PATH) + 1:]
+        parts = suffix.split("/")
+        if len(parts) == 2 and parts[0] and parts[1] == "members":
+            self._handle_add_group_member(unquote(parts[0]))
+        elif (len(parts) == 3 and parts[0] and parts[1] == "members"
+                and parts[2] in ("add", "remove")):
+            group_id = unquote(parts[0])
+            if parts[2] == "add":
+                self._handle_add_group_member(group_id)
+            else:
+                self._handle_remove_group_member(group_id)
+        else:
+            self._send_json(404, {"message": "group not found",
+                                  "field": "group_id"})
 
     def _route_revoke(self, path: str) -> None:
         # Split on raw slashes only; a percent-encoded slash inside a segment
@@ -96,7 +120,21 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path.startswith(_DEVICES_PATH + "/"):
+        if path.startswith(_GROUPS_PATH + "/"):
+            suffix = path[len(_GROUPS_PATH) + 1:]
+            if not suffix or "/" in suffix:
+                self._send_json(404, {"message": "group not found",
+                                      "field": "group_id"})
+                return
+            self._handle_show_group(unquote(suffix))
+        elif path.startswith(_GROUP_SESSIONS_PATH + "/"):
+            suffix = path[len(_GROUP_SESSIONS_PATH) + 1:]
+            if not suffix or "/" in suffix:
+                self._send_json(404, {"message": "session not found",
+                                      "field": "session_id"})
+                return
+            self._handle_show_group_session(unquote(suffix))
+        elif path.startswith(_DEVICES_PATH + "/"):
             suffix = path[len(_DEVICES_PATH) + 1:]
             # A real slash means a sub-path (…/devices/a/b); a percent-encoded
             # slash within a single segment is part of the device id.
@@ -204,6 +242,66 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_show_session(self, session_id: str) -> None:
         try:
             body = self.service.get_session(session_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_create_group(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.create_group(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(201, body)
+
+    def _handle_show_group(self, group_id: str) -> None:
+        try:
+            body = self.service.get_group(group_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_add_group_member(self, group_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.add_group_member(group_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_remove_group_member(self, group_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.remove_group_member(group_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_create_group_session(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.create_group_session(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(201, body)
+
+    def _handle_show_group_session(self, session_id: str) -> None:
+        try:
+            body = self.service.get_group_session(session_id)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

@@ -10,7 +10,16 @@ import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from .models import Device, Message, MessageDelivery, Session, SignedPreKey, utc_now_iso
+from .models import (
+    Device,
+    Group,
+    GroupSession,
+    Message,
+    MessageDelivery,
+    Session,
+    SignedPreKey,
+    utc_now_iso,
+)
 
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
@@ -42,6 +51,23 @@ DEVICE_UNKNOWN = "device_unknown"
 DEVICE_REVOKED = "device_revoked"
 #: Outcome code for a pre-key add conflict (same id, changed key, or revoked).
 PREKEY_CONFLICT = "prekey_conflict"
+
+#: Outcome codes for group creation / membership changes.
+GROUP_UNKNOWN = "group_unknown"
+GROUP_DUPLICATE_ID = "group_duplicate_id"
+GROUP_CREATOR_UNKNOWN = "creator_unknown"
+GROUP_CREATOR_REVOKED = "creator_revoked"
+GROUP_ACTOR_UNKNOWN = "actor_unknown"
+GROUP_ACTOR_REVOKED = "actor_revoked"
+GROUP_ACTOR_NOT_CREATOR = "actor_not_creator"
+GROUP_DEVICE_UNKNOWN = "group_device_unknown"
+GROUP_DEVICE_REVOKED = "group_device_revoked"
+
+#: Outcome codes for group-session creation.
+GROUP_SESSION_GROUP_UNKNOWN = "group_unknown"
+GROUP_SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
+GROUP_SESSION_INITIATOR_INACTIVE = "initiator_inactive"
+GROUP_SESSION_INITIATOR_NOT_MEMBER = "initiator_not_member"
 
 
 class SessionCreateError(Exception):
@@ -84,6 +110,14 @@ class DeviceUpdateError(Exception):
         self.reason = reason
 
 
+class GroupError(Exception):
+    """An atomic group or group-session operation failed; nothing changed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class DeviceStore:
     """In-memory store keyed by ``(user_id, device_id)``.
 
@@ -96,6 +130,8 @@ class DeviceStore:
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
+        self._groups: Dict[str, Group] = {}
+        self._group_sessions: Dict[str, GroupSession] = {}
         self._messages: Dict[str, List[Message]] = {}
         # Per-session set of nonces already accepted for replay protection.
         # Keyed independently of the streams so a nonce is scoped to a session.
@@ -344,6 +380,206 @@ class DeviceStore:
                 "created_at": session.created_at,
             }
 
+    # -- groups ------------------------------------------------------------
+
+    @staticmethod
+    def group_view(group: Group) -> Dict[str, Any]:
+        """Copy one group into its public five-field view."""
+        return {
+            "group_id": group.group_id,
+            "revision": group.revision,
+            "members": list(group.members),
+            "created_at": group.created_at,
+        }
+
+    def create_group(self, group_id: str, creator_device_id: str,
+                     member_device_ids: List[str]) -> Group:
+        """Atomically validate and create one group.
+
+        The id must be unused and the creator an active registered device.
+        Member ids are arbitrary non-empty strings already validated by the
+        service; they need not resolve to registered devices and are stored
+        as given. The creator is always the first member; the other ids
+        follow in request order, de-duplicated (a repeated id kept once).
+        The creator check and the insert happen under the store lock, the
+        same lock device revocations take, so a concurrent revocation is
+        linearized either wholly before this call (then it fails) or wholly
+        after it (then the group is retained). On failure nothing is written.
+        """
+        with self._lock:
+            if group_id in self._groups:
+                raise GroupError(GROUP_DUPLICATE_ID)
+
+            creator = self._active_device(creator_device_id)
+            if creator is None:
+                existing = self._find_device(creator_device_id)
+                raise GroupError(GROUP_CREATOR_REVOKED if existing is not None
+                                 else GROUP_CREATOR_UNKNOWN)
+
+            members: List[str] = [creator_device_id]
+            seen = {creator_device_id}
+            for device_id in member_device_ids:
+                if device_id not in seen:
+                    seen.add(device_id)
+                    members.append(device_id)
+
+            group = Group(group_id=group_id,
+                          creator_device_id=creator_device_id, members=members)
+            self._groups[group_id] = group
+            self._notify_change()
+            return group
+
+    def get_group(self, group_id: str) -> Optional[Group]:
+        """Return the stored group, or ``None`` when the id is unknown."""
+        with self._lock:
+            return self._groups.get(group_id)
+
+    def _find_device(self, device_id: str) -> Optional[Device]:
+        """Resolve a globally-addressed device (must hold the lock)."""
+        key = self._device_index.get(device_id)
+        return self._devices.get(key) if key is not None else None
+
+    def _active_device(self, device_id: str) -> Optional[Device]:
+        """Resolve a device that exists and is not revoked (must hold lock)."""
+        device = self._find_device(device_id)
+        if device is None or device.revoked:
+            return None
+        return device
+
+    def _authorize_group_actor(self, group_id: str,
+                               actor_device_id: str) -> Group:
+        """Resolve a group and authorize its creator (must hold the lock).
+
+        Unknown group -> ``group_unknown``; an unknown or revoked actor ->
+        ``actor_unknown`` / ``actor_revoked``; an active non-creator ->
+        ``actor_not_creator``.
+        """
+        group = self._groups.get(group_id)
+        if group is None:
+            raise GroupError(GROUP_UNKNOWN)
+        actor = self._find_device(actor_device_id)
+        if actor is None:
+            raise GroupError(GROUP_ACTOR_UNKNOWN)
+        if actor.revoked:
+            raise GroupError(GROUP_ACTOR_REVOKED)
+        if actor_device_id != group.creator_device_id:
+            raise GroupError(GROUP_ACTOR_NOT_CREATOR)
+        return group
+
+    def add_group_member(self, group_id: str, actor_device_id: str,
+                         device_id: str) -> Tuple[Group, bool]:
+        """Atomically authorize the creator and add one member.
+
+        Returns ``(group, created)``: ``created`` is False (200) when the
+        active device is already a member, True (201) when it was appended.
+        An unknown or revoked target device raises ``group_device_unknown``
+        / ``group_device_revoked`` (404 / 409, field ``device_id``). A
+        successful append advances the group revision; an idempotent repeat
+        does not.
+        """
+        with self._lock:
+            group = self._authorize_group_actor(group_id, actor_device_id)
+            if device_id in group.members:
+                return group, False
+            target = self._find_device(device_id)
+            if target is None:
+                raise GroupError(GROUP_DEVICE_UNKNOWN)
+            if target.revoked:
+                raise GroupError(GROUP_DEVICE_REVOKED)
+            group.members.append(device_id)
+            group.revision += 1
+            self._notify_change()
+            return group, True
+
+    def remove_group_member(self, group_id: str, actor_device_id: str,
+                            device_id: str) -> Group:
+        """Atomically authorize the creator and remove one member.
+
+        Always succeeds with 200 semantics: a target id that is not (or no
+        longer) on the member list is an idempotent no-op leaving the
+        revision untouched, and a revoked device may still be removed so no
+        revoked id lingers on the roster. The one hard failure besides the
+        shared authorization checks is an id that has never been a
+        registered device (``group_device_unknown`` -> 404). The creator
+        cannot leave their own group; that request is a no-op that keeps
+        the creator as the first member.
+        """
+        with self._lock:
+            group = self._authorize_group_actor(group_id, actor_device_id)
+            if device_id == group.creator_device_id:
+                return group
+            if self._find_device(device_id) is None:
+                raise GroupError(GROUP_DEVICE_UNKNOWN)
+            if device_id in group.members:
+                group.members.remove(device_id)
+                group.revision += 1
+                self._notify_change()
+            return group
+
+    def group_session_view(self, session: GroupSession) -> Dict[str, Any]:
+        """Copy one group session into its public seven-field view."""
+        return {
+            "session_id": session.session_id,
+            "group_id": session.group_id,
+            "initiator_device_id": session.initiator_device_id,
+            "ephemeral_key": session.ephemeral_key,
+            "revision": session.revision,
+            "members": list(session.members),
+            "created_at": session.created_at,
+        }
+
+    def create_group_session(self, group_id: str, initiator_device_id: str,
+                             ephemeral_key: str) -> GroupSession:
+        """Atomically validate and create one group session.
+
+        Every request creates a fresh session (a new ``session_id``);
+        repeated POSTs are never deduplicated. The member list and group
+        revision are frozen at creation, so later membership changes cannot
+        alter the snapshot. The initiator must be an active *current* member
+        of the group. On failure nothing is written.
+        """
+        with self._lock:
+            group = self._groups.get(group_id)
+            if group is None:
+                raise GroupError(GROUP_SESSION_GROUP_UNKNOWN)
+            initiator = self._find_device(initiator_device_id)
+            if initiator is None:
+                raise GroupError(GROUP_SESSION_INITIATOR_UNKNOWN)
+            if initiator.revoked:
+                raise GroupError(GROUP_SESSION_INITIATOR_INACTIVE)
+            if initiator_device_id not in group.members:
+                raise GroupError(GROUP_SESSION_INITIATOR_NOT_MEMBER)
+
+            session = GroupSession(
+                session_id=uuid.uuid4().hex,
+                group_id=group_id,
+                initiator_device_id=initiator_device_id,
+                ephemeral_key=ephemeral_key,
+                members=list(group.members),
+                revision=group.revision,
+            )
+            self._group_sessions[session.session_id] = session
+            self._notify_change()
+            return session
+
+    def get_group_session(self, session_id: str) -> Optional[GroupSession]:
+        """Return the stored group session, or ``None`` when the id unknown."""
+        with self._lock:
+            return self._group_sessions.get(session_id)
+
+    def group_session_member(self, session_id: str,
+                             device_id: str) -> Optional[GroupSession]:
+        """Resolve a group session and check frozen membership (holds lock).
+
+        Returns the session when *device_id* is a frozen member, ``None``
+        otherwise — including when the session does not exist. Membership is
+        tested against the frozen snapshot, not the group's current roster.
+        """
+        session = self._group_sessions.get(session_id)
+        if session is None or device_id not in session.members:
+            return None
+        return session
+
     # -- messages ----------------------------------------------------------
 
     @staticmethod
@@ -377,13 +613,19 @@ class DeviceStore:
         :class:`MessageCreateError` carries the reason.
         """
         with self._lock:
-            if session_id not in self._sessions:
+            group_session = self._group_sessions.get(session_id)
+            if session_id not in self._sessions and group_session is None:
                 raise MessageCreateError(MESSAGE_SESSION_UNKNOWN)
 
             sender_key = self._device_index.get(sender_device_id)
             sender = (self._devices.get(sender_key)
                       if sender_key is not None else None)
             if sender is None or sender.revoked:
+                raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
+            # Only devices frozen into a group session may post into it; a
+            # device removed after the freeze is rejected like an inactive one.
+            if (group_session is not None
+                    and sender_device_id not in group_session.members):
                 raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
 
             stream = self._messages.setdefault(session_id, [])
@@ -423,13 +665,19 @@ class DeviceStore:
         either wholly before (then it fails) or wholly after this call.
         """
         with self._lock:
-            if session_id not in self._sessions:
+            group_session = self._group_sessions.get(session_id)
+            if session_id not in self._sessions and group_session is None:
                 raise MessageListError(MESSAGE_SESSION_UNKNOWN)
 
             device_key = self._device_index.get(device_id)
             device = (self._devices.get(device_key)
                       if device_key is not None else None)
             if device is None or device.revoked:
+                raise MessageListError(MESSAGE_DEVICE_INACTIVE)
+            # Group sessions are readable by the frozen member set only; a
+            # device added or removed after the freeze is not a reader.
+            if group_session is not None and device_id not in \
+                    group_session.members:
                 raise MessageListError(MESSAGE_DEVICE_INACTIVE)
 
             stream = self._messages.get(session_id, [])
@@ -570,6 +818,22 @@ class DeviceStore:
                 "public_key": s.public_key,
                 "created_at": s.created_at,
             } for s in self._sessions.values()]
+            groups = [{
+                "group_id": g.group_id,
+                "creator_device_id": g.creator_device_id,
+                "members": list(g.members),
+                "revision": g.revision,
+                "created_at": g.created_at,
+            } for g in self._groups.values()]
+            group_sessions = [{
+                "session_id": s.session_id,
+                "group_id": s.group_id,
+                "initiator_device_id": s.initiator_device_id,
+                "ephemeral_key": s.ephemeral_key,
+                "members": list(s.members),
+                "revision": s.revision,
+                "created_at": s.created_at,
+            } for s in self._group_sessions.values()]
             messages = {
                 sid: [{
                     "session_id": m.session_id,
@@ -595,6 +859,7 @@ class DeviceStore:
                 for sid, nonces in self._used_nonces.items() if nonces
             }
             return {"devices": devices, "sessions": sessions,
+                    "groups": groups, "group_sessions": group_sessions,
                     "messages": messages, "delivery": delivery,
                     "used_nonces": used_nonces}
 
@@ -609,10 +874,14 @@ class DeviceStore:
 
         raw_devices = state.get("devices", [])
         raw_sessions = state.get("sessions", [])
+        raw_groups = state.get("groups", [])
+        raw_group_sessions = state.get("group_sessions", [])
         raw_messages = state.get("messages", {})
         raw_delivery = state.get("delivery", [])
         raw_used_nonces = state.get("used_nonces")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
+                and isinstance(raw_groups, list)
+                and isinstance(raw_group_sessions, list)
                 and isinstance(raw_messages, dict)
                 and isinstance(raw_delivery, list)):
             raise ValueError("state document has a malformed top-level section")
@@ -669,6 +938,56 @@ class DeviceStore:
                 raise ValueError(
                     f"duplicate session in state: {session.session_id}")
             sessions[session.session_id] = session
+
+        groups: Dict[str, Group] = {}
+        for index, raw in enumerate(raw_groups):
+            if not isinstance(raw, dict):
+                raise ValueError(f"groups[{index}] must be an object")
+            try:
+                members = raw["members"]
+                if not isinstance(members, list) or not all(
+                        isinstance(value, str) for value in members):
+                    raise ValueError("members must be a list of strings")
+                group = Group(
+                    group_id=raw["group_id"],
+                    creator_device_id=raw["creator_device_id"],
+                    members=list(members),
+                    revision=int(raw["revision"]),
+                    created_at=raw["created_at"])
+            except KeyError as error:
+                raise ValueError(
+                    f"groups[{index}] missing field: {error.args[0]}") from None
+            if group.group_id in groups:
+                raise ValueError(
+                    f"duplicate group in state: {group.group_id}")
+            groups[group.group_id] = group
+
+        group_sessions: Dict[str, GroupSession] = {}
+        for index, raw in enumerate(raw_group_sessions):
+            if not isinstance(raw, dict):
+                raise ValueError(f"group_sessions[{index}] must be an object")
+            try:
+                members = raw["members"]
+                if not isinstance(members, list) or not all(
+                        isinstance(value, str) for value in members):
+                    raise ValueError("members must be a list of strings")
+                group_session = GroupSession(
+                    session_id=raw["session_id"],
+                    group_id=raw["group_id"],
+                    initiator_device_id=raw["initiator_device_id"],
+                    ephemeral_key=raw["ephemeral_key"],
+                    members=list(members),
+                    revision=int(raw["revision"]),
+                    created_at=raw["created_at"])
+            except KeyError as error:
+                raise ValueError(
+                    f"group_sessions[{index}] missing field: "
+                    f"{error.args[0]}") from None
+            if group_session.session_id in group_sessions:
+                raise ValueError(
+                    "duplicate group session in state: "
+                    f"{group_session.session_id}")
+            group_sessions[group_session.session_id] = group_session
 
         messages: Dict[str, List[Message]] = {}
         for sid, stream in raw_messages.items():
@@ -739,6 +1058,8 @@ class DeviceStore:
             self._devices = devices
             self._device_index = device_index
             self._sessions = sessions
+            self._groups = groups
+            self._group_sessions = group_sessions
             self._messages = messages
             self._delivery = delivery
             self._used_nonces = used_nonces

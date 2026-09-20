@@ -10,6 +10,8 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 
 在设备契约之上新增身份轮换与预钥补充。POST /v1/devices/{device_id}/identity-key/rotate 的请求体含 identity_key，须为非空字符串且是合法公钥；缺失、类型错误或编码非法返回 400/field=identity_key，设备未知或已撤销分别返回 404/409/field=device_id。设备的 rotated_at 初值等于 registered_at；提交与当前相同的原始公钥返回 200 且 rotated_at 不变（幂等），提交不同公钥则更新 identity_key 并生成新的 UTC ISO-8601（带 +00:00）时间戳；响应含 device_id、identity_key、rotated_at。POST /v1/devices/{device_id}/prekeys 的请求体含 key_id、public_key，二者均须为非空字符串且 public_key 是合法公钥；字段缺失或类型错误返回 400（对应 field），公钥非法返回 400/field=public_key，设备未知或已撤销分别返回 404/409/field=device_id。全新 key_id 按顺序追加并返回 201，响应含 device_id、key_id、public_key；同 key_id、同原始公钥且未撤销时幂等返回 200、响应体相同；同 key_id 但公钥不同，或该 key_id 已撤销，返回 409/field=key_id。GET 返回最新 identity_key 与未撤销的 prekey_ids。身份轮换只影响此后新建的会话，既有会话快照保持冻结；撤销的 key 仍被禁用（无法用同 id 重新补充）。所有校验与写入都在存储的同一把锁下线性化完成，失败时不写入。命令行新增 rotate-identity-key 与 add-prekey，均带 --device-id，其余参数与请求字段一一对应；成功打印单行 JSON 到 stdout，失败打印单行 JSON 到 stderr 并以非零码退出。两项变更都写入 version=1 状态文件并在重启后完整恢复。
 
+在设备契约之上新增群组与群组会话。POST /v1/groups 接收 JSON：group_id、creator_device_id 为非空字符串，member_device_ids 为非空字符串数组（每元素非空）；创建者必须是活跃设备（未知 404/field=creator_device_id，已撤销 409/field=creator_device_id），重复 group_id 返回 409/field=group_id，字段缺失或类型错误 400/对应 field。成员 id 只需是非空字符串、不要求已注册；创建者恒为首位成员，其余按请求顺序去重保留。成功 201 返回 group_id、revision（初值 1）、members、created_at（UTC ISO-8601，+00:00）。GET /v1/groups/{group_id} 返回同样四字段，未知群组 404/field=group_id。成员增删仅创建者可操作：POST /v1/groups/{group_id}/members（等价别名 POST .../members/add）与 POST /v1/groups/{group_id}/members/remove，请求体均含 actor_device_id、device_id（非空字符串，否则 400/对应 field）；未知群组 404/field=group_id，actor 未知 404/field=actor_device_id，actor 已撤销或非创建者 409/field=actor_device_id，目标设备未知 404/field=device_id。新增成员：目标已撤销 409/field=device_id（撤销设备不得加入），新成员 201 且 revision+1，已在群内 200 幂等且 revision 不变。移除成员：成功恒为 200，成员不存在（含已被移出）幂等不递增 revision，已撤销成员仍可移除，创建者移除自己为不改变状态的 no-op（创建者始终保留）。群组查询与成员变更在存储同一把锁下线性化：与设备撤销并发时撤销先则失败、创建/变更先则保留。POST /v1/group-sessions 接收 group_id、initiator_device_id、ephemeral_key（均非空字符串，否则 400/对应 field）；发起者须为群组当前活跃成员——未知群组 404/field=group_id，发起者未知 404/field=initiator_device_id，发起者已撤销或非成员 409/field=initiator_device_id。成功 201 返回 session_id、group_id、initiator_device_id、ephemeral_key、revision、members、created_at；members 与 revision 在创建时冻结为当时的群组成员表与修订号，此后群组增删成员不改变既有会话；重复提交总是新建会话（新 session_id，不去重）。GET /v1/group-sessions/{session_id} 返回冻结快照，未知会话 404/field=session_id。消息读写以冻结成员表为准：POST /v1/messages 的发送方与 GET /v1/messages/{session_id} 的读取方 device_id 都必须是该群组会话的冻结成员（冻结后加入或移出当前群组的设备均不对应快照；冻结成员设备被撤销仍按既有 409 拒绝），未知群组会话沿用 404/field=session_id。群组、成员表、revision 与群组会话冻结快照均写入 version=1 状态文件，重启后完整恢复。命令行新增 group-create、group-show、group-add-member、group-remove-member、create-group-session、show-group-session，与接口一一对应；成功打印单行 JSON 到 stdout（新增成员 201 与重复 200 均为成功），失败打印单行 JSON 到 stderr 并以非零码退出。
+
 ## 当前状态
 
 接口已实现（纯标准库 HTTP 服务 + `cryptography` 校验公钥），并带有单元/集成测试。
@@ -20,7 +22,16 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 - `POST /v1/devices/{device_id}/prekeys/{key_id}/revoke`：撤销单个预密钥。成功 `200`，响应体 `{"device_id":...,"key_id":...,"revoked":true}`；重复调用幂等；未知设备 `404/field=device_id`，设备存在但 `key_id` 未知 `404/field=key_id`。仅排除目标 key，其他 key 与同用户的其他设备不受影响。
 - `POST /v1/devices/{device_id}/identity-key/rotate`：轮换身份公钥。`identity_key` 须为非空合法公钥，否则 `400/field=identity_key`；设备未知/已撤销 `404/409/field=device_id`。`rotated_at` 初值等于 `registered_at`；相同原始公钥 `200` 且时间戳不变，不同公钥更新并生成新的 UTC ISO-8601（`+00:00`）。响应含 `device_id`/`identity_key`/`rotated_at`。轮换只影响此后新建的会话，既有会话快照冻结。
 - `POST /v1/devices/{device_id}/prekeys`：补充预密钥。`key_id`、`public_key` 非空且公钥合法，否则 `400`（`public_key` 非法时 `field=public_key`）；设备未知/已撤销 `404/409/field=device_id`。新 `key_id` 顺序追加返回 `201`（`device_id`/`key_id`/`public_key`）；同 id 同原始公钥且未撤销幂等 `200`；同 id 异值或该 id 已撤销 `409/field=key_id`。撤销的 key 无法用同 id 重新补充。
-- 命令行 `register` / `show` / `revoke-device` / `revoke-prekey` / `rotate-identity-key` / `add-prekey` / `create-session` / `show-session` 与接口一一对应，成功时在 stdout 打印单行 JSON，字段名与 HTTP 一致；失败时在 stderr 打印单行 JSON 错误并以非零码退出。连接失败或超时时，API 命令在 stderr 打印 `field` 为 `server` 的单行 JSON、非零退出，且不输出 traceback。
+- `POST /v1/groups`：创建群组。`group_id`、`creator_device_id` 非空字符串，`member_device_ids` 非空字符串数组（元素非空），否则 `400`/对应 `field`；创建者未知/已撤销 `404/409/field=creator_device_id`；重复 `group_id` `409/field=group_id`。成员 id 不要求已注册；创建者恒居首位，其余按序去重。成功 `201` 返回 `group_id`/`revision`（初值 1）/`members`/`created_at`。
+- `GET /v1/groups/{group_id}`：返回群组四字段快照；未知 `404/field=group_id`。
+- `POST /v1/groups/{group_id}/members`（别名 `…/members/add`）：创建者新增成员。体含非空 `actor_device_id`、`device_id`，否则 `400`；未知群组 `404/field=group_id`，actor 未知 `404/field=actor_device_id`，actor 已撤销或非创建者 `409/field=actor_device_id`，目标设备未知 `404/field=device_id`、已撤销 `409/field=device_id`（撤销设备不得加入）。新成员 `201` 且 `revision+1`；已是成员 `200` 幂等且 `revision` 不变。
+- `POST /v1/groups/{group_id}/members/remove`：创建者移除成员。错误码同上；成功恒为 `200`——成员不在表中为幂等 no-op（`revision` 不变），已撤销成员仍可移除，创建者移除自己为保留创建者的 no-op。
+- `POST /v1/group-sessions`：冻结群组成员创建群组会话。`group_id`/`initiator_device_id`/`ephemeral_key` 非空字符串否则 `400`；未知群组 `404/field=group_id`；发起者未知 `404/field=initiator_device_id`，已撤销或非当前成员 `409/field=initiator_device_id`。成功 `201` 返回 `session_id`/`group_id`/`initiator_device_id`/`ephemeral_key`/`revision`/`members`/`created_at`，成员表与 `revision` 创建时冻结；重复提交总是新建（新 `session_id`）。
+- `GET /v1/group-sessions/{session_id}`：返回冻结快照；未知 `404/field=session_id`。此后群组增删成员不影响既有快照；新建会话才反映最新成员表与 `revision`。
+- 群组会话消息读写限冻结成员：向群组会话 `POST /v1/messages` 的发送方、`GET /v1/messages/{sid}` 的 `device_id` 都必须在冻结成员表中（冻结后被移出当前群组的设备仍可读该冻结会话；冻结后新加入的设备不可；设备被撤销仍按既有规则 `409`）；未知群组会话 `404/field=session_id`。序号连续、nonce 会话级去重等既有消息语义不变。
+- 群组创建、成员增删、群组会话创建与设备撤销共享存储同一把锁、原子线性化，失败不写入、不推进 `revision`。
+- 命令行 `group-create` / `group-show` / `group-add-member` / `group-remove-member` / `create-group-session` / `show-group-session` 与接口一一对应；成功 stdout 单行 JSON（含 200/201），失败 stderr 单行 JSON 且非零退出。群组与冻结会话均持久化到 version=1 状态文件并在重启后完整恢复。
+- 命令行 `register` / `show` / `revoke-device` / `revoke-prekey` / `rotate-identity-key` / `add-prekey` / `create-session` / `show-session` / `group-create` / `group-show` / `group-add-member` / `group-remove-member` / `create-group-session` / `show-group-session` 与接口一一对应，成功时在 stdout 打印单行 JSON，字段名与 HTTP 一致；失败时在 stderr 打印单行 JSON 错误并以非零码退出。连接失败或超时时，API 命令在 stderr 打印 `field` 为 `server` 的单行 JSON、非零退出，且不输出 traceback。
 - `POST /v1/sessions`：协商会话。四个入参（`initiator_device_id`、`recipient_device_id`、`prekey_id`、`ephemeral_key`）须为非空字符串，`ephemeral_key` 须为合法公钥编码，否则 `400` 并以 `field` 指明；两台设备相同返回 `400/field=recipient_device_id`。未知设备/预密钥返回 `404`，已撤销返回 `409`，`field` 分别为 `initiator_device_id` / `recipient_device_id` / `prekey_id`；失败不写入。成功 `201` 返回八字段：四入参回显、`identity_key`（接收方身份公钥）、`public_key`（所用预密钥公钥）、唯一 `session_id`、`created_at`（UTC ISO-8601，`+00:00`）。重复 POST 总是新建会话。
 - `GET /v1/sessions/{session_id}`：返回与创建时一致的八字段快照；未知会话 `404/field=session_id`。快照创建后冻结，设备/预密钥撤销不改变它。
 - 会话创建与设备/预密钥撤销共享同一把锁、线性化执行：撤销先行则创建得 `409` 且不写，创建先行则得 `201` 且会话保留，不存在中间态。
@@ -102,6 +113,33 @@ python3 -m e2ee_backend create-session \
 python3 -m e2ee_backend show-session SESSION_ID
 # => 同样的八个字段，单行 JSON
 
+# 创建群组（--member-device-id 可重复；创建者自动成为首位成员）
+python3 -m e2ee_backend group-create \
+  --group-id team --creator-device-id laptop --member-device-id phone
+# => {"group_id":"team","revision":1,"members":["laptop","phone"],
+#     "created_at":"2026-09-21T…+00:00"}
+
+# 查询群组
+python3 -m e2ee_backend group-show team
+
+# 新增成员（新成员 201；已在群内重复添加 200 幂等，revision 不变）
+python3 -m e2ee_backend group-add-member \
+  --group-id team --actor-device-id laptop --device-id tablet
+# 移除成员（恒为 200；重复移除幂等）
+python3 -m e2ee_backend group-remove-member \
+  --group-id team --actor-device-id laptop --device-id phone
+
+# 创建群组会话（成员表与 revision 在此刻冻结；重复提交总是新建）
+python3 -m e2ee_backend create-group-session \
+  --group-id team --initiator-device-id laptop --ephemeral-key BASE64_OR_PEM_PUBLIC_KEY
+# => {"session_id":"…","group_id":"team","initiator_device_id":"laptop",
+#     "ephemeral_key":"…","revision":2,"members":["laptop","tablet"],
+#     "created_at":"2026-09-21T…+00:00"}
+
+# 查询冻结的群组会话快照
+python3 -m e2ee_backend show-group-session SESSION_ID
+# => 同样的七个字段，单行 JSON；此后群组增删成员不改变该快照
+
 # 投递加密消息信封（sequence 从 1 开始逐条连续）
 python3 -m e2ee_backend send-message \
   --session-id SESSION_ID --sender-device-id laptop \
@@ -147,18 +185,18 @@ python3 -m e2ee_backend decrypt-message \
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：公钥解析、注册成功/409 冲突/各类 400（指明字段）、查询/404、`prekey_ids` 顺序稳定与撤销过滤、设备与单预密钥撤销（200、幂等、404 及对应 field、同用户设备隔离）、撤销与查询并发线性化、会话协商成功（八字段、四入参回显、接收方公钥、唯一 session_id、重复 POST 新建）、会话各类 400/404/409（对应 field、失败不写）、会话快照在撤销后不变、创建与撤销并发原子线性化（撤销先行 409/创建先行 201 两种顺序均被观察到）、消息投递（信封回显与 created_at、sequence 从 1 连续、重复 message_id/错序/发送方撤销/未知会话的 400/404/409 及对应 field、失败不推进序号、会话间序号独立、会话内重复 nonce 返回 409/nonce 且不写入不推进不改变投递状态、nonce 原始字符串比较、同 nonce 跨会话可复用、重复 id/错序/重放的固定优先顺序、相同信封并发只线性化写入一条）、消息拉取（分页升序、next_after 语义、参数校验、读取方撤销 409、发送方撤销后已存消息仍可读）、可靠投递（首次 retry 201/attempts+1、相同 attempt_id 200 不计数、新 attempt_id 200 计数、acked 后重试仍 200 且保持 acked、ack 首次 201/重复 200 幂等、无重试直接 ack、序号不符 409/sequence、未知会话/消息 404、设备不符/未知/撤销 409/device_id、status 缺参 400/device_id、失败不改变状态）、持久化（缺失创建 version=1、损坏/非对象/版本不符/载荷畸形拒绝启动、原子替换无残留临时文件、重启恢复尝试去重/attempts/acked、序号游标、已用 nonce 集合并拒绝重放、旧文件缺 nonce 字段由历史消息重建、nonce 字段畸形拒绝启动、设备与预密钥撤销）、`serve --data-file` 真实子进程重启恢复与损坏拒启、AES-256-GCM 加解密（UTF-8 回环、随机 nonce、AAD 绑定 session_id、密钥/nonce/密文长度与编码校验、篡改与错密钥认证失败）、HTTP 全链路（真实 socket）、CLI 子命令（真实子进程，含连接失败 `field=server`、非零退出、无 traceback）。
+测试覆盖：公钥解析、注册成功/409 冲突/各类 400（指明字段）、查询/404、`prekey_ids` 顺序稳定与撤销过滤、设备与单预密钥撤销（200、幂等、404 及对应 field、同用户设备隔离）、撤销与查询并发线性化、会话协商成功（八字段、四入参回显、接收方公钥、唯一 session_id、重复 POST 新建）、会话各类 400/404/409（对应 field、失败不写）、会话快照在撤销后不变、创建与撤销并发原子线性化（撤销先行 409/创建先行 201 两种顺序均被观察到）、消息投递（信封回显与 created_at、sequence 从 1 连续、重复 message_id/错序/发送方撤销/未知会话的 400/404/409 及对应 field、失败不推进序号、会话间序号独立、会话内重复 nonce 返回 409/nonce 且不写入不推进不改变投递状态、nonce 原始字符串比较、同 nonce 跨会话可复用、重复 id/错序/重放的固定优先顺序、相同信封并发只线性化写入一条）、消息拉取（分页升序、next_after 语义、参数校验、读取方撤销 409、发送方撤销后已存消息仍可读）、可靠投递（首次 retry 201/attempts+1、相同 attempt_id 200 不计数、新 attempt_id 200 计数、acked 后重试仍 200 且保持 acked、ack 首次 201/重复 200 幂等、无重试直接 ack、序号不符 409/sequence、未知会话/消息 404、设备不符/未知/撤销 409/device_id、status 缺参 400/device_id、失败不改变状态）、持久化（缺失创建 version=1、损坏/非对象/版本不符/载荷畸形拒绝启动、原子替换无残留临时文件、重启恢复尝试去重/attempts/acked、序号游标、已用 nonce 集合并拒绝重放、旧文件缺 nonce 字段由历史消息重建、nonce 字段畸形拒绝启动、设备与预密钥撤销）、`serve --data-file` 真实子进程重启恢复与损坏拒启、AES-256-GCM 加解密（UTF-8 回环、随机 nonce、AAD 绑定 session_id、密钥/nonce/密文长度与编码校验、篡改与错密钥认证失败）、HTTP 全链路（真实 socket）、CLI 子命令（真实子进程，含连接失败 `field=server`、非零退出、无 traceback）、群组与群组会话（创建四字段与成员去重、重复 group_id 409、创建者未知/已撤销 404/409、成员数组各类 400、查询 404、成员新增 201/重复 200、未知群组/设备与越权 404/409 及对应 field、已撤销设备不得加入、移除恒 200/幂等/创建者保留、revision 递增与冻结不变、群会话发起者规则 404/409、重复提交新建 session_id、冻结成员表与 revision 不受后续增删影响、消息读写限冻结成员（冻结后新加入不可、移出者仍可读、设备撤销仍 409）、创建与撤销并发线性化只有合法结局、群组与冻结快照持久化重启恢复）、群组 HTTP 全链路与群组 CLI 子进程（成功 stdout/失败 stderr/非零退出）。
 
 ## 代码结构
 
 ```
 e2ee_backend/
   crypto.py       # cryptography 公钥解析/校验（PEM、DER、原始曲线点）与 AES-256-GCM 本地加解密
-  models.py       # Device / SignedPreKey / Session / Message / MessageDelivery 数据模型
-  storage.py      # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、消息原子追加与分页、投递去重/确认、整体状态快照与恢复）
+  models.py       # Device / SignedPreKey / Session / Group / GroupSession / Message / MessageDelivery 数据模型
+  storage.py      # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、群组与冻结群会话、消息原子追加与分页（群组会话限冻结成员）、投递去重/确认、整体状态快照与恢复）
   persistence.py  # version=1 JSON 状态文件：缺失创建、损坏/版本不符拒启、临时文件+fsync+os.replace 原子替换
-  service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/消息/投递）
-  http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、消息投递与拉取、重试/确认/状态）
-  cli.py          # register/show/revoke-*/rotate-identity-key/add-prekey/create-session/show-session/send-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
+  service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/群组/群会话/消息/投递）
+  http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、群组创建/查询/成员增删、群组会话协商与查询、消息投递与拉取、重试/确认/状态）
+  cli.py          # register/show/revoke-*/rotate-identity-key/add-prekey/create-session/show-session/group-*/create-group-session/show-group-session/send-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
 tests/            # unittest 测试
 ```

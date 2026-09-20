@@ -83,6 +83,42 @@ class MessageDelivery:
 
 
 @dataclass
+class Group:
+    """A member group created by one (creator) device.
+
+    Membership keeps insertion order (creator first, then each added member)
+    so the public ``members`` listing is stable across repeated reads. The
+    ``revision`` starts at 1 and advances by one on every successful
+    membership change; the creator is fixed for the group's lifetime.
+    """
+
+    group_id: str
+    creator_device_id: str
+    members: List[str] = field(default_factory=list)
+    revision: int = 1
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class GroupSession:
+    """An immutable snapshot of a negotiated group session.
+
+    The member list is frozen at creation time: later group membership
+    changes never alter it, and only frozen members may read messages sent
+    into the session. Only public material (the initiator's ephemeral public
+    key) and identifiers are retained.
+    """
+
+    session_id: str
+    group_id: str
+    initiator_device_id: str
+    ephemeral_key: str
+    members: List[str]
+    revision: int
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class Session:
     """An immutable snapshot of a negotiated session.
 

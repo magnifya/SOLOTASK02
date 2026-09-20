@@ -150,6 +150,46 @@ def build_parser() -> argparse.ArgumentParser:
     p_show_session.add_argument("session_id")
     p_show_session.set_defaults(handler=cmd_show_session)
 
+    p_group_create = sub.add_parser("group-create", help="create a member group")
+    p_group_create.add_argument("--group-id", required=True)
+    p_group_create.add_argument("--creator-device-id", required=True)
+    p_group_create.add_argument(
+        "--member-device-id", action="append", default=[], metavar="DEVICE_ID",
+        help="initial member device id (besides the creator); repeatable")
+    p_group_create.set_defaults(handler=cmd_group_create)
+
+    p_group_show = sub.add_parser("group-show", help="show a group snapshot")
+    p_group_show.add_argument("group_id")
+    p_group_show.set_defaults(handler=cmd_group_show)
+
+    p_group_add = sub.add_parser(
+        "group-add-member", help="add a device to a group (creator only)")
+    p_group_add.add_argument("--group-id", required=True)
+    p_group_add.add_argument("--actor-device-id", required=True)
+    p_group_add.add_argument("--device-id", required=True)
+    p_group_add.set_defaults(handler=cmd_group_add_member)
+
+    p_group_remove = sub.add_parser(
+        "group-remove-member", help="remove a device from a group (creator only)")
+    p_group_remove.add_argument("--group-id", required=True)
+    p_group_remove.add_argument("--actor-device-id", required=True)
+    p_group_remove.add_argument("--device-id", required=True)
+    p_group_remove.set_defaults(handler=cmd_group_remove_member)
+
+    p_create_group_session = sub.add_parser(
+        "create-group-session", help="freeze a group into a group session")
+    p_create_group_session.add_argument("--group-id", required=True)
+    p_create_group_session.add_argument("--initiator-device-id", required=True)
+    p_create_group_session.add_argument(
+        "--ephemeral-key", required=True,
+        help="ephemeral public key (string), or @path to read it from a file")
+    p_create_group_session.set_defaults(handler=cmd_create_group_session)
+
+    p_show_group_session = sub.add_parser(
+        "show-group-session", help="show a frozen group-session snapshot")
+    p_show_group_session.add_argument("session_id")
+    p_show_group_session.set_defaults(handler=cmd_show_group_session)
+
     p_send_message = sub.add_parser(
         "send-message", help="send an encrypted message envelope into a session")
     p_send_message.add_argument("--session-id", required=True)
@@ -364,6 +404,99 @@ def cmd_show_session(args: argparse.Namespace) -> int:
     from urllib.parse import quote
 
     url = f"{args.base_url}/v1/sessions/{quote(args.session_id, safe='')}"
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def cmd_group_create(args: argparse.Namespace) -> int:
+    """Call POST /v1/groups and print the single-line JSON response."""
+    payload = {
+        "group_id": args.group_id,
+        "creator_device_id": args.creator_device_id,
+        "member_device_ids": args.member_device_id,
+    }
+    try:
+        status, response = _request_json("POST", f"{args.base_url}/v1/groups",
+                                         body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 201 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 201 else 1
+
+
+def cmd_group_show(args: argparse.Namespace) -> int:
+    """Call GET /v1/groups/{group_id} and print the single-line JSON."""
+    from urllib.parse import quote
+
+    url = f"{args.base_url}/v1/groups/{quote(args.group_id, safe='')}"
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def cmd_group_add_member(args: argparse.Namespace) -> int:
+    """Call POST /v1/groups/{group_id}/members; 201 created or 200 duplicate."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/groups/"
+           f"{quote(args.group_id, safe='')}/members")
+    payload = {"actor_device_id": args.actor_device_id,
+               "device_id": args.device_id}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_group_remove_member(args: argparse.Namespace) -> int:
+    """Call POST /v1/groups/{group_id}/members/remove; always 200 on success."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/groups/"
+           f"{quote(args.group_id, safe='')}/members/remove")
+    payload = {"actor_device_id": args.actor_device_id,
+               "device_id": args.device_id}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_create_group_session(args: argparse.Namespace) -> int:
+    """Call POST /v1/group-sessions and print the single-line JSON response."""
+    payload = {
+        "group_id": args.group_id,
+        "initiator_device_id": args.initiator_device_id,
+        "ephemeral_key": _read_key_argument(args.ephemeral_key),
+    }
+    try:
+        status, response = _request_json(
+            "POST", f"{args.base_url}/v1/group-sessions", body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 201 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 201 else 1
+
+
+def cmd_show_group_session(args: argparse.Namespace) -> int:
+    """Call GET /v1/group-sessions/{session_id} and print the single-line JSON."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/group-sessions/"
+           f"{quote(args.session_id, safe='')}")
     try:
         status, response = _request_json("GET", url)
     except ServerUnavailable:

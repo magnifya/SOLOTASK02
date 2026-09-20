@@ -17,6 +17,19 @@ from .storage import (
     DELIVERY_SESSION_UNKNOWN,
     DEVICE_REVOKED,
     DEVICE_UNKNOWN,
+    GROUP_ACTOR_NOT_CREATOR,
+    GROUP_ACTOR_REVOKED,
+    GROUP_ACTOR_UNKNOWN,
+    GROUP_CREATOR_REVOKED,
+    GROUP_CREATOR_UNKNOWN,
+    GROUP_DEVICE_REVOKED,
+    GROUP_DEVICE_UNKNOWN,
+    GROUP_DUPLICATE_ID,
+    GROUP_SESSION_GROUP_UNKNOWN,
+    GROUP_SESSION_INITIATOR_INACTIVE,
+    GROUP_SESSION_INITIATOR_NOT_MEMBER,
+    GROUP_SESSION_INITIATOR_UNKNOWN,
+    GROUP_UNKNOWN,
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
@@ -33,6 +46,7 @@ from .storage import (
     DeviceStore,
     DeviceUpdateError,
     DeliveryError,
+    GroupError,
     MessageCreateError,
     MessageListError,
     SessionCreateError,
@@ -318,6 +332,183 @@ class DeviceService:
             raise ServiceError(f"session not found: {session_id}",
                                "session_id", status_code=404)
         return view
+
+    # -- groups ------------------------------------------------------------
+
+    #: Maps a storage-level group-membership failure to (HTTP status, field).
+    _GROUP_MEMBER_ERROR_MAP = {
+        GROUP_UNKNOWN: (404, "group_id"),
+        GROUP_ACTOR_UNKNOWN: (404, "actor_device_id"),
+        GROUP_ACTOR_REVOKED: (409, "actor_device_id"),
+        GROUP_ACTOR_NOT_CREATOR: (409, "actor_device_id"),
+        GROUP_DEVICE_UNKNOWN: (404, "device_id"),
+        GROUP_DEVICE_REVOKED: (409, "device_id"),
+    }
+
+    def create_group(self, payload: object) -> Dict[str, Any]:
+        """Validate a group-creation payload and atomically create the group.
+
+        ``group_id`` and ``creator_device_id`` must be non-empty strings and
+        ``member_device_ids`` a non-empty array of non-empty strings. The
+        creator must be an active device; it always becomes the first member.
+        A repeated ``group_id`` is a 409 naming ``group_id``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("group_id", "creator_device_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        if "member_device_ids" not in payload:
+            raise ServiceError("missing required field: member_device_ids",
+                               "member_device_ids")
+        raw_members = payload["member_device_ids"]
+        if not isinstance(raw_members, list) or not raw_members:
+            raise ServiceError(
+                "field must be a non-empty array: member_device_ids",
+                "member_device_ids")
+        for index, element in enumerate(raw_members):
+            if not is_nonempty_string(element):
+                raise ServiceError(
+                    "every member must be a non-empty string: "
+                    f"member_device_ids[{index}]",
+                    "member_device_ids")
+
+        try:
+            group = self.store.create_group(
+                payload["group_id"], payload["creator_device_id"],
+                list(raw_members))
+        except GroupError as error:
+            if error.reason == GROUP_DUPLICATE_ID:
+                raise ServiceError(
+                    f"group_id already exists: {payload['group_id']}",
+                    "group_id", status_code=409)
+            if error.reason == GROUP_CREATOR_UNKNOWN:
+                raise ServiceError(
+                    f"device not found: {payload['creator_device_id']}",
+                    "creator_device_id", status_code=404)
+            raise ServiceError("creator_device_id is revoked",
+                               "creator_device_id", status_code=409)
+        return self.store.group_view(group)
+
+    def get_group(self, group_id: str) -> Dict[str, Any]:
+        """Return the group's public snapshot; 404/field=group_id if unknown."""
+        group = self.store.get_group(group_id)
+        if group is None:
+            raise ServiceError(f"group not found: {group_id}",
+                               "group_id", status_code=404)
+        return self.store.group_view(group)
+
+    def _validate_member_change(self, payload: object
+                                ) -> Tuple[str, str]:
+        """Validate the shared body of add/remove-member requests."""
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("actor_device_id", "device_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        return payload["actor_device_id"], payload["device_id"]
+
+    def _group_member_error(self, error: GroupError,
+                            group_id: str) -> ServiceError:
+        """Translate a storage membership failure into a ServiceError."""
+        status_code, field = self._GROUP_MEMBER_ERROR_MAP[error.reason]
+        if error.reason == GROUP_UNKNOWN:
+            text = f"group not found: {group_id}"
+        elif error.reason == GROUP_ACTOR_UNKNOWN:
+            text = "actor_device_id is not a registered device"
+        elif error.reason == GROUP_DEVICE_UNKNOWN:
+            text = "device_id is not a registered device"
+        elif field == "actor_device_id":
+            text = "actor_device_id is revoked or is not the group creator"
+        else:
+            text = "device_id is revoked and cannot be added to the group"
+        return ServiceError(text, field, status_code=status_code)
+
+    def add_group_member(self, group_id: str,
+                         payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and add one member; 201 created, 200 when already a member.
+
+        Only the creator may change membership. Unknown group/actor/target
+        device are 404 with the corresponding field; a revoked or
+        non-creator actor and a revoked target are 409.
+        """
+        actor_device_id, device_id = self._validate_member_change(payload)
+        try:
+            group, created = self.store.add_group_member(
+                group_id, actor_device_id, device_id)
+        except GroupError as error:
+            raise self._group_member_error(error, group_id)
+        return self.store.group_view(group), 201 if created else 200
+
+    def remove_group_member(self, group_id: str, payload: object
+                            ) -> Dict[str, Any]:
+        """Validate and remove one member; always 200 (idempotent).
+
+        Only the creator may remove members. Removing a device that is not
+        on the roster is a no-op; an id that has never been registered is
+        404/field=device_id.
+        """
+        actor_device_id, device_id = self._validate_member_change(payload)
+        try:
+            group = self.store.remove_group_member(
+                group_id, actor_device_id, device_id)
+        except GroupError as error:
+            raise self._group_member_error(error, group_id)
+        return self.store.group_view(group)
+
+    # -- group sessions ----------------------------------------------------
+
+    def create_group_session(self, payload: object) -> Dict[str, Any]:
+        """Validate a group-session payload and atomically create one.
+
+        Every request creates a fresh session (a new ``session_id``);
+        repeated POSTs are never deduplicated. The member list is frozen at
+        creation. The initiator must be an active current member.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("group_id", "initiator_device_id", "ephemeral_key"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        try:
+            session = self.store.create_group_session(
+                payload["group_id"], payload["initiator_device_id"],
+                payload["ephemeral_key"])
+        except GroupError as error:
+            if error.reason == GROUP_SESSION_GROUP_UNKNOWN:
+                raise ServiceError(
+                    f"group not found: {payload['group_id']}",
+                    "group_id", status_code=404)
+            if error.reason == GROUP_SESSION_INITIATOR_UNKNOWN:
+                raise ServiceError(
+                    f"device not found: {payload['initiator_device_id']}",
+                    "initiator_device_id", status_code=404)
+            raise ServiceError(
+                "initiator_device_id is revoked or is not a group member",
+                "initiator_device_id", status_code=409)
+        return self.store.group_session_view(session)
+
+    def get_group_session(self, session_id: str) -> Dict[str, Any]:
+        """Return the frozen group-session snapshot; 404/field=session_id."""
+        session = self.store.get_group_session(session_id)
+        if session is None:
+            raise ServiceError(f"session not found: {session_id}",
+                               "session_id", status_code=404)
+        return self.store.group_session_view(session)
 
     # -- messages ----------------------------------------------------------
 
