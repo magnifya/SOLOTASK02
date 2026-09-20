@@ -119,6 +119,21 @@ class GroupSession:
 
 
 @dataclass
+class GroupSyncCursor:
+    """Per-device read cursor for syncing one group session's messages.
+
+    Records the sequence up to which a frozen member device has consumed the
+    session's message stream, together with the timestamp of the last forward
+    checkpoint (``updated_at``). A device has one cursor per group session;
+    the initial cursor sits at sequence 0 and is created lazily on the first
+    check-pointed advance. Only the integer cursor and its timestamp are kept.
+    """
+
+    cursor: int = 0
+    updated_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class Session:
     """An immutable snapshot of a negotiated session.
 

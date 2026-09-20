@@ -37,6 +37,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_create_group()
         elif path == _GROUP_SESSIONS_PATH:
             self._handle_create_group_session()
+        elif path.startswith(_GROUP_SESSIONS_PATH + "/") \
+                and path.endswith("/sync/checkpoint"):
+            self._route_group_sync_checkpoint(path)
         elif path.startswith(_GROUPS_PATH + "/"):
             self._route_group_member(path)
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
@@ -87,6 +90,15 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"message": "group not found",
                                   "field": "group_id"})
 
+    def _route_group_sync_checkpoint(self, path: str) -> None:
+        suffix = path[len(_GROUP_SESSIONS_PATH) + 1:
+                      -len("/sync/checkpoint")]
+        if suffix and "/" not in suffix:
+            self._handle_sync_checkpoint(unquote(suffix))
+        else:
+            self._send_json(404, {"message": "session not found",
+                                  "field": "session_id"})
+
     def _route_revoke(self, path: str) -> None:
         # Split on raw slashes only; a percent-encoded slash inside a segment
         # is part of the id, mirroring the GET route.
@@ -129,6 +141,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_show_group(unquote(suffix))
         elif path.startswith(_GROUP_SESSIONS_PATH + "/"):
             suffix = path[len(_GROUP_SESSIONS_PATH) + 1:]
+            if suffix.endswith("/sync"):
+                session_id = suffix[:-len("/sync")]
+                if not session_id or "/" in session_id:
+                    self._send_json(404, {"message": "session not found",
+                                          "field": "session_id"})
+                    return
+                self._handle_sync_group_messages(unquote(session_id))
+                return
             if not suffix or "/" in suffix:
                 self._send_json(404, {"message": "session not found",
                                       "field": "session_id"})
@@ -306,6 +326,68 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(200, body)
+
+    def _handle_sync_group_messages(self, session_id: str) -> None:
+        params = self._sync_query_params()
+        if params is None:
+            return  # a 400 response was already sent
+        device_id, after, limit = params
+        try:
+            body = self.service.sync_group_messages(
+                session_id, device_id, after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_sync_checkpoint(self, session_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.sync_group_checkpoint(
+                session_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _sync_query_params(self) -> Optional[Tuple[str, Optional[int], int]]:
+        """Validate the sync GET params: single ``device_id``, optional
+        non-negative ``after`` (omitted -> the stored cursor), and ``limit``
+        in 1..100 (default 100). Returns ``None`` after sending a 400."""
+        query = parse_qs(urlsplit(self.path).query)
+
+        device_ids = query.get("device_id", [])
+        if len(device_ids) != 1 or not device_ids[0]:
+            self._send_json(400, {"message": "device_id is required",
+                                  "field": "device_id"})
+            return None
+
+        after_values = query.get("after")
+        if after_values is None:
+            after: Optional[int] = None
+        elif len(after_values) != 1:
+            self._send_json(400, {"message": "after must appear at most once",
+                                  "field": "after"})
+            return None
+        else:
+            try:
+                after = int(after_values[0])
+            except ValueError:
+                self._send_json(400, {"message": "after must be an integer",
+                                      "field": "after"})
+                return None
+            if after < 0:
+                self._send_json(400, {"message": "after is out of range",
+                                      "field": "after"})
+                return None
+
+        limit = self._int_param(query, "limit", default=100,
+                                minimum=1, maximum=100)
+        if limit is None:
+            return None
+        return device_ids[0], after, limit
 
     def _handle_post_message(self) -> None:
         payload = self._read_json_request()
