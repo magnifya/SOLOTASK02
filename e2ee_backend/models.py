@@ -101,3 +101,40 @@ class Session:
     identity_key: str
     public_key: str
     created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class Group:
+    """A mutable member group created by one of its devices.
+
+    ``members`` holds the device ids in stable insertion order (the order in
+    which they were supplied when the group was created or later joined). Every successful membership change increments
+    ``revision`` (starting at 1); the creator is fixed for the group's life.
+    Only identifiers are retained.
+    """
+
+    group_id: str
+    creator_device_id: str
+    members: List[str] = field(default_factory=list)
+    revision: int = 1
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class GroupSession:
+    """A group session whose membership is frozen at creation time.
+
+    ``members`` is an ordered snapshot of the group's members then; later
+    group membership changes never alter it. Message reads in a group session
+    are restricted to these frozen members, even if a member device is later
+    revoked. Only public material (the initiator's ephemeral public key) and
+    identifiers are retained.
+    """
+
+    session_id: str
+    group_id: str
+    initiator_device_id: str
+    ephemeral_key: str
+    members: List[str] = field(default_factory=list)
+    revision: int = 1
+    created_at: str = field(default_factory=utc_now_iso)
