@@ -10,7 +10,7 @@ import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .models import Device, Message, MessageDelivery, Session, SignedPreKey
+from .models import Device, Message, MessageDelivery, Session, SignedPreKey, utc_now_iso
 
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
@@ -35,6 +35,12 @@ DELIVERY_MESSAGE_UNKNOWN = "message_unknown"
 DELIVERY_DEVICE_MISMATCH = "device_mismatch"
 DELIVERY_DEVICE_INACTIVE = "device_inactive"
 DELIVERY_BAD_SEQUENCE = "bad_sequence"
+
+#: Outcome codes for identity-key rotation.
+DEVICE_UNKNOWN = "device_unknown"
+DEVICE_REVOKED = "device_revoked"
+#: Outcome code for a pre-key add conflict (same id, changed key, or revoked).
+PREKEY_CONFLICT = "prekey_conflict"
 
 
 class SessionCreateError(Exception):
@@ -63,6 +69,14 @@ class MessageListError(Exception):
 
 class DeliveryError(Exception):
     """An atomic delivery (retry/ack/status) check failed; nothing changed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class DeviceUpdateError(Exception):
+    """An atomic identity-key rotation or pre-key add failed; nothing changed."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -169,6 +183,73 @@ class DeviceStore:
                     self._notify_change()
                     return device, True
             return device, False
+
+    def identity_view(self, device: Device) -> Dict[str, Any]:
+        """Copy the device's current identity material into a three-field view."""
+        return {
+            "device_id": device.device_id,
+            "identity_key": device.identity_key,
+            "rotated_at": device.rotated_at,
+        }
+
+    def rotate_identity_key(self, device_id: str, identity_key: str
+                            ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically rotate a device's identity key.
+
+        Returns ``(view, changed)``: ``changed`` is True when the key was
+        actually replaced (and ``rotated_at`` advanced), False when the new
+        key equals the stored one (idempotent; ``rotated_at`` untouched).
+        Unknown -> :class:`DeviceUpdateError` ``device_unknown`` (404);
+        revoked -> ``device_revoked`` (409). All checks and the write happen
+        under the store lock; a failure writes nothing.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                raise DeviceUpdateError(DEVICE_UNKNOWN)
+            if device.revoked:
+                raise DeviceUpdateError(DEVICE_REVOKED)
+            changed = identity_key != device.identity_key
+            if changed:
+                device.identity_key = identity_key
+                device.rotated_at = utc_now_iso()
+                self._notify_change()
+            return self.identity_view(device), changed
+
+    def add_prekey(self, device_id: str, key_id: str, public_key: str
+                   ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically append a pre-key (or confirm an identical existing one).
+
+        A new ``key_id`` is appended in order and reported with ``created``
+        True (201). An existing, non-revoked key with the same ``public_key``
+        is idempotent (200, ``created`` False). An existing id with a changed
+        key, or an id whose key was revoked, raises
+        :class:`DeviceUpdateError` ``prekey_conflict`` (409/key_id). Unknown
+        device -> ``device_unknown`` (404), revoked device -> ``device_revoked``
+        (409). Locked; a failure writes nothing.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                raise DeviceUpdateError(DEVICE_UNKNOWN)
+            if device.revoked:
+                raise DeviceUpdateError(DEVICE_REVOKED)
+            existing = next((pk for pk in device.prekeys
+                             if pk.key_id == key_id), None)
+            if existing is not None:
+                if not existing.revoked and existing.public_key == public_key:
+                    return ({"device_id": device.device_id,
+                             "key_id": existing.key_id,
+                             "public_key": existing.public_key}, False)
+                raise DeviceUpdateError(PREKEY_CONFLICT)
+            prekey = SignedPreKey(key_id=key_id, public_key=public_key)
+            device.prekeys.append(prekey)
+            self._notify_change()
+            return ({"device_id": device.device_id,
+                     "key_id": prekey.key_id,
+                     "public_key": prekey.public_key}, True)
 
     def public_view(self, device_id: str) -> Optional[Dict[str, Any]]:
         """Atomically build the public snapshot of a device.
@@ -457,6 +538,7 @@ class DeviceStore:
                     "device_id": device.device_id,
                     "identity_key": device.identity_key,
                     "registered_at": device.registered_at,
+                    "rotated_at": device.rotated_at,
                     "revoked": device.revoked,
                     "prekeys": [{"key_id": pk.key_id,
                                  "public_key": pk.public_key,
@@ -531,6 +613,9 @@ class DeviceStore:
                     user_id=raw["user_id"], device_id=raw["device_id"],
                     identity_key=raw["identity_key"],
                     registered_at=raw["registered_at"],
+                    # Older version-1 files predate this field; then it equals
+                    # registered_at (Device.__post_init__ fills in the default).
+                    rotated_at=raw.get("rotated_at"),
                     prekeys=prekeys, revoked=bool(raw.get("revoked", False)))
             except KeyError as error:
                 raise ValueError(

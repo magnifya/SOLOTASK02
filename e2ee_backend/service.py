@@ -15,11 +15,14 @@ from .storage import (
     DELIVERY_DEVICE_MISMATCH,
     DELIVERY_MESSAGE_UNKNOWN,
     DELIVERY_SESSION_UNKNOWN,
+    DEVICE_REVOKED,
+    DEVICE_UNKNOWN,
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
+    PREKEY_CONFLICT,
     SESSION_INITIATOR_REVOKED,
     SESSION_INITIATOR_UNKNOWN,
     SESSION_PREKEY_REVOKED,
@@ -27,6 +30,7 @@ from .storage import (
     SESSION_RECIPIENT_REVOKED,
     SESSION_RECIPIENT_UNKNOWN,
     DeviceStore,
+    DeviceUpdateError,
     DeliveryError,
     MessageCreateError,
     MessageListError,
@@ -174,6 +178,87 @@ class DeviceService:
             raise ServiceError(f"pre-key not found: {key_id}",
                                "key_id", status_code=404)
         return {"device_id": device.device_id, "key_id": key_id, "revoked": True}
+
+    # -- identity rotation & pre-key replenishment -------------------------
+
+    def rotate_identity_key(self, device_id: str,
+                            payload: object) -> Dict[str, Any]:
+        """Validate and apply an identity-key rotation.
+
+        The new ``identity_key`` must be a non-empty, valid public key. The
+        same value as the current key is a no-op that leaves ``rotated_at``
+        unchanged; a changed value stamps a fresh UTC ISO-8601 ``rotated_at``.
+        Unknown device is 404, revoked device is 409 (both field
+        ``device_id``); nothing is written on failure.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "identity_key" not in payload:
+            raise ServiceError("missing required field: identity_key",
+                               "identity_key")
+        if not is_nonempty_string(payload["identity_key"]):
+            raise ServiceError(
+                "field must be a non-empty string: identity_key",
+                "identity_key")
+        if load_public_key(payload["identity_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: identity_key",
+                "identity_key")
+
+        try:
+            view, _changed = self.store.rotate_identity_key(
+                device_id, payload["identity_key"])
+        except DeviceUpdateError as error:
+            raise self._device_update_error(error, device_id)
+        return view
+
+    def add_prekey(self, device_id: str,
+                   payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and append a pre-key, or confirm an identical existing one.
+
+        ``key_id`` and ``public_key`` must be non-empty strings and the key
+        must parse as a public key. A new id appends in order (201); an
+        existing id with the same, non-revoked key is idempotent (200); a
+        changed key or a revoked id conflicts (409/key_id). Unknown device is
+        404, revoked device 409 (field ``device_id``). Returns
+        ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("key_id", "public_key"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if load_public_key(payload["public_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: public_key", "public_key")
+
+        try:
+            view, created = self.store.add_prekey(
+                device_id, payload["key_id"], payload["public_key"])
+        except DeviceUpdateError as error:
+            raise self._device_update_error(error, device_id)
+        return view, 201 if created else 200
+
+    @staticmethod
+    def _device_update_error(error: DeviceUpdateError,
+                             device_id: str) -> ServiceError:
+        """Translate a rotation/add-pre-key storage failure to a ServiceError."""
+        if error.reason == DEVICE_UNKNOWN:
+            return ServiceError(f"device not found: {device_id}",
+                                "device_id", status_code=404)
+        if error.reason == DEVICE_REVOKED:
+            return ServiceError("device_id is revoked",
+                                "device_id", status_code=409)
+        if error.reason == PREKEY_CONFLICT:
+            return ServiceError(
+                "key_id already exists with a different key or is revoked",
+                "key_id", status_code=409)
+        raise  # pragma: no cover - defensive
 
     # -- sessions ----------------------------------------------------------
 

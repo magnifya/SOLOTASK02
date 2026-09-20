@@ -33,6 +33,11 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_post_message()
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
             self._route_revoke(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/identity-key/rotate"):
+            self._route_rotate_identity(path)
+        elif path.startswith(_DEVICES_PATH + "/"):
+            self._route_add_prekey(path)
         elif path.startswith(_MESSAGES_PATH + "/") and path.endswith("/acks"):
             self._route_acks(path)
         elif path.startswith(_MESSAGES_PATH + "/") and "/retry/" in path:
@@ -67,6 +72,24 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_revoke_device(unquote(parts[0]))
         elif len(parts) == 3 and parts[1] == "prekeys":
             self._handle_revoke_prekey(unquote(parts[0]), unquote(parts[2]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_rotate_identity(self, path: str) -> None:
+        suffix = path[len(_DEVICES_PATH) + 1:-len("/identity-key/rotate")]
+        parts = suffix.split("/")
+        if len(parts) == 1 and parts[0]:
+            self._handle_rotate_identity(unquote(parts[0]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_add_prekey(self, path: str) -> None:
+        suffix = path[len(_DEVICES_PATH) + 1:]
+        parts = suffix.split("/")
+        if len(parts) == 2 and parts[0] and parts[1] == "prekeys":
+            self._handle_add_prekey(unquote(parts[0]))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -144,6 +167,28 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(200, body)
+
+    def _handle_rotate_identity(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.rotate_identity_key(device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_add_prekey(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.add_prekey(device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
 
     def _handle_create_session(self) -> None:
         payload = self._read_json_request()

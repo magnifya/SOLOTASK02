@@ -118,6 +118,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_revoke_prekey.add_argument("--key-id", required=True)
     p_revoke_prekey.set_defaults(handler=cmd_revoke_prekey)
 
+    p_rotate_identity = sub.add_parser(
+        "rotate-identity-key",
+        help="rotate a device's identity public key")
+    p_rotate_identity.add_argument("--device-id", required=True)
+    p_rotate_identity.add_argument(
+        "--identity-key", required=True,
+        help="new identity public key (string), or @path to read it from a file")
+    p_rotate_identity.set_defaults(handler=cmd_rotate_identity_key)
+
+    p_add_prekey = sub.add_parser(
+        "add-prekey", help="append a signed pre-key to a device")
+    p_add_prekey.add_argument("--device-id", required=True)
+    p_add_prekey.add_argument("--key-id", required=True)
+    p_add_prekey.add_argument(
+        "--public-key", required=True,
+        help="pre-key public key (string), or @path to read it from a file")
+    p_add_prekey.set_defaults(handler=cmd_add_prekey)
+
     p_create_session = sub.add_parser(
         "create-session", help="negotiate a session between two devices")
     p_create_session.add_argument("--initiator-device-id", required=True)
@@ -292,6 +310,35 @@ def cmd_revoke_prekey(args: argparse.Namespace) -> int:
     stream = sys.stdout if status == 200 else sys.stderr
     print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
     return 0 if status == 200 else 1
+
+
+def cmd_rotate_identity_key(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/{id}/identity-key/rotate and print the JSON."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/devices/"
+           f"{quote(args.device_id, safe='')}/identity-key/rotate")
+    payload = {"identity_key": _read_key_argument(args.identity_key)}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_add_prekey(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/{id}/prekeys; 201 created or 200 idempotent."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/devices/"
+           f"{quote(args.device_id, safe='')}/prekeys")
+    payload = {"key_id": args.key_id,
+               "public_key": _read_key_argument(args.public_key)}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
 
 
 def cmd_create_session(args: argparse.Namespace) -> int:

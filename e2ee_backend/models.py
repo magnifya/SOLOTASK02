@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 
 def utc_now_iso() -> str:
@@ -36,8 +36,15 @@ class Device:
     device_id: str
     identity_key: str
     registered_at: str = field(default_factory=utc_now_iso)
+    #: Timestamp of the last identity-key rotation. A device starts unrotated,
+    #: so this equals ``registered_at`` until the key is actually replaced.
+    rotated_at: Optional[str] = None
     prekeys: List[SignedPreKey] = field(default_factory=list)
     revoked: bool = False
+
+    def __post_init__(self) -> None:
+        if self.rotated_at is None:
+            self.rotated_at = self.registered_at
 
 
 @dataclass
