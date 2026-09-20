@@ -43,10 +43,17 @@ from .storage import (
     SESSION_PREKEY_UNKNOWN,
     SESSION_RECIPIENT_REVOKED,
     SESSION_RECIPIENT_UNKNOWN,
+    SYNC_CURSOR_BACKWARD,
+    SYNC_CURSOR_OUT_OF_RANGE,
+    SYNC_DEVICE_INACTIVE,
+    SYNC_DEVICE_NOT_MEMBER,
+    SYNC_DEVICE_UNKNOWN,
+    SYNC_SESSION_UNKNOWN,
     DeviceStore,
     DeviceUpdateError,
     DeliveryError,
     GroupError,
+    GroupSyncError,
     MessageCreateError,
     MessageListError,
     SessionCreateError,
@@ -676,3 +683,86 @@ class DeviceService:
                 session_id, message_id, device_id)
         except DeliveryError as error:
             raise self._delivery_error(error, session_id, message_id)
+
+    # -- group-session sync ------------------------------------------------
+
+    #: Maps a group-sync failure reason to (HTTP status, field name).
+    _SYNC_ERROR_MAP = {
+        SYNC_SESSION_UNKNOWN: (404, "session_id"),
+        # An unknown device, a revoked device and a non-frozen member all
+        # surface as 409/field=device_id (mirroring GET /v1/messages reads):
+        # only the session id is a missing resource (404).
+        SYNC_DEVICE_UNKNOWN: (409, "device_id"),
+        SYNC_DEVICE_INACTIVE: (409, "device_id"),
+        SYNC_DEVICE_NOT_MEMBER: (409, "device_id"),
+        SYNC_CURSOR_BACKWARD: (409, "cursor"),
+        SYNC_CURSOR_OUT_OF_RANGE: (400, "cursor"),
+    }
+
+    def _group_sync_error(self, error: GroupSyncError,
+                          session_id: str,
+                          cursor: Optional[int] = None) -> ServiceError:
+        """Translate a storage :class:`GroupSyncError` into a ServiceError."""
+        status_code, field = self._SYNC_ERROR_MAP[error.reason]
+        if error.reason == SYNC_SESSION_UNKNOWN:
+            text = f"session not found: {session_id}"
+        elif error.reason == SYNC_CURSOR_BACKWARD:
+            text = f"cursor must not move backwards (got {cursor})"
+        elif error.reason == SYNC_CURSOR_OUT_OF_RANGE:
+            text = f"cursor is out of range (got {cursor})"
+        else:
+            text = ("device_id is not an active frozen member of this "
+                    "group session")
+        return ServiceError(text, field, status_code=status_code)
+
+    def sync_group_messages(self, session_id: str, device_id: str,
+                            after: Optional[int], limit: int
+                            ) -> Dict[str, Any]:
+        """Return one ascending sync page for a frozen group-session member.
+
+        ``after`` of ``None`` means "resume from the device's stored cursor"
+        and advances that cursor; an explicit non-negative ``after`` never
+        changes it. The envelope page is ordered ascending by sequence and
+        ``next_cursor`` is the last returned sequence (or the starting point
+        on an empty page).
+        """
+        try:
+            messages, next_cursor, has_more = self.store.sync_group_messages(
+                session_id, device_id, after, limit)
+        except GroupSyncError as error:
+            raise self._group_sync_error(error, session_id)
+        return {"messages": messages, "next_cursor": next_cursor,
+                "has_more": has_more}
+
+    def sync_checkpoint(self, session_id: str,
+                        payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and set one device's sync checkpoint.
+
+        ``device_id`` must be a non-empty string and ``cursor`` an integer
+        between 0 and the session's largest message sequence. A forward move
+        returns 201 (and refreshes ``updated_at``); an equal cursor returns
+        200 and changes nothing; a backward move is 409/field=cursor.
+        Unknown session is 404; an unknown, revoked or non-frozen device is
+        409/field=device_id. A failure never changes the stored cursor.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id",
+                               "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        if "cursor" not in payload:
+            raise ServiceError("missing required field: cursor", "cursor")
+        cursor = payload["cursor"]
+        if not isinstance(cursor, int) or isinstance(cursor, bool):
+            raise ServiceError("field must be an integer: cursor", "cursor")
+
+        try:
+            view, status_code = self.store.set_sync_checkpoint(
+                session_id, payload["device_id"], cursor)
+        except GroupSyncError as error:
+            raise self._group_sync_error(error, session_id, cursor)
+        return view, status_code

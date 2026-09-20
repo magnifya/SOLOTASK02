@@ -119,6 +119,20 @@ class GroupSession:
 
 
 @dataclass
+class GroupSyncCursor:
+    """Per-device sync position in a group session's message stream.
+
+    ``cursor`` is the highest message sequence the device has synced through
+    (0 before the device ever syncs). ``updated_at`` is the UTC ISO-8601
+    timestamp of the last forward checkpoint; it stays untouched when the
+    checkpoint is unchanged. Only the position and its timestamp are kept.
+    """
+
+    cursor: int = 0
+    updated_at: Optional[str] = None
+
+
+@dataclass
 class Session:
     """An immutable snapshot of a negotiated session.
 

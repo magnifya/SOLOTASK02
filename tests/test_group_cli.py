@@ -152,6 +152,90 @@ class GroupCLITest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self._json(result.stderr)["field"], "session_id")
 
+    def _group_session_with_messages(self, count=3) -> str:
+        self._run("group-create", "--group-id", "g1",
+                  "--creator-device-id", "creator",
+                  "--member-device-id", "alice")
+        created = self._run("create-group-session", "--group-id", "g1",
+                            "--initiator-device-id", "creator",
+                            "--ephemeral-key", "epk")
+        session_id = self._json(created.stdout)["session_id"]
+        for sequence in range(1, count + 1):
+            self._run("send-message", "--session-id", session_id,
+                      "--sender-device-id", "creator",
+                      "--message-id", f"m{sequence}",
+                      "--sequence", str(sequence),
+                      "--nonce", f"n{sequence}", "--ciphertext", "ct")
+        return session_id
+
+    def test_sync_group_messages_paging_and_resume(self) -> None:
+        sid = self._group_session_with_messages()
+        first = self._run("sync-group-messages", sid,
+                          "--device-id", "alice", "--limit", "2")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        body = self._json(first.stdout)
+        self.assertEqual([m["sequence"] for m in body["messages"]], [1, 2])
+        self.assertEqual(body["next_cursor"], 2)
+        self.assertTrue(body["has_more"])
+        # Omitted --after resumes from the device's stored cursor.
+        second = self._run("sync-group-messages", sid, "--device-id", "alice")
+        body = self._json(second.stdout)
+        self.assertEqual([m["sequence"] for m in body["messages"]], [3])
+        self.assertEqual(body["next_cursor"], 3)
+        self.assertFalse(body["has_more"])
+        # Explicit --after is a one-shot read and does not move the cursor.
+        explicit = self._run("sync-group-messages", sid,
+                             "--device-id", "alice", "--after", "1")
+        body = self._json(explicit.stdout)
+        self.assertEqual([m["sequence"] for m in body["messages"]], [2, 3])
+        self.assertEqual(body["next_cursor"], 3)
+        # Stored cursor is still 3, so an omitted-after read is now empty.
+        again = self._run("sync-group-messages", sid, "--device-id", "alice")
+        body = self._json(again.stdout)
+        self.assertEqual(body["messages"], [])
+        self.assertEqual(body["next_cursor"], 3)
+
+    def test_sync_group_messages_unknown_session(self) -> None:
+        result = self._run("sync-group-messages", "missing",
+                           "--device-id", "alice")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self._json(result.stderr)["field"], "session_id")
+
+    def test_sync_checkpoint_forward_same_backward(self) -> None:
+        sid = self._group_session_with_messages()
+        forward = self._run("sync-checkpoint", sid,
+                            "--device-id", "creator", "--cursor", "3")
+        self.assertEqual(forward.returncode, 0, forward.stderr)
+        body = self._json(forward.stdout)
+        self.assertEqual(body["cursor"], 3)
+        self.assertIn("updated_at", body)
+        timestamp = body["updated_at"]
+
+        same = self._run("sync-checkpoint", sid,
+                         "--device-id", "creator", "--cursor", "3")
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertEqual(self._json(same.stdout)["updated_at"], timestamp)
+
+        backward = self._run("sync-checkpoint", sid,
+                             "--device-id", "creator", "--cursor", "2")
+        self.assertEqual(backward.returncode, 1)
+        self.assertFalse(backward.stdout.strip())
+        self.assertEqual(self._json(backward.stderr)["field"], "cursor")
+
+    def test_sync_checkpoint_out_of_range_is_400(self) -> None:
+        sid = self._group_session_with_messages()
+        result = self._run("sync-checkpoint", sid,
+                           "--device-id", "creator", "--cursor", "99")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self._json(result.stderr)["field"], "cursor")
+
+    def test_sync_checkpoint_non_member_409(self) -> None:
+        sid = self._group_session_with_messages()
+        result = self._run("sync-checkpoint", sid,
+                           "--device-id", "carol", "--cursor", "0")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self._json(result.stderr)["field"], "device_id")
+
 
 if __name__ == "__main__":
     unittest.main()

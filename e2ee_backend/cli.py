@@ -190,6 +190,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_show_group_session.add_argument("session_id")
     p_show_group_session.set_defaults(handler=cmd_show_group_session)
 
+    p_sync_group = sub.add_parser(
+        "sync-group-messages",
+        help="sync a page of group-session messages from a device's cursor")
+    p_sync_group.add_argument("session_id")
+    p_sync_group.add_argument("--device-id", required=True)
+    p_sync_group.add_argument(
+        "--after", type=int, default=None,
+        help="read after this sequence; omitted to resume from the device's "
+             "stored cursor (and advance it)")
+    p_sync_group.add_argument("--limit", type=int, default=100)
+    p_sync_group.set_defaults(handler=cmd_sync_group_messages)
+
+    p_sync_checkpoint = sub.add_parser(
+        "sync-checkpoint",
+        help="set a device's group-session sync checkpoint cursor")
+    p_sync_checkpoint.add_argument("session_id")
+    p_sync_checkpoint.add_argument("--device-id", required=True)
+    p_sync_checkpoint.add_argument(
+        "--cursor", required=True, type=int,
+        help="new cursor (0..largest message sequence); forward moves 201, "
+             "unchanged 200, backwards 409")
+    p_sync_checkpoint.set_defaults(handler=cmd_sync_checkpoint)
+
     p_send_message = sub.add_parser(
         "send-message", help="send an encrypted message envelope into a session")
     p_send_message.add_argument("--session-id", required=True)
@@ -504,6 +527,43 @@ def cmd_show_group_session(args: argparse.Namespace) -> int:
     stream = sys.stdout if status == 200 else sys.stderr
     print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
     return 0 if status == 200 else 1
+
+
+def cmd_sync_group_messages(args: argparse.Namespace) -> int:
+    """Call GET /v1/group-sessions/{sid}/sync and print the single-line JSON.
+
+    ``--after`` is omitted from the query when not supplied, which tells the
+    server to resume from (and advance) the device's stored cursor.
+    """
+    from urllib.parse import quote, urlencode
+
+    params: List[Tuple[str, object]] = [
+        ("device_id", args.device_id), ("limit", args.limit)]
+    if args.after is not None:
+        params.append(("after", args.after))
+    url = (f"{args.base_url}/v1/group-sessions/"
+           f"{quote(args.session_id, safe='')}/sync?{urlencode(params)}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def cmd_sync_checkpoint(args: argparse.Namespace) -> int:
+    """Call POST /v1/group-sessions/{sid}/sync/checkpoint; 201 or 200 succeed."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/group-sessions/"
+           f"{quote(args.session_id, safe='')}/sync/checkpoint")
+    payload = {"device_id": args.device_id, "cursor": args.cursor}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
 
 
 def cmd_send_message(args: argparse.Namespace) -> int:

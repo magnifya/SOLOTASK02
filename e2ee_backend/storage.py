@@ -14,6 +14,7 @@ from .models import (
     Device,
     Group,
     GroupSession,
+    GroupSyncCursor,
     Message,
     MessageDelivery,
     Session,
@@ -69,6 +70,14 @@ GROUP_SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
 GROUP_SESSION_INITIATOR_INACTIVE = "initiator_inactive"
 GROUP_SESSION_INITIATOR_NOT_MEMBER = "initiator_not_member"
 
+#: Outcome codes for group-session message sync / checkpoints.
+SYNC_SESSION_UNKNOWN = "session_unknown"
+SYNC_DEVICE_UNKNOWN = "device_unknown"
+SYNC_DEVICE_INACTIVE = "device_inactive"
+SYNC_DEVICE_NOT_MEMBER = "device_not_member"
+SYNC_CURSOR_OUT_OF_RANGE = "cursor_out_of_range"
+SYNC_CURSOR_BACKWARD = "cursor_backward"
+
 
 class SessionCreateError(Exception):
     """An atomic session lookup/revocation check failed (nothing was written)."""
@@ -118,6 +127,20 @@ class GroupError(Exception):
         self.reason = reason
 
 
+class GroupSyncError(Exception):
+    """An atomic group-session sync/checkpoint operation failed.
+
+    A sync read never mutates state, so failures are simply reported. A
+    checkpoint that fails validation (unknown session/device, revoked or
+    non-frozen device, or a cursor moving backwards) changes neither the
+    stored cursor nor any message.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class DeviceStore:
     """In-memory store keyed by ``(user_id, device_id)``.
 
@@ -133,6 +156,9 @@ class DeviceStore:
         self._groups: Dict[str, Group] = {}
         self._group_sessions: Dict[str, GroupSession] = {}
         self._messages: Dict[str, List[Message]] = {}
+        # Per-device sync checkpoints for group sessions, keyed by
+        # (session_id, device_id) against the frozen member set.
+        self._group_sync_cursors: Dict[Tuple[str, str], GroupSyncCursor] = {}
         # Per-session set of nonces already accepted for replay protection.
         # Keyed independently of the streams so a nonce is scoped to a session.
         self._used_nonces: Dict[str, Set[str]] = {}
@@ -785,6 +811,125 @@ class DeviceStore:
             state = self._delivery.get((session_id, message_id))
             return self._delivery_view(session_id, message, state)
 
+    # -- group-session sync (per-device cursors) ---------------------------
+
+    def _group_sync_target(self, session_id: str,
+                           device_id: str) -> GroupSession:
+        """Resolve a group session and authorize a frozen, active member.
+
+        Must be called while holding the store lock. Unknown session ->
+        ``session_unknown`` (404); an unknown device -> ``device_unknown``,
+        a revoked device -> ``device_inactive`` and one not frozen into the
+        session -> ``device_not_member`` (all three 409/field ``device_id``).
+        A device removed from the group after the freeze is still a frozen
+        member and may sync; a device added afterwards is not.
+        """
+        session = self._group_sessions.get(session_id)
+        if session is None:
+            raise GroupSyncError(SYNC_SESSION_UNKNOWN)
+        device = self._find_device(device_id)
+        if device is None:
+            raise GroupSyncError(SYNC_DEVICE_UNKNOWN)
+        if device.revoked:
+            raise GroupSyncError(SYNC_DEVICE_INACTIVE)
+        if device_id not in session.members:
+            raise GroupSyncError(SYNC_DEVICE_NOT_MEMBER)
+        return session
+
+    @staticmethod
+    def _sync_checkpoint_view(session_id: str, device_id: str,
+                              record: GroupSyncCursor) -> Dict[str, Any]:
+        """Build the four-field checkpoint view of one device cursor."""
+        return {
+            "session_id": session_id,
+            "device_id": device_id,
+            "cursor": record.cursor,
+            "updated_at": record.updated_at,
+        }
+
+    def sync_group_messages(self, session_id: str, device_id: str,
+                            after: Optional[int], limit: int
+                            ) -> Tuple[List[Dict[str, Any]], int, bool]:
+        """Atomically read one ascending sync page of a group session.
+
+        Returns ``(message_views, next_cursor, has_more)``: messages with
+        ``sequence > after`` in ascending order (at most *limit*), the cursor
+        to resume from (the last returned sequence, or the starting point on
+        an empty page), and whether at least one further message follows the
+        returned page.
+
+        When *after* is ``None`` the read starts from the device's stored
+        cursor and that cursor is advanced to ``next_cursor`` while still
+        holding the store lock; an empty page leaves the cursor (and the
+        timestamp) untouched. An explicit, non-negative *after* never changes
+        the stored cursor. The session lookup, frozen-membership check, read
+        and cursor advance share one linearization point with membership
+        changes and device revocations.
+        """
+        with self._lock:
+            self._group_sync_target(session_id, device_id)
+            key = (session_id, device_id)
+            record = self._group_sync_cursors.get(key)
+            advance = after is None
+            start = record.cursor if (advance and record is not None) \
+                else (after if after is not None else 0)
+
+            stream = self._messages.get(session_id, [])
+            matched = [m for m in stream if m.sequence > start]
+            page = matched[:limit]
+            has_more = len(matched) > limit
+            next_cursor = page[-1].sequence if page else start
+
+            if advance and page:
+                if record is None:
+                    record = GroupSyncCursor()
+                    self._group_sync_cursors[key] = record
+                record.cursor = next_cursor
+                record.updated_at = utc_now_iso()
+                self._notify_change()
+            return ([self.message_view(m) for m in page], next_cursor,
+                    has_more)
+
+    def set_sync_checkpoint(self, session_id: str, device_id: str,
+                            cursor: int
+                            ) -> Tuple[Dict[str, Any], int]:
+        """Atomically move a device's sync checkpoint.
+
+        ``cursor`` must be between 0 and the session's largest message
+        sequence (``cursor_out_of_range`` -> 400/field=cursor). A forward
+        move stamps a fresh ``updated_at`` and returns 201; an equal cursor is
+        idempotent (200, timestamp untouched); a backward move fails with
+        ``cursor_backward`` (409/field=cursor) and changes nothing. The
+        implicit starting cursor is 0, so a first checkpoint of 0 is the
+        unchanged case. Session/device authorization happens first under the
+        same lock; a failed checkpoint never alters the stored cursor.
+        """
+        with self._lock:
+            self._group_sync_target(session_id, device_id)
+            stream = self._messages.get(session_id, [])
+            max_sequence = stream[-1].sequence if stream else 0
+            if cursor < 0 or cursor > max_sequence:
+                raise GroupSyncError(SYNC_CURSOR_OUT_OF_RANGE)
+
+            key = (session_id, device_id)
+            record = self._group_sync_cursors.get(key)
+            previous = record.cursor if record is not None else 0
+            if cursor < previous:
+                raise GroupSyncError(SYNC_CURSOR_BACKWARD)
+            if cursor == previous:
+                view_record = record if record is not None else GroupSyncCursor()
+                return (self._sync_checkpoint_view(
+                    session_id, device_id, view_record), 200)
+
+            if record is None:
+                record = GroupSyncCursor()
+                self._group_sync_cursors[key] = record
+            record.cursor = cursor
+            record.updated_at = utc_now_iso()
+            self._notify_change()
+            return (self._sync_checkpoint_view(session_id, device_id, record),
+                    201)
+
     # -- persistence snapshot ----------------------------------------------
 
     def snapshot_state(self) -> Dict[str, Any]:
@@ -858,10 +1003,18 @@ class DeviceStore:
                 sid: sorted(nonces)
                 for sid, nonces in self._used_nonces.items() if nonces
             }
+            group_sync_cursors = [{
+                "session_id": sid,
+                "device_id": device_id,
+                "cursor": record.cursor,
+                "updated_at": record.updated_at,
+            } for (sid, device_id), record
+                in self._group_sync_cursors.items()]
             return {"devices": devices, "sessions": sessions,
                     "groups": groups, "group_sessions": group_sessions,
                     "messages": messages, "delivery": delivery,
-                    "used_nonces": used_nonces}
+                    "used_nonces": used_nonces,
+                    "group_sync_cursors": group_sync_cursors}
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         """Replace all in-memory state from a persisted (version-stripped) doc.
@@ -879,6 +1032,7 @@ class DeviceStore:
         raw_messages = state.get("messages", {})
         raw_delivery = state.get("delivery", [])
         raw_used_nonces = state.get("used_nonces")
+        raw_group_sync_cursors = state.get("group_sync_cursors")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_groups, list)
                 and isinstance(raw_group_sessions, list)
@@ -1054,6 +1208,44 @@ class DeviceStore:
                     f"duplicate delivery record in state: {dkey}")
             delivery[dkey] = record
 
+        # Per-device group-session sync checkpoints. Older version-1 files
+        # predate the section: it simply starts empty (every device resumes at
+        # 0). A present section must be a list of objects with a non-negative
+        # integer ``cursor`` and a string/nullable ``updated_at``; anything
+        # else is a malformed document and startup is refused.
+        group_sync_cursors: Dict[Tuple[str, str], GroupSyncCursor] = {}
+        if raw_group_sync_cursors is not None:
+            if not isinstance(raw_group_sync_cursors, list):
+                raise ValueError("group_sync_cursors must be a list")
+            for index, raw in enumerate(raw_group_sync_cursors):
+                if not isinstance(raw, dict):
+                    raise ValueError(
+                        f"group_sync_cursors[{index}] must be an object")
+                try:
+                    cursor = raw["cursor"]
+                    updated_at = raw["updated_at"]
+                    if (not isinstance(cursor, int)
+                            or isinstance(cursor, bool) or cursor < 0):
+                        raise ValueError("cursor must be a non-negative integer")
+                    if updated_at is not None and not isinstance(
+                            updated_at, str):
+                        raise ValueError("updated_at must be a string or null")
+                    record = GroupSyncCursor(cursor=cursor,
+                                             updated_at=updated_at)
+                    ckey = (raw["session_id"], raw["device_id"])
+                except KeyError as error:
+                    raise ValueError(
+                        f"group_sync_cursors[{index}] missing field: "
+                        f"{error.args[0]}") from None
+                if not all(isinstance(value, str) for value in ckey):
+                    raise ValueError(
+                        f"group_sync_cursors[{index}] session_id/device_id "
+                        "must be strings")
+                if ckey in group_sync_cursors:
+                    raise ValueError(
+                        f"duplicate sync cursor in state: {ckey}")
+                group_sync_cursors[ckey] = record
+
         with self._lock:
             self._devices = devices
             self._device_index = device_index
@@ -1063,3 +1255,4 @@ class DeviceStore:
             self._messages = messages
             self._delivery = delivery
             self._used_nonces = used_nonces
+            self._group_sync_cursors = group_sync_cursors
