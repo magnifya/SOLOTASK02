@@ -25,6 +25,7 @@ MESSAGE_SESSION_UNKNOWN = "session_unknown"
 MESSAGE_SENDER_INACTIVE = "sender_inactive"
 MESSAGE_DUPLICATE_ID = "duplicate_message_id"
 MESSAGE_BAD_SEQUENCE = "bad_sequence"
+MESSAGE_DUPLICATE_NONCE = "duplicate_nonce"
 
 #: Outcome code for a failed message listing.
 MESSAGE_DEVICE_INACTIVE = "device_inactive"
@@ -96,6 +97,8 @@ class DeviceStore:
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
         self._messages: Dict[str, List[Message]] = {}
+        # Replay protection: nonces already used per session (exact strings).
+        self._used_nonces: Dict[str, set] = {}
         # Delivery state keyed by (session_id, message_id).
         self._delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         # Called (under the lock) after any state mutation, for persistence.
@@ -360,11 +363,15 @@ class DeviceStore:
                        ciphertext: str) -> Message:
         """Atomically validate and append one message to a session's stream.
 
-        The session lookup, sender revocation check, duplicate-id check and
-        sequence-continuity check all happen while holding the store lock (the
-        same lock device revocations take), so a concurrent revocation is
-        linearized either wholly before this call (then it fails) or wholly
-        after it (then the message is retained). On any failure nothing is
+        The session lookup, sender revocation check, duplicate-id check,
+        sequence-continuity check and nonce replay check all happen while
+        holding the store lock (the same lock device revocations take), so a
+        concurrent revocation is linearized either wholly before this call
+        (then it fails) or wholly after it (then the message is retained).
+        The checks run in a stable order: unknown session, inactive sender,
+        duplicate ``message_id``, broken ``sequence``, then a ``nonce``
+        already used in this session (compared as the exact string; the same
+        nonce in a different session is fine). On any failure nothing is
         written and :class:`MessageCreateError` carries the reason.
         """
         with self._lock:
@@ -383,6 +390,9 @@ class DeviceStore:
             expected = stream[-1].sequence + 1 if stream else 1
             if sequence != expected:
                 raise MessageCreateError(MESSAGE_BAD_SEQUENCE)
+            nonces = self._used_nonces.setdefault(session_id, set())
+            if nonce in nonces:
+                raise MessageCreateError(MESSAGE_DUPLICATE_NONCE)
 
             message = Message(
                 session_id=session_id,
@@ -393,6 +403,7 @@ class DeviceStore:
                 ciphertext=ciphertext,
             )
             stream.append(message)
+            nonces.add(nonce)
             self._notify_change()
             return message
 
@@ -575,8 +586,11 @@ class DeviceStore:
                 "acked": state.acked,
                 "ack_sequence": state.ack_sequence,
             } for (sid, mid), state in self._delivery.items()]
+            nonces = {sid: sorted(values)
+                      for sid, values in self._used_nonces.items()}
             return {"devices": devices, "sessions": sessions,
-                    "messages": messages, "delivery": delivery}
+                    "messages": messages, "delivery": delivery,
+                    "nonces": nonces}
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         """Replace all in-memory state from a persisted (version-stripped) doc.
@@ -591,10 +605,15 @@ class DeviceStore:
         raw_sessions = state.get("sessions", [])
         raw_messages = state.get("messages", {})
         raw_delivery = state.get("delivery", [])
+        # Older version-1 files predate this field; the set is then rebuilt
+        # from the stored messages below.
+        raw_nonces = state.get("nonces")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_messages, dict)
                 and isinstance(raw_delivery, list)):
             raise ValueError("state document has a malformed top-level section")
+        if raw_nonces is not None and not isinstance(raw_nonces, dict):
+            raise ValueError("nonces must map session_id to a list")
 
         devices: Dict[Tuple[str, str], Device] = {}
         device_index: Dict[str, Tuple[str, str]] = {}
@@ -671,6 +690,20 @@ class DeviceStore:
                         f"{error.args[0]}") from None
             messages[sid] = parsed
 
+        if raw_nonces is None:
+            # Legacy file without the field: rebuild from message history.
+            used_nonces: Dict[str, set] = {
+                sid: {m.nonce for m in stream}
+                for sid, stream in messages.items() if stream}
+        else:
+            used_nonces = {}
+            for sid, values in raw_nonces.items():
+                if not isinstance(sid, str) or not isinstance(values, list) \
+                        or not all(isinstance(value, str) for value in values):
+                    raise ValueError(
+                        "nonces must map session_id to a list of strings")
+                used_nonces[sid] = set(values)
+
         delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         for index, raw in enumerate(raw_delivery):
             if not isinstance(raw, dict):
@@ -699,4 +732,5 @@ class DeviceStore:
             self._device_index = device_index
             self._sessions = sessions
             self._messages = messages
+            self._used_nonces = used_nonces
             self._delivery = delivery

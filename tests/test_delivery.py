@@ -48,7 +48,8 @@ def _message_payload(session_id: str, message_id: str = "m1",
         "sender_device_id": sender,
         "message_id": message_id,
         "sequence": sequence,
-        "nonce": base64.b64encode(b"0123456789ab").decode(),
+        # Distinct per message_id: a session rejects a replayed nonce.
+        "nonce": base64.b64encode(f"nonce:{message_id}".encode()).decode(),
         "ciphertext": base64.b64encode(b"ciphertext-and-tag").decode(),
     }
 
@@ -515,6 +516,53 @@ class PersistenceTest(unittest.TestCase):
             _message_payload(fixture.session_id, message_id="m3", sequence=3))
         self.assertEqual(body["sequence"], 3)
 
+    def test_nonce_replay_set_survives_restart(self) -> None:
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "state.json")
+        fixture = self._service_with_state()
+        attach_persistence(fixture.service, path)
+        # the used nonce is persisted alongside the messages
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        m1_nonce = _message_payload(fixture.session_id)["nonce"]
+        self.assertIn(m1_nonce, document["nonces"][fixture.session_id])
+
+        restored = DeviceService()
+        attach_persistence(restored, path)
+        payload = _message_payload(fixture.session_id, message_id="m2",
+                                   sequence=2)
+        payload["nonce"] = m1_nonce
+        with self.assertRaises(ServiceError) as ctx:
+            restored.post_message(payload)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.field, "nonce")
+        # a fresh nonce still works after the restart
+        body = restored.post_message(
+            _message_payload(fixture.session_id, message_id="m2", sequence=2))
+        self.assertEqual(body["sequence"], 2)
+
+    def test_legacy_file_without_nonces_rebuilds_from_messages(self) -> None:
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "state.json")
+        fixture = self._service_with_state()
+        attach_persistence(fixture.service, path)
+        # simulate an old version-1 file that predates the nonce set
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        del document["nonces"]
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+
+        restored = DeviceService()
+        attach_persistence(restored, path)
+        payload = _message_payload(fixture.session_id, message_id="m2",
+                                   sequence=2)
+        payload["nonce"] = _message_payload(fixture.session_id)["nonce"]
+        with self.assertRaises(ServiceError) as ctx:
+            restored.post_message(payload)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.field, "nonce")
+
     def test_revocation_survives_restart(self) -> None:
         directory = tempfile.mkdtemp()
         path = os.path.join(directory, "state.json")
@@ -764,7 +812,7 @@ class ServePersistenceTest(unittest.TestCase):
 
         result = self._cli(port, "send-message", "--session-id", sid,
                            "--sender-device-id", "d1", "--message-id", "m2",
-                           "--sequence", "2", "--nonce", "bm9uY2UxMjM0NTY3",
+                           "--sequence", "2", "--nonce", "bm9uY2U2NTQzMjE=",
                            "--ciphertext", "Y2lw")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["sequence"], 2)

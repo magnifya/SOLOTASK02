@@ -36,7 +36,8 @@ def _message_payload(session_id: str, message_id: str = "m1",
         "sender_device_id": sender,
         "message_id": message_id,
         "sequence": sequence,
-        "nonce": base64.b64encode(b"0123456789ab").decode(),
+        # Distinct per message_id: a session rejects a replayed nonce.
+        "nonce": base64.b64encode(f"nonce:{message_id}".encode()).decode(),
         "ciphertext": base64.b64encode(b"ciphertext-and-tag").decode(),
     }
 
@@ -66,6 +67,10 @@ class ServiceMessageTest(unittest.TestCase):
     def _post(self, **overrides) -> dict:
         payload = _message_payload(self.session_id)
         payload.update(overrides)
+        if "nonce" not in overrides:
+            # Keep the nonce distinct per message_id (replay protection).
+            payload["nonce"] = base64.b64encode(
+                f"nonce:{payload['message_id']}".encode()).decode()
         return self.service.post_message(payload)
 
     def test_post_returns_full_envelope_with_created_at(self) -> None:
@@ -150,6 +155,53 @@ class ServiceMessageTest(unittest.TestCase):
             self._post(message_id="m2", sequence=5)
         body = self._post(message_id="m2", sequence=2)
         self.assertEqual(body["sequence"], 2)
+
+    def test_duplicate_nonce_is_409_and_writes_nothing(self) -> None:
+        posted = self._post(message_id="m1", sequence=1)
+        reused_nonce = posted["nonce"]
+        with self.assertRaises(ServiceError) as ctx:
+            self._post(message_id="m2", sequence=2, nonce=reused_nonce)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.field, "nonce")
+        # nothing was written: the stream still holds only m1 and the
+        # sequence cursor was not advanced
+        page = self.service.list_messages(self.session_id, "d2", 0, 100)
+        self.assertEqual([m["message_id"] for m in page["messages"]], ["m1"])
+        body = self._post(message_id="m2", sequence=2)
+        self.assertEqual(body["sequence"], 2)
+
+    def test_nonce_check_runs_after_id_and_sequence_checks(self) -> None:
+        posted = self._post(message_id="m1", sequence=1)
+        reused_nonce = posted["nonce"]
+        with self.assertRaises(ServiceError) as ctx:
+            self._post(message_id="m1", sequence=2, nonce=reused_nonce)
+        self.assertEqual(ctx.exception.field, "message_id")
+        with self.assertRaises(ServiceError) as ctx:
+            self._post(message_id="m2", sequence=5, nonce=reused_nonce)
+        self.assertEqual(ctx.exception.field, "sequence")
+
+    def test_same_nonce_is_allowed_in_another_session(self) -> None:
+        posted = self._post(message_id="m1", sequence=1)
+        other = self.service.create_session({
+            "initiator_device_id": "d2",
+            "recipient_device_id": "d1",
+            "prekey_id": "k1",
+            "ephemeral_key": _raw_key_b64(),
+        })
+        body = self._post(session_id=other["session_id"],
+                          message_id="m1", sequence=1,
+                          nonce=posted["nonce"])
+        self.assertEqual(body["session_id"], other["session_id"])
+
+    def test_nonce_is_compared_as_the_exact_string(self) -> None:
+        posted = self._post(message_id="m1", sequence=1, nonce="nonce-value")
+        self.assertEqual(posted["nonce"], "nonce-value")
+        # a different string (trailing space, different case) is not a replay
+        self._post(message_id="m2", sequence=2, nonce="nonce-value ")
+        self._post(message_id="m3", sequence=3, nonce="Nonce-value")
+        with self.assertRaises(ServiceError) as ctx:
+            self._post(message_id="m4", sequence=4, nonce="nonce-value")
+        self.assertEqual(ctx.exception.field, "nonce")
 
     def test_sequences_are_independent_per_session(self) -> None:
         other = self.service.create_session({
@@ -284,6 +336,19 @@ class HTTPMessageTest(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(body["field"], "sequence")
 
+    def test_post_duplicate_nonce_is_409_with_nonce_field(self) -> None:
+        status, body = self._post_message()
+        self.assertEqual(status, 201)
+        payload = _message_payload(self.session_id, "m2", 2)
+        payload["nonce"] = body["nonce"]
+        status, body = self._request("POST", "/v1/messages", payload)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["field"], "nonce")
+        # the failed write changed nothing: m2 with a fresh nonce succeeds
+        status, body = self._post_message(message_id="m2", sequence=2)
+        self.assertEqual(status, 201)
+        self.assertEqual(body["sequence"], 2)
+
     def test_get_messages_roundtrip_and_pagination(self) -> None:
         for index in range(1, 4):
             self.assertEqual(self._post_message(f"m{index}", index)[0], 201)
@@ -363,12 +428,13 @@ class CLIMessageTest(unittest.TestCase):
              *arguments],
             capture_output=True, text=True, timeout=15)
 
-    def _send(self, message_id: str, sequence: int) -> subprocess.CompletedProcess:
+    def _send(self, message_id: str, sequence: int,
+              nonce: str = "bm9uY2UxMjM0NTY3") -> subprocess.CompletedProcess:
         return self._run("send-message", "--session-id", self.session_id,
                          "--sender-device-id", "d1",
                          "--message-id", message_id,
                          "--sequence", str(sequence),
-                         "--nonce", "bm9uY2UxMjM0NTY3",
+                         "--nonce", nonce,
                          "--ciphertext", "Y2lwaGVydGV4dA==")
 
     def test_send_and_pull_roundtrip(self) -> None:
@@ -379,7 +445,7 @@ class CLIMessageTest(unittest.TestCase):
         self.assertEqual(sent["sequence"], 1)
         self.assertTrue(sent["created_at"].endswith("+00:00"))
 
-        self.assertEqual(self._send("m2", 2).returncode, 0)
+        self.assertEqual(self._send("m2", 2, nonce="bm9uY2U2NTQzMjE=").returncode, 0)
 
         result = self._run("pull-messages", self.session_id, "--device-id", "d2")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -403,6 +469,20 @@ class CLIMessageTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         error = json.loads(result.stderr)
         self.assertEqual(error["field"], "message_id")
+
+    def test_send_replayed_nonce_exits_nonzero_with_json_error(self) -> None:
+        self.assertEqual(self._send("m1", 1).returncode, 0)
+        # m2 reuses m1's nonce (the _send default): rejected as a replay.
+        result = self._send("m2", 2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.strip().count("\n"), 0)
+        error = json.loads(result.stderr)
+        self.assertEqual(error["field"], "nonce")
+        # nothing was written: m2 with a fresh nonce still lands at sequence 2
+        result = self._send("m2", 2, nonce="ZnJlc2gtbm9uY2U=")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["sequence"], 2)
 
     def test_pull_unknown_session_exits_nonzero(self) -> None:
         result = self._run("pull-messages", "ghost", "--device-id", "d1")
