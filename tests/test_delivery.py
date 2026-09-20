@@ -48,7 +48,8 @@ def _message_payload(session_id: str, message_id: str = "m1",
         "sender_device_id": sender,
         "message_id": message_id,
         "sequence": sequence,
-        "nonce": base64.b64encode(b"0123456789ab").decode(),
+        # Distinct per message id: a session rejects nonce replays.
+        "nonce": base64.b64encode(f"nonce-{message_id}".encode()).decode(),
         "ciphertext": base64.b64encode(b"ciphertext-and-tag").decode(),
     }
 
@@ -581,6 +582,74 @@ class PersistenceTest(unittest.TestCase):
         with self.assertRaises(StateFileError):
             attach_persistence(DeviceService(), path)
 
+    def test_used_nonce_set_survives_restart(self) -> None:
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "state.json")
+        fixture = self._service_with_state()
+        attach_persistence(fixture.service, path)
+        nonce_a = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        fixture.service.post_message(_message_payload(
+            fixture.session_id, message_id="m2", sequence=2,
+        ) | {"nonce": nonce_a})
+        # The set is part of the version-1 document.
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertEqual(document["used_nonces"][fixture.session_id],
+                         sorted({_message_payload(fixture.session_id)["nonce"],
+                                 nonce_a}))
+
+        restored = DeviceService()
+        attach_persistence(restored, path)
+        # The historical nonce is still consumed: replaying it is 409/nonce.
+        with self.assertRaises(ServiceError) as ctx:
+            restored.post_message(_message_payload(
+                fixture.session_id, message_id="m3", sequence=3,
+            ) | {"nonce": nonce_a})
+        self.assertEqual(ctx.exception.field, "nonce")
+        # A fresh nonce at the resumed cursor is accepted.
+        body = restored.post_message(_message_payload(
+            fixture.session_id, message_id="m3", sequence=3))
+        self.assertEqual(body["sequence"], 3)
+
+    def test_legacy_file_without_nonce_section_rebuilds_from_messages(self) -> None:
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "state.json")
+        fixture = self._service_with_state()
+        attach_persistence(fixture.service, path)
+        # Simulate a pre-replay-protection version-1 file: strip the section.
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        del document["used_nonces"]
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+
+        restored = DeviceService()
+        attach_persistence(restored, path)  # must not refuse to start
+        # The set was rebuilt from stored message history, so the historical
+        # nonce (the fixture m1 nonce) is already consumed.
+        historical_nonce = _message_payload(fixture.session_id)["nonce"]
+        with self.assertRaises(ServiceError) as ctx:
+            restored.post_message(_message_payload(
+                fixture.session_id, message_id="m2", sequence=2,
+            ) | {"nonce": historical_nonce})
+        self.assertEqual(ctx.exception.field, "nonce")
+
+    def test_malformed_nonce_section_is_rejected(self) -> None:
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "state.json")
+        fixture = self._service_with_state()
+        attach_persistence(fixture.service, path)
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        for bad_section in (["not", "an", "object"],
+                            {"sid": "not-a-list"},
+                            {"sid": [1, 2, 3]}):
+            document["used_nonces"] = bad_section
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(document, handle)
+            with self.assertRaises(StateFileError):
+                attach_persistence(DeviceService(), path)
+
 
 class CLIDeliveryTest(unittest.TestCase):
     """Real-subprocess tests for retry-message/ack-message/message-status."""
@@ -764,10 +833,24 @@ class ServePersistenceTest(unittest.TestCase):
 
         result = self._cli(port, "send-message", "--session-id", sid,
                            "--sender-device-id", "d1", "--message-id", "m2",
-                           "--sequence", "2", "--nonce", "bm9uY2UxMjM0NTY3",
+                           "--sequence", "2", "--nonce", "bm9uY2UtbTI=",
                            "--ciphertext", "Y2lw")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["sequence"], 2)
+
+        # The m1 nonce remains consumed across the restart: a fresh envelope
+        # replaying it is 409/nonce and does not advance the stream.
+        replay = self._cli(port, "send-message", "--session-id", sid,
+                           "--sender-device-id", "d1", "--message-id", "m3",
+                           "--sequence", "3",
+                           "--nonce", "bm9uY2UxMjM0NTY3",
+                           "--ciphertext", "Y2lw")
+        self.assertNotEqual(replay.returncode, 0)
+        self.assertEqual(json.loads(replay.stderr)["field"], "nonce")
+        result = self._cli(port, "pull-messages", sid, "--device-id", "d2")
+        body = json.loads(result.stdout)
+        self.assertEqual([m["message_id"] for m in body["messages"]],
+                         ["m1", "m2"])
 
     def test_corrupt_file_makes_serve_refuse_to_start(self) -> None:
         with open(self.data_file, "w", encoding="utf-8") as handle:

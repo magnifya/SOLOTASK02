@@ -20,6 +20,7 @@ from .storage import (
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
+    MESSAGE_DUPLICATE_NONCE,
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
     PREKEY_CONFLICT,
@@ -49,6 +50,7 @@ _MESSAGE_CREATE_ERROR_MAP = {
     MESSAGE_SENDER_INACTIVE: (409, "sender_device_id"),
     MESSAGE_DUPLICATE_ID: (409, "message_id"),
     MESSAGE_BAD_SEQUENCE: (409, "sequence"),
+    MESSAGE_DUPLICATE_NONCE: (409, "nonce"),
 }
 
 #: Maps a storage-level session failure reason to (HTTP status, field name).
@@ -323,8 +325,11 @@ class DeviceService:
         """Validate a message-send payload and atomically append the message.
 
         ``sequence`` must continue the session's stream (starting at 1, no
-        gaps or duplicates) and ``message_id`` must be unique within the
-        session; violations are 409s, as is a revoked/unknown sender device.
+        gaps or duplicates), ``message_id`` must be unique within the session,
+        and ``nonce`` must not have been accepted before in the same session;
+        each violation is a 409 naming the offending field, as is a
+        revoked/unknown sender device. The identical nonce in a different
+        session is allowed.
         """
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object",
@@ -361,9 +366,12 @@ class DeviceService:
             elif error.reason == MESSAGE_DUPLICATE_ID:
                 message_text = (f"message_id already exists in session: "
                                 f"{payload['message_id']}")
-            else:
+            elif error.reason == MESSAGE_BAD_SEQUENCE:
                 message_text = (f"sequence must continue the session stream "
                                 f"(got {sequence})")
+            else:
+                message_text = (f"nonce already used in this session: "
+                                f"{payload['nonce']}")
             raise ServiceError(message_text, field, status_code=status_code)
 
         return self.store.message_view(message)

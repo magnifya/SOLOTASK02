@@ -36,7 +36,9 @@ def _message_payload(session_id: str, message_id: str = "m1",
         "sender_device_id": sender,
         "message_id": message_id,
         "sequence": sequence,
-        "nonce": base64.b64encode(b"0123456789ab").decode(),
+        # Distinct per message id: a session rejects nonce replays, so each
+        # message of a multi-message stream carries its own deterministic nonce.
+        "nonce": base64.b64encode(f"nonce-{message_id}".encode()).decode(),
         "ciphertext": base64.b64encode(b"ciphertext-and-tag").decode(),
     }
 
@@ -64,7 +66,11 @@ class ServiceMessageTest(unittest.TestCase):
         self.session_id = self.fixture.session_id
 
     def _post(self, **overrides) -> dict:
-        payload = _message_payload(self.session_id)
+        # Build the payload from the (possibly overridden) message_id so its
+        # deterministic nonce tracks the message, then apply the rest verbatim.
+        payload = _message_payload(
+            overrides.get("session_id", self.session_id),
+            message_id=overrides.get("message_id", "m1"))
         payload.update(overrides)
         return self.service.post_message(payload)
 
@@ -162,6 +168,98 @@ class ServiceMessageTest(unittest.TestCase):
         body = self._post(session_id=other["session_id"],
                           message_id="m1", sequence=1)
         self.assertEqual(body["session_id"], other["session_id"])
+
+    def test_replayed_nonce_is_409_and_writes_nothing(self) -> None:
+        nonce_a = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        self._post(message_id="m1", sequence=1, nonce=nonce_a)
+        # Fresh id and the correct next sequence, but the session already saw
+        # this exact nonce: a replay, rejected as 409/nonce.
+        with self.assertRaises(ServiceError) as ctx:
+            self._post(message_id="m2", sequence=2, nonce=nonce_a)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.field, "nonce")
+
+        # Nothing was written and the sequence cursor did not advance: the
+        # page still holds only m1, and a legitimate m2/2 still goes through.
+        page = self.service.list_messages(self.session_id, "d2", 0, 100)
+        self.assertEqual([m["message_id"] for m in page["messages"]], ["m1"])
+        self.assertEqual(page["next_after"], 1)
+        body = self._post(message_id="m2", sequence=2,
+                          nonce=base64.b64encode(b"BBBBBBBBBBBBBBBB").decode())
+        self.assertEqual(body["sequence"], 2)
+
+    def test_identical_nonce_is_allowed_in_another_session(self) -> None:
+        nonce_a = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        other = self.service.create_session({
+            "initiator_device_id": "d2",
+            "recipient_device_id": "d1",
+            "prekey_id": "k1",
+            "ephemeral_key": _raw_key_b64(),
+        })
+        self._post(message_id="m1", sequence=1, nonce=nonce_a)
+        # Same nonce (and even the same message_id/sequence) in another
+        # session is an independent context and is accepted.
+        body = self._post(session_id=other["session_id"],
+                          message_id="m1", sequence=1, nonce=nonce_a)
+        self.assertEqual(body["session_id"], other["session_id"])
+
+    def test_nonce_is_compared_as_the_raw_string(self) -> None:
+        # Byte-for-byte string equality: spacing/case differences are distinct
+        # nonces, while the exact repeat is the replay.
+        self._post(message_id="m1", sequence=1, nonce="nonce-1")
+        self._post(message_id="m2", sequence=2, nonce="nonce-1 ")
+        self._post(message_id="m3", sequence=3, nonce="Nonce-1")
+        with self.assertRaises(ServiceError) as ctx:
+            self._post(message_id="m4", sequence=4, nonce="nonce-1")
+        self.assertEqual(ctx.exception.field, "nonce")
+
+    def test_replay_does_not_change_delivery_state(self) -> None:
+        nonce_a = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        self._post(message_id="m1", sequence=1, nonce=nonce_a)
+        with self.assertRaises(ServiceError):
+            self._post(message_id="m2", sequence=2, nonce=nonce_a)
+        # m1 has never been retried: the rejected replay records no attempt.
+        view, status = self.service.retry_message(
+            self.session_id, "m1",
+            {"device_id": "d2", "attempt_id": "a1"})
+        self.assertEqual(status, 201)
+        self.assertEqual(view["attempts"], 1)
+        self.assertEqual(view["status"], "pending")
+
+    def test_check_priority_dup_id_then_bad_sequence_then_nonce(self) -> None:
+        nonce_a = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        self._post(message_id="m1", sequence=1, nonce=nonce_a)
+        # Same id AND same nonce: duplicate message_id wins.
+        with self.assertRaises(ServiceError) as ctx:
+            self._post(message_id="m1", sequence=2, nonce=nonce_a)
+        self.assertEqual(ctx.exception.field, "message_id")
+        # Fresh id but wrong sequence AND reused nonce: sequence wins.
+        with self.assertRaises(ServiceError) as ctx:
+            self._post(message_id="m2", sequence=9, nonce=nonce_a)
+        self.assertEqual(ctx.exception.field, "sequence")
+
+    def test_concurrent_identical_envelope_is_linearized_to_one_append(self):
+        import threading
+
+        nonce_a = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        results = []
+
+        def send() -> None:
+            try:
+                self._post(message_id="m1", sequence=1, nonce=nonce_a)
+                results.append("ok")
+            except ServiceError:
+                results.append("conflict")
+
+        threads = [threading.Thread(target=send) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results.count("ok"), 1)
+        self.assertEqual(results.count("conflict"), 7)
+        page = self.service.list_messages(self.session_id, "d2", 0, 100)
+        self.assertEqual([m["message_id"] for m in page["messages"]], ["m1"])
 
     def test_list_paginates_ascending_with_next_after(self) -> None:
         for index in range(1, 6):
@@ -284,6 +382,38 @@ class HTTPMessageTest(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(body["field"], "sequence")
 
+    def test_replayed_nonce_is_409_with_field_nonce(self) -> None:
+        nonce_a = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        status, body = self._request(
+            "POST", "/v1/messages",
+            _message_payload(self.session_id, "m1", 1)
+            | {"nonce": nonce_a})
+        self.assertEqual(status, 201)
+        status, body = self._request(
+            "POST", "/v1/messages",
+            _message_payload(self.session_id, "m2", 2)
+            | {"nonce": nonce_a})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["field"], "nonce")
+        # Nothing was written: the stream still holds only m1.
+        status, body = self._request(
+            "GET", f"/v1/messages/{self.session_id}?device_id=d2")
+        self.assertEqual([m["message_id"] for m in body["messages"]], ["m1"])
+
+    def test_same_nonce_in_another_session_is_201(self) -> None:
+        nonce_a = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        _, other = self._request("POST", "/v1/sessions", {
+            "initiator_device_id": "d2",
+            "recipient_device_id": "d1",
+            "prekey_id": "k1",
+            "ephemeral_key": _raw_key_b64(),
+        })
+        for session_id in (self.session_id, other["session_id"]):
+            status, _ = self._request(
+                "POST", "/v1/messages",
+                _message_payload(session_id, "m1", 1) | {"nonce": nonce_a})
+            self.assertEqual(status, 201, session_id)
+
     def test_get_messages_roundtrip_and_pagination(self) -> None:
         for index in range(1, 4):
             self.assertEqual(self._post_message(f"m{index}", index)[0], 201)
@@ -364,11 +494,13 @@ class CLIMessageTest(unittest.TestCase):
             capture_output=True, text=True, timeout=15)
 
     def _send(self, message_id: str, sequence: int) -> subprocess.CompletedProcess:
+        # One deterministic nonce per message id; a session rejects replays.
+        nonce = base64.b64encode(f"nonce-{message_id}".encode()).decode()
         return self._run("send-message", "--session-id", self.session_id,
                          "--sender-device-id", "d1",
                          "--message-id", message_id,
                          "--sequence", str(sequence),
-                         "--nonce", "bm9uY2UxMjM0NTY3",
+                         "--nonce", nonce,
                          "--ciphertext", "Y2lwaGVydGV4dA==")
 
     def test_send_and_pull_roundtrip(self) -> None:
@@ -403,6 +535,42 @@ class CLIMessageTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         error = json.loads(result.stderr)
         self.assertEqual(error["field"], "message_id")
+
+    def test_replayed_nonce_exits_nonzero_with_field_nonce(self) -> None:
+        nonce = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        first = self._run("send-message", "--session-id", self.session_id,
+                          "--sender-device-id", "d1", "--message-id", "m1",
+                          "--sequence", "1", "--nonce", nonce,
+                          "--ciphertext", "Y2lw")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        # Fresh id and correct sequence, but the session already saw the nonce.
+        replay = self._run("send-message", "--session-id", self.session_id,
+                           "--sender-device-id", "d1", "--message-id", "m2",
+                           "--sequence", "2", "--nonce", nonce,
+                           "--ciphertext", "Y2lw")
+        self.assertNotEqual(replay.returncode, 0)
+        self.assertEqual(replay.stdout, "")
+        self.assertEqual(json.loads(replay.stderr)["field"], "nonce")
+        # The rejected replay did not land in the stream.
+        pulled = self._run("pull-messages", self.session_id,
+                           "--device-id", "d2")
+        body = json.loads(pulled.stdout)
+        self.assertEqual([m["message_id"] for m in body["messages"]], ["m1"])
+
+    def test_same_nonce_in_other_session_exits_zero(self) -> None:
+        nonce = base64.b64encode(b"AAAAAAAAAAAAAAAA").decode()
+        other = self._run("create-session",
+                          "--initiator-device-id", "d2",
+                          "--recipient-device-id", "d1",
+                          "--prekey-id", "k1",
+                          "--ephemeral-key", _raw_key_b64())
+        other_sid = json.loads(other.stdout)["session_id"]
+        for session_id in (self.session_id, other_sid):
+            result = self._run("send-message", "--session-id", session_id,
+                               "--sender-device-id", "d1",
+                               "--message-id", "m1", "--sequence", "1",
+                               "--nonce", nonce, "--ciphertext", "Y2lw")
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_pull_unknown_session_exits_nonzero(self) -> None:
         result = self._run("pull-messages", "ghost", "--device-id", "d1")
