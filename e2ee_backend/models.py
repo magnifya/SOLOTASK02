@@ -38,6 +38,13 @@ class Device:
     registered_at: str = field(default_factory=utc_now_iso)
     prekeys: List[SignedPreKey] = field(default_factory=list)
     revoked: bool = False
+    #: Timestamp of the latest identity-key rotation. Initially equal to
+    #  ``registered_at``; only changes when the key actually changes.
+    rotated_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.rotated_at:
+            self.rotated_at = self.registered_at
 
 
 @dataclass

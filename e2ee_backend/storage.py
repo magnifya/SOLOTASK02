@@ -10,7 +10,7 @@ import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .models import Device, Message, MessageDelivery, Session, SignedPreKey
+from .models import Device, Message, MessageDelivery, Session, SignedPreKey, utc_now_iso
 
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
@@ -28,6 +28,11 @@ MESSAGE_BAD_SEQUENCE = "bad_sequence"
 
 #: Outcome code for a failed message listing.
 MESSAGE_DEVICE_INACTIVE = "device_inactive"
+
+#: Outcome codes for identity-key rotation / pre-key replenishment.
+DEVICE_UNKNOWN = "device_unknown"
+DEVICE_REVOKED = "device_revoked"
+PREKEY_DUPLICATE_CONFLICT = "prekey_duplicate_conflict"
 
 #: Outcome codes for delivery (retry/ack/status) failures.
 DELIVERY_SESSION_UNKNOWN = "session_unknown"
@@ -63,6 +68,14 @@ class MessageListError(Exception):
 
 class DeliveryError(Exception):
     """An atomic delivery (retry/ack/status) check failed; nothing changed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class DeviceUpdateError(Exception):
+    """An atomic identity-key rotation/pre-key add failed; nothing changed."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -169,6 +182,80 @@ class DeviceStore:
                     self._notify_change()
                     return device, True
             return device, False
+
+    # -- identity rotation & pre-key replenishment ------------------------
+
+    def rotate_identity_key(self, device_id: str, identity_key: str
+                            ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically rotate a device's identity public key.
+
+        Resolves the (globally unique) device under the store lock — the same
+        lock revocation takes — so the operation is linearized against
+        revocation. An unknown device raises ``DEVICE_UNKNOWN`` and a revoked
+        device raises ``DEVICE_REVOKED`` (nothing is written). Posting the same
+        key is idempotent: ``rotated_at`` is left untouched and ``changed`` is
+        ``False``. A different key replaces it, stamps a fresh UTC
+        ``rotated_at`` and reports ``changed=True``.
+        """
+        with self._lock:
+            lookup = self._device_index.get(device_id)
+            device = self._devices.get(lookup) if lookup is not None else None
+            if device is None:
+                raise DeviceUpdateError(DEVICE_UNKNOWN)
+            if device.revoked:
+                raise DeviceUpdateError(DEVICE_REVOKED)
+
+            changed = identity_key != device.identity_key
+            if changed:
+                device.identity_key = identity_key
+                device.rotated_at = utc_now_iso()
+                self._notify_change()
+            return {
+                "device_id": device.device_id,
+                "identity_key": device.identity_key,
+                "rotated_at": device.rotated_at,
+            }, changed
+
+    def add_prekey(self, device_id: str, key_id: str, public_key: str
+                   ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically append one signed pre-key to a device.
+
+        A new ``key_id`` is appended to the end of the device's pre-key list
+        (so listing order is stable) and returns ``(view, True)`` for a 201.
+        An existing id with the identical ``public_key`` is idempotent: it
+        returns ``(view, False)`` for a 200 when the key is still active. An
+        existing id with a different key, or an existing-but-revoked id, is a
+        conflict (``PREKEY_DUPLICATE_CONFLICT``) and nothing changes. Unknown
+        or revoked devices fail with the corresponding reason.
+        """
+        with self._lock:
+            lookup = self._device_index.get(device_id)
+            device = self._devices.get(lookup) if lookup is not None else None
+            if device is None:
+                raise DeviceUpdateError(DEVICE_UNKNOWN)
+            if device.revoked:
+                raise DeviceUpdateError(DEVICE_REVOKED)
+
+            existing = next((pk for pk in device.prekeys
+                             if pk.key_id == key_id), None)
+            if existing is not None:
+                if existing.revoked or existing.public_key != public_key:
+                    raise DeviceUpdateError(PREKEY_DUPLICATE_CONFLICT)
+                view, created = {
+                    "device_id": device.device_id,
+                    "key_id": existing.key_id,
+                    "public_key": existing.public_key,
+                }, False
+            else:
+                prekey = SignedPreKey(key_id=key_id, public_key=public_key)
+                device.prekeys.append(prekey)
+                self._notify_change()
+                view, created = {
+                    "device_id": device.device_id,
+                    "key_id": key_id,
+                    "public_key": public_key,
+                }, True
+            return view, created
 
     def public_view(self, device_id: str) -> Optional[Dict[str, Any]]:
         """Atomically build the public snapshot of a device.
@@ -458,6 +545,7 @@ class DeviceStore:
                     "identity_key": device.identity_key,
                     "registered_at": device.registered_at,
                     "revoked": device.revoked,
+                    "rotated_at": device.rotated_at,
                     "prekeys": [{"key_id": pk.key_id,
                                  "public_key": pk.public_key,
                                  "revoked": pk.revoked}
@@ -531,7 +619,8 @@ class DeviceStore:
                     user_id=raw["user_id"], device_id=raw["device_id"],
                     identity_key=raw["identity_key"],
                     registered_at=raw["registered_at"],
-                    prekeys=prekeys, revoked=bool(raw.get("revoked", False)))
+                    prekeys=prekeys, revoked=bool(raw.get("revoked", False)),
+                    rotated_at=raw.get("rotated_at", ""))
             except KeyError as error:
                 raise ValueError(
                     f"devices[{index}] missing field: {error.args[0]}") from None

@@ -15,11 +15,14 @@ from .storage import (
     DELIVERY_DEVICE_MISMATCH,
     DELIVERY_MESSAGE_UNKNOWN,
     DELIVERY_SESSION_UNKNOWN,
+    DEVICE_REVOKED,
+    DEVICE_UNKNOWN,
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
+    PREKEY_DUPLICATE_CONFLICT,
     SESSION_INITIATOR_REVOKED,
     SESSION_INITIATOR_UNKNOWN,
     SESSION_PREKEY_REVOKED,
@@ -28,6 +31,7 @@ from .storage import (
     SESSION_RECIPIENT_UNKNOWN,
     DeviceStore,
     DeliveryError,
+    DeviceUpdateError,
     MessageCreateError,
     MessageListError,
     SessionCreateError,
@@ -174,6 +178,86 @@ class DeviceService:
             raise ServiceError(f"pre-key not found: {key_id}",
                                "key_id", status_code=404)
         return {"device_id": device.device_id, "key_id": key_id, "revoked": True}
+
+    # -- identity rotation & pre-key replenishment ------------------------
+
+    #: Maps a device-update failure reason to (HTTP status, field name).
+    _DEVICE_UPDATE_ERROR_MAP = {
+        DEVICE_UNKNOWN: (404, "device_id"),
+        DEVICE_REVOKED: (409, "device_id"),
+        PREKEY_DUPLICATE_CONFLICT: (409, "key_id"),
+    }
+
+    def _device_update_error(self, error: DeviceUpdateError,
+                             device_id: str) -> ServiceError:
+        """Translate a storage :class:`DeviceUpdateError` into a ServiceError."""
+        status_code, field = self._DEVICE_UPDATE_ERROR_MAP[error.reason]
+        if error.reason == DEVICE_UNKNOWN:
+            text = f"device not found: {device_id}"
+        elif error.reason == DEVICE_REVOKED:
+            text = f"device_id is revoked: {device_id}"
+        else:
+            text = "key_id already exists with a different public key or is revoked"
+        return ServiceError(text, field, status_code=status_code)
+
+    def rotate_identity_key(self, device_id: str,
+                            payload: object) -> Dict[str, Any]:
+        """Rotate a device's identity public key (same value is idempotent).
+
+        Returns the three-field body with status 200 in both cases; only an
+        actually different key advances ``rotated_at``. Rotation never reaches
+        existing sessions, whose snapshots keep the key they froze at
+        creation; only sessions negotiated afterwards use the new key.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "identity_key" not in payload:
+            raise ServiceError("missing required field: identity_key",
+                               "identity_key")
+        if not is_nonempty_string(payload["identity_key"]):
+            raise ServiceError(
+                "field must be a non-empty string: identity_key", "identity_key")
+        if load_public_key(payload["identity_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: identity_key", "identity_key")
+
+        try:
+            view, _changed = self.store.rotate_identity_key(
+                device_id, payload["identity_key"])
+        except DeviceUpdateError as error:
+            raise self._device_update_error(error, device_id)
+        return view
+
+    def add_prekey(self, device_id: str,
+                   payload: object) -> Tuple[Dict[str, Any], int]:
+        """Append one signed pre-key, or idempotently accept an identical one.
+
+        A brand-new ``key_id`` returns ``(body, 201)`` and is appended after
+        the existing keys. Re-posting the same ``key_id`` with the very same
+        ``public_key`` (while still active) returns ``(body, 200)``. A changed
+        key for a known id, or a revoked id, is a ``409/field=key_id``
+        conflict and nothing is written.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("key_id", "public_key"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if load_public_key(payload["public_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: public_key", "public_key")
+
+        try:
+            view, created = self.store.add_prekey(
+                device_id, payload["key_id"], payload["public_key"])
+        except DeviceUpdateError as error:
+            raise self._device_update_error(error, device_id)
+        return view, 201 if created else 200
 
     # -- sessions ----------------------------------------------------------
 

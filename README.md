@@ -8,6 +8,8 @@
 
 serve 支持持久化：--data-file 指定状态文件路径，缺省时取环境变量 E2EE_DATA_FILE，二者皆无则保持进程内存储。状态文件为 version=1 的单个 JSON 文档：文件缺失时自动创建；文件损坏、非 JSON 对象或版本不符时拒绝启动（不丢弃既有状态）。每次变更先写同目录临时文件、fsync 后 os.replace 原子替换，崩溃不会留下半写文件。重启后完整恢复：设备与预密钥（含撤销标记）、会话快照、消息与序号游标，以及可靠投递的尝试去重集合、attempts、acked 状态与撤销状态。
 
+在设备生命周期内新增身份轮换与预密钥补充。POST /v1/devices/{device_id}/identity-key/rotate 的请求体含非空字符串 identity_key，且必须是合法公钥编码；字段缺失、类型错误或公钥非法返回 400/field=identity_key，设备未知或已撤销分别返回 404/409/field=device_id。成功返回 200，响应含 device_id、identity_key、rotated_at；rotated_at 初值等于 registered_at，提交与当前相同的 identity_key 时幂等且 rotated_at 不变，提交不同的合法公钥才更新身份并把 rotated_at 置为当前 UTC 时间（ISO-8601，带 +00:00）。POST /v1/devices/{device_id}/prekeys 的请求体含非空 key_id、public_key，public_key 须为合法公钥；缺失/类型错误返回 400/对应 field，公钥编码非法返回 400/field=public_key，设备未知/已撤销返回 404/409/field=device_id。全新 key_id 顺序追加到预密钥末尾并返回 201（响应 device_id、key_id、public_key）；相同 key_id 连同相同 public_key 且该密钥未撤销时幂等返回 200 同体；相同 key_id 但 public_key 不同、或该 key_id 已撤销时返回 409/field=key_id 且不写入。轮换只影响此后协商的新会话——既有会话快照在创建时冻结、永不改变；GET 设备记录始终返回最新 identity_key 与未撤销的 prekey_ids，撤销的密钥不可用。所有校验与写入在存储同一把锁下原子线性化，失败不写。命令行新增 rotate-identity-key 与 add-prekey，均带 --device-id，其余参数与请求字段一一对应，成功 stdout 单行 JSON，失败 stderr 单行 JSON 且非零退出。rotated_at 随 version=1 状态文件持久化，重启可恢复。
+
 ## 当前状态
 
 接口已实现（纯标准库 HTTP 服务 + `cryptography` 校验公钥），并带有单元/集成测试。
@@ -16,7 +18,10 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 - `GET /v1/devices/{device_id}`：返回 `identity_key`、`prekey_ids`（仅未撤销，顺序与注册时一致且重复请求完全相同）、`registered_at`；不存在返回 `404`。
 - `POST /v1/devices/{device_id}/revoke`：撤销设备及其全部预密钥。已存在设备返回 `200`，响应体 `{"device_id":...,"revoked":true}`；重复调用幂等；未知设备返回 `404`（`field=device_id`）。撤销后 `GET` 的 `prekey_ids` 为空，`identity_key` 与 `registered_at` 不变。
 - `POST /v1/devices/{device_id}/prekeys/{key_id}/revoke`：撤销单个预密钥。成功 `200`，响应体 `{"device_id":...,"key_id":...,"revoked":true}`；重复调用幂等；未知设备 `404/field=device_id`，设备存在但 `key_id` 未知 `404/field=key_id`。仅排除目标 key，其他 key 与同用户的其他设备不受影响。
-- 命令行 `register` / `show` / `revoke-device` / `revoke-prekey` / `create-session` / `show-session` 与接口一一对应，成功时在 stdout 打印单行 JSON，字段名与 HTTP 一致；失败时在 stderr 打印单行 JSON 错误并以非零码退出。连接失败或超时时，API 命令在 stderr 打印 `field` 为 `server` 的单行 JSON、非零退出，且不输出 traceback。
+- `POST /v1/devices/{device_id}/identity-key/rotate`：轮换身份公钥。请求体仅 `identity_key`（非空、合法公钥），缺失/类型/编码错误 `400/field=identity_key`，未知设备 `404`、已撤销设备 `409`（`field=device_id`）。成功 `200` 返回 `device_id`、`identity_key`、`rotated_at`；`rotated_at` 初值等于 `registered_at`，提交相同公钥幂等且时间戳不变，提交不同公钥才更新并生成当前 UTC ISO-8601（`+00:00`）时间戳。
+- `POST /v1/devices/{device_id}/prekeys`：补充签名预密钥。请求体含非空 `key_id`、`public_key`（后者须为合法公钥）；缺失/类型错误 `400`（对应 field），公钥非法 `400/field=public_key`，设备未知/已撤销 `404/409/field=device_id`。全新 id 顺序追加返回 `201`（`device_id`、`key_id`、`public_key`）；相同 id 且相同公钥、密钥未撤销时幂等 `200` 返回同体；相同 id 但公钥不同或该 id 已撤销时 `409/field=key_id` 且不写入。
+- 身份轮换只影响轮换后协商的新会话：既有会话快照在创建时冻结，`GET /v1/sessions/{id}` 始终返回冻结的 `identity_key`/`public_key`；撤销的预密钥在新会话协商中不可用。轮换、补充、撤销与查询共享存储同一把锁，原子线性化，失败不写。
+- 命令行 `register` / `show` / `revoke-device` / `revoke-prekey` / `rotate-identity-key` / `add-prekey` / `create-session` / `show-session` 与接口一一对应，成功时在 stdout 打印单行 JSON，字段名与 HTTP 一致；失败时在 stderr 打印单行 JSON 错误并以非零码退出。连接失败或超时时，API 命令在 stderr 打印 `field` 为 `server` 的单行 JSON、非零退出，且不输出 traceback。
 - `POST /v1/sessions`：协商会话。四个入参（`initiator_device_id`、`recipient_device_id`、`prekey_id`、`ephemeral_key`）须为非空字符串，`ephemeral_key` 须为合法公钥编码，否则 `400` 并以 `field` 指明；两台设备相同返回 `400/field=recipient_device_id`。未知设备/预密钥返回 `404`，已撤销返回 `409`，`field` 分别为 `initiator_device_id` / `recipient_device_id` / `prekey_id`；失败不写入。成功 `201` 返回八字段：四入参回显、`identity_key`（接收方身份公钥）、`public_key`（所用预密钥公钥）、唯一 `session_id`、`created_at`（UTC ISO-8601，`+00:00`）。重复 POST 总是新建会话。
 - `GET /v1/sessions/{session_id}`：返回与创建时一致的八字段快照；未知会话 `404/field=session_id`。快照创建后冻结，设备/预密钥撤销不改变它。
 - 会话创建与设备/预密钥撤销共享同一把锁、线性化执行：撤销先行则创建得 `409` 且不写，创建先行则得 `201` 且会话保留，不存在中间态。
@@ -29,7 +34,7 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 - `GET /v1/messages/{session_id}/status/{message_id}?device_id=…`：`device_id` 缺失/为空/重复 `400/field=device_id`；未知 `404`，越权或接收方撤销 `409/field=device_id`；`200` 返回五字段投递状态（无记录时 `pending`/`0`）。
 - 命令行 `retry-message` / `ack-message` / `message-status` 与三个接口一一对应；成功 stdout 单行 JSON（含 200/201），失败 stderr 单行 JSON 且非零退出。
 - 可靠投递的校验、去重计数与确认在存储同一把锁下原子完成，失败不改变状态。
-- 持久化：`serve --data-file PATH`（缺省取 `$E2EE_DATA_FILE`，再缺省为纯内存）。状态文件 `version=1` JSON，缺失自动创建，损坏/非对象/版本不符拒绝启动；每次变更临时文件 + fsync + `os.replace` 原子替换。重启恢复设备、预密钥撤销、会话、消息与序号游标，以及投递去重集合、`attempts`、acked 与设备撤销状态。
+- 持久化：`serve --data-file PATH`（缺省取 `$E2EE_DATA_FILE`，再缺省为纯内存）。状态文件 `version=1` JSON，缺失自动创建，损坏/非对象/版本不符拒绝启动；每次变更临时文件 + fsync + `os.replace` 原子替换。重启恢复设备（含轮换后的 identity_key 与 `rotated_at`）、预密钥（含补充与撤销）、会话、消息与序号游标，以及投递去重集合、`attempts`、acked 与设备撤销状态。
 - 命令行 `encrypt-message` / `decrypt-message` 为纯本地 AES-256-GCM 加解密（不访问服务器）：`--session-id`、`--key`（base64 编码的 32 字节密钥）、`--plaintext`（UTF-8）→ 输出 `session_id`/`nonce`（12 字节，base64）/`ciphertext`（base64，末尾附 16 字节 GCM tag）；`decrypt-message` 额外接收 `--nonce`/`--ciphertext` → 输出 `session_id`/`plaintext`。`session_id` 的 UTF-8 字节作为 AAD 参与认证。任何失败在 stderr 打印带 `field` 的单行 JSON 并以非零码退出。
 - 服务端仅保存标识与公开密钥（identity key、signed pre-key、临时公钥均为公钥），不保存私钥、共享秘密或明文消息。存储线程安全；默认进程内，`serve --data-file`/`$E2EE_DATA_FILE` 时持久化到 version=1 JSON 文件并在重启后完整恢复。
 
@@ -75,6 +80,16 @@ python3 -m e2ee_backend revoke-prekey --device-id laptop --key-id 1
 # 撤销整台设备（幂等）
 python3 -m e2ee_backend revoke-device --device-id laptop
 # => {"device_id":"laptop","revoked":true}
+
+# 轮换身份公钥（相同公钥幂等，rotated_at 不变；不同公钥才更新时间戳）
+python3 -m e2ee_backend rotate-identity-key \
+  --device-id laptop --identity-key BASE64_OR_PEM_PUBLIC_KEY
+# => {"device_id":"laptop","identity_key":"…","rotated_at":"2026-09-19T10:14:07.511290+00:00"}
+
+# 补充一个签名预密钥（新 id 顺序追加 201；相同 id+公钥幂等 200）
+python3 -m e2ee_backend add-prekey \
+  --device-id laptop --key-id 3 --public-key BASE64_OR_PEM_PUBLIC_KEY
+# => {"device_id":"laptop","key_id":"3","public_key":"…"}
 
 # 协商会话（ephemeral-key 同样支持 PEM/base64/hex 公钥与 @文件）
 python3 -m e2ee_backend create-session \
@@ -133,7 +148,7 @@ python3 -m e2ee_backend decrypt-message \
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：公钥解析、注册成功/409 冲突/各类 400（指明字段）、查询/404、`prekey_ids` 顺序稳定与撤销过滤、设备与单预密钥撤销（200、幂等、404 及对应 field、同用户设备隔离）、撤销与查询并发线性化、会话协商成功（八字段、四入参回显、接收方公钥、唯一 session_id、重复 POST 新建）、会话各类 400/404/409（对应 field、失败不写）、会话快照在撤销后不变、创建与撤销并发原子线性化（撤销先行 409/创建先行 201 两种顺序均被观察到）、消息投递（信封回显与 created_at、sequence 从 1 连续、重复 message_id/错序/发送方撤销/未知会话的 400/404/409 及对应 field、失败不推进序号、会话间序号独立）、消息拉取（分页升序、next_after 语义、参数校验、读取方撤销 409、发送方撤销后已存消息仍可读）、可靠投递（首次 retry 201/attempts+1、相同 attempt_id 200 不计数、新 attempt_id 200 计数、acked 后重试仍 200 且保持 acked、ack 首次 201/重复 200 幂等、无重试直接 ack、序号不符 409/sequence、未知会话/消息 404、设备不符/未知/撤销 409/device_id、status 缺参 400/device_id、失败不改变状态）、持久化（缺失创建 version=1、损坏/非对象/版本不符/载荷畸形拒绝启动、原子替换无残留临时文件、重启恢复尝试去重/attempts/acked、序号游标、设备与预密钥撤销）、`serve --data-file` 真实子进程重启恢复与损坏拒启、AES-256-GCM 加解密（UTF-8 回环、随机 nonce、AAD 绑定 session_id、密钥/nonce/密文长度与编码校验、篡改与错密钥认证失败）、HTTP 全链路（真实 socket）、CLI 子命令（真实子进程，含连接失败 `field=server`、非零退出、无 traceback）。
+测试覆盖：公钥解析、注册成功/409 冲突/各类 400（指明字段）、查询/404、`prekey_ids` 顺序稳定与撤销过滤、设备与单预密钥撤销（200、幂等、404 及对应 field、同用户设备隔离）、撤销与查询并发线性化、身份轮换（相同公钥 200 且 rotated_at 不变、不同公钥更新且生成 +00:00 UTC 时间戳、缺失/类型/非法公钥 400/identity_key、未知/撤销 404/409/device_id、失败不写、rotated_at 初值为 registered_at）、预密钥补充（新 id 顺序追加 201、相同 id+公钥幂等 200、相同 id 异值或已撤销 409/key_id、字段与公钥校验 400、未知/撤销设备、失败不写）、轮换只影响新会话且旧会话快照冻结、补充密钥可用而撤销密钥不可用、rotated_at 快照持久化与重启恢复（含旧版无该字段时回退 registered_at）、会话协商成功（八字段、四入参回显、接收方公钥、唯一 session_id、重复 POST 新建）、会话各类 400/404/409（对应 field、失败不写）、会话快照在撤销后不变、创建与撤销并发原子线性化（撤销先行 409/创建先行 201 两种顺序均被观察到）、消息投递（信封回显与 created_at、sequence 从 1 连续、重复 message_id/错序/发送方撤销/未知会话的 400/404/409 及对应 field、失败不推进序号、会话间序号独立）、消息拉取（分页升序、next_after 语义、参数校验、读取方撤销 409、发送方撤销后已存消息仍可读）、可靠投递（首次 retry 201/attempts+1、相同 attempt_id 200 不计数、新 attempt_id 200 计数、acked 后重试仍 200 且保持 acked、ack 首次 201/重复 200 幂等、无重试直接 ack、序号不符 409/sequence、未知会话/消息 404、设备不符/未知/撤销 409/device_id、status 缺参 400/device_id、失败不改变状态）、持久化（缺失创建 version=1、损坏/非对象/版本不符/载荷畸形拒绝启动、原子替换无残留临时文件、重启恢复尝试去重/attempts/acked、序号游标、设备与预密钥撤销）、`serve --data-file` 真实子进程重启恢复与损坏拒启、AES-256-GCM 加解密（UTF-8 回环、随机 nonce、AAD 绑定 session_id、密钥/nonce/密文长度与编码校验、篡改与错密钥认证失败）、HTTP 全链路（真实 socket）、CLI 子命令（真实子进程，含连接失败 `field=server`、非零退出、无 traceback）。
 
 ## 代码结构
 
@@ -141,10 +156,10 @@ python3 -m unittest discover -s tests -v
 e2ee_backend/
   crypto.py       # cryptography 公钥解析/校验（PEM、DER、原始曲线点）与 AES-256-GCM 本地加解密
   models.py       # Device / SignedPreKey / Session / Message / MessageDelivery 数据模型
-  storage.py      # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、消息原子追加与分页、投递去重/确认、整体状态快照与恢复）
+  storage.py      # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、身份轮换/预密钥补充、会话原子创建、消息原子追加与分页、投递去重/确认、整体状态快照与恢复）
   persistence.py  # version=1 JSON 状态文件：缺失创建、损坏/版本不符拒启、临时文件+fsync+os.replace 原子替换
-  service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/消息/投递）
-  http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、消息投递与拉取、重试/确认/状态）
-  cli.py          # register/show/revoke-*/create-session/show-session/send-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
+  service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/身份轮换/会话/消息/投递）
+  http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、身份轮换与预密钥补充、会话协商与查询、消息投递与拉取、重试/确认/状态）
+  cli.py          # register/show/revoke-*/rotate-identity-key/add-prekey/create-session/show-session/send-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
 tests/            # unittest 测试
 ```
