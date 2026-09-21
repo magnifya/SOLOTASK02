@@ -1136,66 +1136,172 @@ class DeviceStore:
         for sid, stream in raw_messages.items():
             if not isinstance(sid, str) or not isinstance(stream, list):
                 raise ValueError("messages must map session_id to a list")
+            # Every stream belongs to a saved session (1:1 or group); a key
+            # that names no session is a dangling reference.
+            if sid not in sessions and sid not in group_sessions:
+                raise ValueError(
+                    f"messages reference an unknown session: {sid}")
+            group_session = group_sessions.get(sid)
             parsed: List[Message] = []
+            seen_message_ids: Set[str] = set()
+            seen_nonces: Set[str] = set()
             for index, raw in enumerate(stream):
+                where = f"messages[{sid}][{index}]"
                 if not isinstance(raw, dict):
-                    raise ValueError(f"messages[{sid}][{index}] must be an object")
+                    raise ValueError(f"{where} must be an object")
                 try:
-                    parsed.append(Message(
-                        session_id=raw["session_id"],
-                        sender_device_id=raw["sender_device_id"],
-                        message_id=raw["message_id"],
-                        sequence=raw["sequence"], nonce=raw["nonce"],
-                        ciphertext=raw["ciphertext"],
-                        created_at=raw["created_at"]))
+                    envelope_sid = raw["session_id"]
+                    sender = raw["sender_device_id"]
+                    message_id = raw["message_id"]
+                    sequence = raw["sequence"]
+                    nonce = raw["nonce"]
+                    ciphertext = raw["ciphertext"]
+                    created_at = raw["created_at"]
                 except KeyError as error:
                     raise ValueError(
-                        f"messages[{sid}][{index}] missing field: "
-                        f"{error.args[0]}") from None
+                        f"{where} missing field: {error.args[0]}") from None
+                if not all(isinstance(value, str) and value for value in (
+                        envelope_sid, sender, message_id, nonce, ciphertext,
+                        created_at)):
+                    raise ValueError(
+                        f"{where} string fields must be non-empty strings")
+                # The envelope must agree with the stream key it is filed
+                # under; a mismatch means the document is internally
+                # inconsistent.
+                if envelope_sid != sid:
+                    raise ValueError(
+                        f"{where} session_id does not match its stream key")
+                if not isinstance(sequence, int) or isinstance(sequence, bool):
+                    raise ValueError(f"{where} sequence must be an integer")
+                # Sequences run 1..n with no gaps or reordering, exactly as
+                # append_message enforces for live traffic.
+                if sequence != index + 1:
+                    raise ValueError(
+                        f"{where} sequence must run from 1 without gaps")
+                if message_id in seen_message_ids:
+                    raise ValueError(
+                        f"{where} duplicates message_id in session: "
+                        f"{message_id}")
+                if nonce in seen_nonces:
+                    raise ValueError(
+                        f"{where} duplicates nonce in session: {nonce}")
+                # The sender must be a registered device. A revoked device's
+                # historical messages stay recoverable, so revocation is not
+                # checked here; group sessions additionally require the
+                # sender to be in the frozen member snapshot.
+                if sender not in device_index:
+                    raise ValueError(
+                        f"{where} references an unknown sender device: "
+                        f"{sender}")
+                if group_session is not None \
+                        and sender not in group_session.members:
+                    raise ValueError(
+                        f"{where} sender is not a frozen member of the "
+                        f"group session: {sender}")
+                seen_message_ids.add(message_id)
+                seen_nonces.add(nonce)
+                parsed.append(Message(
+                    session_id=envelope_sid, sender_device_id=sender,
+                    message_id=message_id, sequence=sequence, nonce=nonce,
+                    ciphertext=ciphertext, created_at=created_at))
             messages[sid] = parsed
 
         # Session-scoped replay protection. Older version-1 files predate the
         # section: rebuild it from stored message history, which lists every
-        # nonce ever accepted. A present section must map session_id to a list
-        # of plain strings; anything else is a malformed document.
+        # nonce ever accepted. A present section must map session_id to a
+        # duplicate-free list of plain strings and must equal the nonce set
+        # reconstructed from the messages section exactly — a section that
+        # omits accepted nonces would silently re-open replay, and one that
+        # adds unknown nonces is corrupt; both refuse startup.
+        rebuilt_nonces: Dict[str, Set[str]] = {
+            sid: {message.nonce for message in stream}
+            for sid, stream in messages.items() if stream
+        }
         used_nonces: Dict[str, Set[str]] = {}
-        for sid, stream in messages.items():
-            rebuilt = used_nonces.setdefault(sid, set())
-            for message in stream:
-                rebuilt.add(message.nonce)
-        if raw_used_nonces is not None:
+        if raw_used_nonces is None:
+            used_nonces = rebuilt_nonces
+        else:
             if not isinstance(raw_used_nonces, dict):
                 raise ValueError("used_nonces must be an object")
+            parsed_nonces: Dict[str, Set[str]] = {}
             for sid, nonce_list in raw_used_nonces.items():
                 if not isinstance(sid, str) or not isinstance(nonce_list, list) \
                         or not all(isinstance(value, str)
                                    for value in nonce_list):
                     raise ValueError(
                         "used_nonces must map session_id to a list of strings")
-                used_nonces.setdefault(sid, set()).update(nonce_list)
+                if len(set(nonce_list)) != len(nonce_list):
+                    raise ValueError(
+                        f"used_nonces[{sid}] contains duplicate nonces")
+                parsed_nonces[sid] = set(nonce_list)
+            if parsed_nonces != rebuilt_nonces:
+                raise ValueError(
+                    "used_nonces does not match the stored message nonces")
+            used_nonces = parsed_nonces
 
         delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         for index, raw in enumerate(raw_delivery):
+            where = f"delivery[{index}]"
             if not isinstance(raw, dict):
-                raise ValueError(f"delivery[{index}] must be an object")
+                raise ValueError(f"{where} must be an object")
             try:
+                d_session = raw["session_id"]
+                d_message = raw["message_id"]
+                attempts = raw["attempts"]
                 attempt_ids = raw["attempt_ids"]
-                if not isinstance(attempt_ids, list) or not all(
-                        isinstance(value, str) for value in attempt_ids):
-                    raise ValueError("attempt_ids must be a list of strings")
-                record = MessageDelivery(
-                    attempts=int(raw["attempts"]),
-                    attempt_ids=set(attempt_ids),
-                    acked=bool(raw["acked"]),
-                    ack_sequence=int(raw["ack_sequence"]))
-                dkey = (raw["session_id"], raw["message_id"])
+                acked = raw["acked"]
+                ack_sequence = raw["ack_sequence"]
             except KeyError as error:
                 raise ValueError(
-                    f"delivery[{index}] missing field: {error.args[0]}") from None
+                    f"{where} missing field: {error.args[0]}") from None
+            if not (isinstance(d_session, str) and d_session
+                    and isinstance(d_message, str) and d_message):
+                raise ValueError(
+                    f"{where} session_id/message_id must be non-empty strings")
+            if not isinstance(attempts, int) or isinstance(attempts, bool) \
+                    or attempts < 0:
+                raise ValueError(
+                    f"{where} attempts must be a non-negative integer")
+            if not isinstance(attempt_ids, list) or not all(
+                    isinstance(value, str) and value for value in attempt_ids):
+                raise ValueError(
+                    f"{where} attempt_ids must be a list of non-empty strings")
+            if len(set(attempt_ids)) != len(attempt_ids):
+                raise ValueError(
+                    f"{where} attempt_ids must not contain duplicates")
+            # The counter is derived state: it must agree with the id list.
+            if attempts != len(attempt_ids):
+                raise ValueError(
+                    f"{where} attempts must equal the number of attempt_ids")
+            if not isinstance(acked, bool):
+                raise ValueError(f"{where} acked must be a boolean")
+            if not isinstance(ack_sequence, int) \
+                    or isinstance(ack_sequence, bool) or ack_sequence < 0:
+                raise ValueError(
+                    f"{where} ack_sequence must be a non-negative integer")
+            dkey = (d_session, d_message)
             if dkey in delivery:
                 raise ValueError(
                     f"duplicate delivery record in state: {dkey}")
-            delivery[dkey] = record
+            # A delivery record only exists for a stored message; a record
+            # naming no message is a dangling reference.
+            target = next((m for m in messages.get(d_session, [])
+                           if m.message_id == d_message), None)
+            if target is None:
+                raise ValueError(
+                    f"{where} references an unknown message: {dkey}")
+            # The ack cursor mirrors the message once acked and is 0 before.
+            if acked:
+                if ack_sequence != target.sequence:
+                    raise ValueError(
+                        f"{where} ack_sequence must equal the message "
+                        f"sequence {target.sequence}")
+            elif ack_sequence != 0:
+                raise ValueError(
+                    f"{where} ack_sequence must be 0 while not acked")
+            delivery[dkey] = MessageDelivery(
+                attempts=attempts, attempt_ids=set(attempt_ids), acked=acked,
+                ack_sequence=ack_sequence)
 
         # Per-device group-session sync cursors. Older version-1 files predate
         # the section: it is absent and treated as empty (every device starts

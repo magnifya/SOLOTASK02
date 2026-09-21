@@ -19,6 +19,7 @@ import shutil
 import tempfile
 import threading
 import unittest
+from copy import deepcopy
 from http.client import HTTPConnection
 from typing import Any, Dict, Tuple
 
@@ -509,6 +510,211 @@ class ConcurrentRevocationLinearizationTest(unittest.TestCase):
         self.assertEqual(
             [name for name in os.listdir(self.directory)
              if name.endswith(".tmp")], [])
+
+
+class _MalformedSectionStartupBase(unittest.TestCase):
+    """Shared fixture: a persisted good document plus rejection helpers."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.mkdtemp()
+        _service, _store, self.good_path, self.sid = build_fixture(
+            self.directory, with_carol=True, with_empty_session=True)
+        with open(self.good_path, encoding="utf-8") as handle:
+            self.good_document = json.load(handle)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def _assert_rejected_without_touching_file(
+            self, document: Dict[str, Any]) -> None:
+        path = os.path.join(self.directory, "bad.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        before = open(path, "rb").read()
+        before_ino = os.stat(path).st_ino
+        with self.assertRaises(StateFileError):
+            attach_persistence(DeviceService(), path)
+        # Startup must never overwrite a file it rejected: same bytes, same
+        # inode (no atomic replace happened).
+        self.assertEqual(open(path, "rb").read(), before)
+        self.assertEqual(os.stat(path).st_ino, before_ino)
+
+    def _with_section(self, name: str, value: Any) -> Dict[str, Any]:
+        document = deepcopy(self.good_document)
+        document[name] = value
+        return document
+
+    def _with_messages(self, stream: Any) -> Dict[str, Any]:
+        document = deepcopy(self.good_document)
+        document["messages"] = {self.sid: stream}
+        return document
+
+    def _good_stream(self) -> Any:
+        return deepcopy(self.good_document["messages"][self.sid])
+
+
+class MalformedMessageSectionStartupTest(_MalformedSectionStartupBase):
+    """The messages section must be internally consistent to be loaded."""
+
+    def test_section_must_be_an_object(self) -> None:
+        for bad in ([], "nope", 3):
+            self._assert_rejected_without_touching_file(
+                self._with_section("messages", bad))
+
+    def test_stream_key_must_name_a_saved_session(self) -> None:
+        self._assert_rejected_without_touching_file(
+            self._with_section("messages", {"ghost-session": []}))
+
+    def test_envelope_session_id_must_match_stream_key(self) -> None:
+        stream = self._good_stream()
+        stream[0]["session_id"] = "some-other-session"
+        self._assert_rejected_without_touching_file(
+            self._with_messages(stream))
+
+    def test_envelope_field_types_are_checked(self) -> None:
+        for field, value in (("sequence", "1"), ("sequence", True),
+                             ("nonce", ""), ("ciphertext", 7),
+                             ("sender_device_id", ""), ("message_id", ""),
+                             ("created_at", "")):
+            stream = self._good_stream()
+            stream[1][field] = value
+            self._assert_rejected_without_touching_file(
+                self._with_messages(stream))
+
+    def test_sequence_must_run_from_one_without_gaps(self) -> None:
+        for index, value in ((0, 0), (0, 2), (2, 4), (2, 2)):
+            stream = self._good_stream()
+            stream[index]["sequence"] = value
+            self._assert_rejected_without_touching_file(
+                self._with_messages(stream))
+
+    def test_message_id_must_be_unique_within_session(self) -> None:
+        stream = self._good_stream()
+        stream[2]["message_id"] = "m1"
+        self._assert_rejected_without_touching_file(
+            self._with_messages(stream))
+
+    def test_nonce_must_be_unique_within_session(self) -> None:
+        stream = self._good_stream()
+        stream[2]["nonce"] = "n1"
+        self._assert_rejected_without_touching_file(
+            self._with_messages(stream))
+
+    def test_sender_must_be_a_registered_device(self) -> None:
+        stream = self._good_stream()
+        stream[0]["sender_device_id"] = "ghost"
+        self._assert_rejected_without_touching_file(
+            self._with_messages(stream))
+
+    def test_group_sender_must_be_a_frozen_member(self) -> None:
+        # carol is registered but not frozen into the group session.
+        stream = self._good_stream()
+        stream[0]["sender_device_id"] = "carol"
+        self._assert_rejected_without_touching_file(
+            self._with_messages(stream))
+
+    def test_revoked_sender_history_still_loads(self) -> None:
+        service = DeviceService()
+        attach_persistence(service, self.good_path)
+        service.revoke_device("creator")  # persisted: sender now revoked
+        restarted = DeviceService()
+        attach_persistence(restarted, self.good_path)
+        body = restarted.sync_group_messages(self.sid, "alice", 0, 100)
+        self.assertEqual([m["sequence"] for m in body["messages"]], [1, 2, 3])
+
+
+class NonceSetConsistencyStartupTest(_MalformedSectionStartupBase):
+    """used_nonces must equal the nonce set of the stored messages exactly."""
+
+    def test_missing_nonce_is_rejected(self) -> None:
+        document = self._with_section(
+            "used_nonces", {self.sid: ["n1", "n3"]})
+        self._assert_rejected_without_touching_file(document)
+
+    def test_extra_nonce_is_rejected(self) -> None:
+        document = self._with_section(
+            "used_nonces", {self.sid: ["n1", "n2", "n3", "n9"]})
+        self._assert_rejected_without_touching_file(document)
+
+    def test_unknown_session_key_is_rejected(self) -> None:
+        document = self._with_section(
+            "used_nonces",
+            {self.sid: ["n1", "n2", "n3"], "ghost-session": ["x"]})
+        self._assert_rejected_without_touching_file(document)
+
+    def test_duplicate_entries_are_rejected(self) -> None:
+        document = self._with_section(
+            "used_nonces", {self.sid: ["n1", "n1", "n2", "n3"]})
+        self._assert_rejected_without_touching_file(document)
+
+    def test_exact_section_loads(self) -> None:
+        service = DeviceService()
+        attach_persistence(service, self.good_path)
+        self.assertEqual(service.store._used_nonces[self.sid],
+                         {"n1", "n2", "n3"})
+
+
+class MalformedDeliverySectionStartupTest(_MalformedSectionStartupBase):
+    """Delivery records must reference stored messages and stay consistent."""
+
+    def _record(self, **overrides: Any) -> Dict[str, Any]:
+        record = {"session_id": self.sid, "message_id": "m2", "attempts": 1,
+                  "attempt_ids": ["a1"], "acked": True, "ack_sequence": 2}
+        record.update(overrides)
+        return record
+
+    def _with_delivery(self, *records: Any) -> Dict[str, Any]:
+        return self._with_section("delivery", list(records))
+
+    def test_dangling_message_reference_is_rejected(self) -> None:
+        self._assert_rejected_without_touching_file(
+            self._with_delivery(self._record(message_id="m9")))
+        self._assert_rejected_without_touching_file(
+            self._with_delivery(self._record(session_id="ghost-session")))
+
+    def test_attempts_must_equal_attempt_id_count(self) -> None:
+        self._assert_rejected_without_touching_file(
+            self._with_delivery(self._record(attempts=2)))
+
+    def test_attempt_ids_must_be_unique_strings(self) -> None:
+        self._assert_rejected_without_touching_file(self._with_delivery(
+            self._record(attempts=2, attempt_ids=["a1", "a1"])))
+        self._assert_rejected_without_touching_file(self._with_delivery(
+            self._record(attempt_ids=[1])))
+
+    def test_field_types_are_checked(self) -> None:
+        self._assert_rejected_without_touching_file(
+            self._with_delivery(self._record(attempts="1")))
+        self._assert_rejected_without_touching_file(
+            self._with_delivery(self._record(acked=1)))
+        self._assert_rejected_without_touching_file(
+            self._with_delivery(self._record(ack_sequence="2")))
+
+    def test_acked_record_must_mirror_message_sequence(self) -> None:
+        self._assert_rejected_without_touching_file(
+            self._with_delivery(self._record(ack_sequence=3)))
+
+    def test_unacked_record_must_have_zero_ack_sequence(self) -> None:
+        self._assert_rejected_without_touching_file(self._with_delivery(
+            self._record(attempts=0, attempt_ids=[], acked=False,
+                         ack_sequence=2)))
+
+    def test_duplicate_record_key_is_rejected(self) -> None:
+        self._assert_rejected_without_touching_file(
+            self._with_delivery(self._record(), self._record()))
+
+    def test_well_formed_record_loads(self) -> None:
+        document = self._with_delivery(self._record())
+        path = os.path.join(self.directory, "with-delivery.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        service = DeviceService()
+        attach_persistence(service, path)
+        state = service.store._delivery[(self.sid, "m2")]
+        self.assertTrue(state.acked)
+        self.assertEqual(state.ack_sequence, 2)
+        self.assertEqual(state.attempts, 1)
+        self.assertEqual(state.attempt_ids, {"a1"})
 
 
 if __name__ == "__main__":
