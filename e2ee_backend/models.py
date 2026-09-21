@@ -127,6 +127,41 @@ class ClaimSessionBinding:
 
 
 @dataclass
+class BatchClaimSessionEntry:
+    """One frozen recipient entry of a batch-claim session set.
+
+    Repeats the per-device material frozen by the originating batch claim
+    (recipient device, claimed pre-key and the public material), so the
+    recovery check can compare the binding against both the batch claim
+    record and the session snapshot without looking at any device's current
+    (possibly rotated) identity key.
+    """
+
+    recipient_device_id: str
+    prekey_id: str
+    identity_key: str
+    public_key: str
+    session_id: str
+
+
+@dataclass
+class BatchClaimSessionBinding:
+    """Durable binding of one batch claim to the session set it established.
+
+    A batch claim establishes at most one session per claimed device, and
+    the whole set is created together with this one record in a single
+    locked transaction (all sessions or none). ``entries`` keeps the batch
+    claim's frozen device order. Only the initiator's id, the frozen
+    recipient/pre-key material, session ids and timestamps are retained.
+    """
+
+    claim_id: str
+    initiator_device_id: str
+    entries: List[BatchClaimSessionEntry] = field(default_factory=list)
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class Message:
     """An encrypted message envelope stored inside a session.
 

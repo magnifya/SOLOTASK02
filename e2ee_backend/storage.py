@@ -12,6 +12,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .models import (
     BatchClaimDevice,
+    BatchClaimSessionBinding,
+    BatchClaimSessionEntry,
     ClaimSessionBinding,
     Device,
     Group,
@@ -55,6 +57,17 @@ BATCH_CLAIM_NO_PREKEY = "prekey_unavailable"
 #: The claim_id was already committed by a single (or batch) claim of the
 #: other kind; the shared idempotency namespace forbids the reuse.
 CLAIM_ID_CONFLICT = "claim_id_conflict"
+
+#: Outcome codes for an atomic batch-claim multi-device session creation.
+BATCH_SESSION_CLAIM_UNKNOWN = "batch_claim_unknown"
+BATCH_SESSION_CLAIM_WRONG_KIND = "batch_claim_wrong_kind"
+BATCH_SESSION_DUPLICATE = "batch_claim_already_used"
+BATCH_SESSION_INITIATOR_UNKNOWN = SESSION_INITIATOR_UNKNOWN
+BATCH_SESSION_INITIATOR_REVOKED = SESSION_INITIATOR_REVOKED
+BATCH_SESSION_INITIATOR_IN_SNAPSHOT = "initiator_in_snapshot"
+BATCH_SESSION_DEVICE_SET_MISMATCH = "device_set_mismatch"
+BATCH_SESSION_RECIPIENT_REVOKED = SESSION_RECIPIENT_REVOKED
+BATCH_SESSION_PREKEY_REVOKED = SESSION_PREKEY_REVOKED
 
 #: Outcome codes for a failed atomic message append.
 MESSAGE_SESSION_UNKNOWN = "session_unknown"
@@ -168,6 +181,19 @@ class PreKeyBatchClaimError(Exception):
         self.reason = reason
 
 
+class BatchClaimSessionError(Exception):
+    """An atomic session-set creation from a batch claim failed; nothing was written.
+
+    Carries the offending recipient's device id (or pre-key id) for the
+    reasons that name ``recipient_device_id`` / ``prekey_id``.
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail
+
+
 class GroupError(Exception):
     """An atomic group or group-session operation failed; nothing changed."""
 
@@ -205,6 +231,11 @@ class DeviceStore:
         # Sessions established via POST /v1/sessions/from-claim, keyed by the
         # claim_id they consumed. At most one binding per claim_id.
         self._claim_session_bindings: Dict[str, ClaimSessionBinding] = {}
+        # Session sets established via POST /v1/sessions/from-batch-claim,
+        # keyed by the batch claim_id they consumed. At most one binding per
+        # batch claim_id, recording every session created from the claim.
+        self._batch_claim_session_bindings: \
+            Dict[str, BatchClaimSessionBinding] = {}
         self._groups: Dict[str, Group] = {}
         self._group_sessions: Dict[str, GroupSession] = {}
         # Per-device group-session read cursors, keyed by
@@ -671,6 +702,128 @@ class DeviceStore:
                 created_at=session.created_at)
             self._notify_change()
             return session
+
+    def get_batch_claim(self, claim_id: str) -> Optional[PreKeyBatchClaim]:
+        """Return the committed batch claim with this id, or ``None``."""
+        with self._lock:
+            return self._prekey_batch_claims.get(claim_id)
+
+    def create_sessions_from_batch_claim(
+            self, claim_id: str, initiator_device_id: str,
+            ephemeral_keys: List[Tuple[str, str]]
+    ) -> BatchClaimSessionBinding:
+        """Atomically establish one session per device of a batch claim.
+
+        The whole check-and-write runs under the store lock — the same lock
+        taken by both kinds of claims, ordinary session creation and
+        device/pre-key revocations — so every status check, all session
+        inserts and the single batch binding linearize together: either
+        every session is created with the binding or nothing at all.
+
+        *ephemeral_keys* is the request's ordered list of
+        ``(device_id, ephemeral_key)`` pairs; its device set must equal the
+        batch claim's frozen snapshot exactly. Validation happens in the
+        batch claim's frozen device order. A ``claim_id`` without a batch
+        claim is a 404 (``claim_id``; one naming a single claim is reported
+        the same way at the HTTP layer); one whose batch binding already
+        exists is a 409 (``claim_id``) and creates nothing. An
+        unknown/revoked initiator is a 404/409 naming
+        ``initiator_device_id``; an initiator that is itself one of the
+        claimed devices is a 400 naming ``initiator_device_id``. A request
+        device outside the snapshot is a 400 with the offending device id on
+        :attr:`BatchClaimSessionError.detail`; a snapshot device missing
+        from the request is a 400 with an empty detail. A claimed recipient
+        device revoked after the claim is a 409 naming
+        ``recipient_device_id`` (the offending device id rides on
+        :attr:`BatchClaimSessionError.detail`), and a claimed pre-key
+        revoked afterwards is a 409 naming ``prekey_id``. Every session
+        freezes the batch claim's recipient/key/public material; only the
+        ephemeral key (looked up in *ephemeral_keys* by recipient device id)
+        comes from the request.
+        """
+        with self._lock:
+            if claim_id in self._batch_claim_session_bindings:
+                raise BatchClaimSessionError(BATCH_SESSION_DUPLICATE)
+
+            batch = self._prekey_batch_claims.get(claim_id)
+            if batch is None:
+                # A single-claim id (bound or not) is not a batch claim; the
+                # service maps both outcomes to 404/409 with field=claim_id.
+                reason = (BATCH_SESSION_CLAIM_WRONG_KIND
+                          if claim_id in self._prekey_claims
+                          else BATCH_SESSION_CLAIM_UNKNOWN)
+                raise BatchClaimSessionError(reason)
+
+            frozen_entries = batch.devices
+            initiator = self._find_device(initiator_device_id)
+            if initiator is None:
+                raise BatchClaimSessionError(BATCH_SESSION_INITIATOR_UNKNOWN)
+            # Snapshot membership is a request-shape error (400) and wins
+            # over the device's own revoked status: an initiator that is one
+            # of the claimed devices is rejected as a whole batch regardless
+            # of whether that recipient device was since revoked.
+            if any(entry.device_id == initiator_device_id
+                   for entry in frozen_entries):
+                raise BatchClaimSessionError(
+                    BATCH_SESSION_INITIATOR_IN_SNAPSHOT)
+            if initiator.revoked:
+                raise BatchClaimSessionError(BATCH_SESSION_INITIATOR_REVOKED)
+
+            # The request's device set must equal the claim snapshot: an
+            # extra request device names it in detail (the service turns it
+            # into the array-item field path), a missing one leaves detail
+            # empty (the service names the whole ephemeral_keys array).
+            requested = [device_id for device_id, _key in ephemeral_keys]
+            snapshot_ids = [entry.device_id for entry in frozen_entries]
+            extra = next((device_id for device_id in requested
+                          if device_id not in snapshot_ids), "")
+            if extra or set(requested) != set(snapshot_ids):
+                raise BatchClaimSessionError(
+                    BATCH_SESSION_DEVICE_SET_MISMATCH, extra)
+            ephemeral_by_device = dict(ephemeral_keys)
+
+            # Validate every recipient and its claimed pre-key first, in the
+            # claim's frozen order, before building or inserting anything, so
+            # one failure leaves the whole batch unwritten.
+            for entry in frozen_entries:
+                recipient = self._find_device(entry.device_id)
+                if recipient is None or recipient.revoked:
+                    raise BatchClaimSessionError(
+                        BATCH_SESSION_RECIPIENT_REVOKED, entry.device_id)
+                used_prekey = next((pk for pk in recipient.prekeys
+                                    if pk.key_id == entry.key_id), None)
+                if used_prekey is None or used_prekey.revoked:
+                    raise BatchClaimSessionError(
+                        BATCH_SESSION_PREKEY_REVOKED, entry.key_id)
+
+            sessions: List[Tuple[BatchClaimSessionEntry, Session]] = []
+            for entry in frozen_entries:
+                session = Session(
+                    session_id=uuid.uuid4().hex,
+                    initiator_device_id=initiator_device_id,
+                    recipient_device_id=entry.device_id,
+                    prekey_id=entry.key_id,
+                    ephemeral_key=ephemeral_by_device[entry.device_id],
+                    identity_key=entry.identity_key,
+                    public_key=entry.public_key)
+                sessions.append((entry, session))
+
+            binding_entries: List[BatchClaimSessionEntry] = []
+            for entry, session in sessions:
+                self._sessions[session.session_id] = session
+                binding_entries.append(BatchClaimSessionEntry(
+                    recipient_device_id=entry.device_id,
+                    prekey_id=entry.key_id,
+                    identity_key=entry.identity_key,
+                    public_key=entry.public_key,
+                    session_id=session.session_id))
+            binding = BatchClaimSessionBinding(
+                claim_id=claim_id,
+                initiator_device_id=initiator_device_id,
+                entries=binding_entries)
+            self._batch_claim_session_bindings[claim_id] = binding
+            self._notify_change()
+            return binding
 
     def session_view(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return the immutable eight-field snapshot of a session, or ``None``.
@@ -1264,6 +1417,18 @@ class DeviceStore:
                 "public_key": b.public_key,
                 "created_at": b.created_at,
             } for b in self._claim_session_bindings.values()]
+            batch_claim_session_bindings = [{
+                "claim_id": b.claim_id,
+                "initiator_device_id": b.initiator_device_id,
+                "created_at": b.created_at,
+                "entries": [{
+                    "recipient_device_id": entry.recipient_device_id,
+                    "prekey_id": entry.prekey_id,
+                    "identity_key": entry.identity_key,
+                    "public_key": entry.public_key,
+                    "session_id": entry.session_id,
+                } for entry in b.entries],
+            } for b in self._batch_claim_session_bindings.values()]
             prekey_batch_claims = [{
                 "claim_id": b.claim_id,
                 "user_id": b.user_id,
@@ -1325,6 +1490,8 @@ class DeviceStore:
                     "prekey_claims": prekey_claims,
                     "prekey_batch_claims": prekey_batch_claims,
                     "claim_session_bindings": claim_session_bindings,
+                    "batch_claim_session_bindings":
+                        batch_claim_session_bindings,
                     "groups": groups, "group_sessions": group_sessions,
                     "messages": messages, "delivery": delivery,
                     "used_nonces": used_nonces,
@@ -1344,6 +1511,8 @@ class DeviceStore:
         raw_prekey_claims = state.get("prekey_claims", [])
         raw_prekey_batch_claims = state.get("prekey_batch_claims", [])
         raw_claim_session_bindings = state.get("claim_session_bindings", [])
+        raw_batch_claim_session_bindings = state.get(
+            "batch_claim_session_bindings", [])
         raw_groups = state.get("groups", [])
         raw_group_sessions = state.get("group_sessions", [])
         raw_messages = state.get("messages", {})
@@ -1354,6 +1523,7 @@ class DeviceStore:
                 and isinstance(raw_prekey_claims, list)
                 and isinstance(raw_prekey_batch_claims, list)
                 and isinstance(raw_claim_session_bindings, list)
+                and isinstance(raw_batch_claim_session_bindings, list)
                 and isinstance(raw_groups, list)
                 and isinstance(raw_group_sessions, list)
                 and isinstance(raw_messages, dict)
@@ -1363,6 +1533,11 @@ class DeviceStore:
 
         devices: Dict[Tuple[str, str], Device] = {}
         device_index: Dict[str, Tuple[str, str]] = {}
+        # Registration order (the snapshot serializes devices in store
+        # insertion order, which is registration order). Batch claims freeze
+        # their devices in this same relative order; a file whose batch
+        # device list contradicts it is internally inconsistent.
+        registration_order: Dict[str, int] = {}
         for index, raw in enumerate(raw_devices):
             where = f"devices[{index}]"
             if not isinstance(raw, dict):
@@ -1436,6 +1611,7 @@ class DeviceStore:
                     f"duplicate device in state: {device.device_id}")
             devices[key] = device
             device_index[device.device_id] = key
+            registration_order[device.device_id] = index
 
         sessions: Dict[str, Session] = {}
         for index, raw in enumerate(raw_sessions):
@@ -1644,6 +1820,16 @@ class DeviceStore:
                 entries.append(BatchClaimDevice(
                     device_id=device_id, identity_key=identity_key,
                     key_id=key_id, public_key=public_key))
+            # The frozen device list must keep the devices' relative
+            # registration order (active-device enumeration filters, never
+            # reorders). A contradicting file is refused at startup rather
+            # than silently re-ordered.
+            positions = [registration_order[entry.device_id]
+                         for entry in entries]
+            if positions != sorted(positions):
+                raise ValueError(
+                    f"{where}.devices must keep the devices' registration "
+                    f"order")
             prekey_batch_claims[claim_id] = PreKeyBatchClaim(
                 claim_id=claim_id, user_id=user_id, devices=entries,
                 claimed_at=claimed_at)
@@ -1723,6 +1909,126 @@ class DeviceStore:
                 recipient_device_id=recipient_device_id, prekey_id=prekey_id,
                 identity_key=identity_key, public_key=public_key,
                 created_at=created_at)
+
+        # Batch-claim-to-session-set bindings written by
+        # POST /v1/sessions/from-batch-claim. Older files predate the
+        # section: it is absent and loaded as empty. A present section is
+        # fully validated — one record per batch claim_id, its entries
+        # referencing the batch claim's frozen devices in exactly that
+        # registration order, each with a distinct session that exists as a
+        # 1:1 session and is not bound by any other claim, and the frozen
+        # recipient/key/public material agreeing with both the batch claim
+        # record and the session snapshot. Frozen identity keys are never
+        # compared with the device's current (possibly rotated) key.
+        batch_claim_session_bindings: Dict[str, BatchClaimSessionBinding] = {}
+        batch_bound_sessions: Set[str] = set()
+        for index, raw in enumerate(raw_batch_claim_session_bindings):
+            where = f"batch_claim_session_bindings[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            claim_id = raw.get("claim_id")
+            initiator_device_id = raw.get("initiator_device_id")
+            created_at = raw.get("created_at")
+            for name, value in (("claim_id", claim_id),
+                                ("initiator_device_id", initiator_device_id),
+                                ("created_at", created_at)):
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"{where}.{name} must be a non-empty string")
+            batch = prekey_batch_claims.get(claim_id)
+            if batch is None:
+                raise ValueError(
+                    f"{where} references an unknown batch claim: {claim_id}")
+            if claim_id in batch_claim_session_bindings:
+                raise ValueError(
+                    f"duplicate batch claim session binding in state: "
+                    f"{claim_id}")
+            raw_entries = raw.get("entries")
+            if not isinstance(raw_entries, list) or not raw_entries:
+                raise ValueError(
+                    f"{where}.entries must be a non-empty list")
+            # The entry set must equal the batch claim snapshot, listed in
+            # the same frozen registration order.
+            if len(raw_entries) != len(batch.devices):
+                raise ValueError(
+                    f"{where} entry count does not match the batch claim "
+                    f"snapshot")
+            entries: List[BatchClaimSessionEntry] = []
+            binding_session_ids: Set[str] = set()
+            for e_index, (raw_entry, frozen) in enumerate(
+                    zip(raw_entries, batch.devices)):
+                e_where = f"{where}.entries[{e_index}]"
+                if not isinstance(raw_entry, dict):
+                    raise ValueError(f"{e_where} must be an object")
+                recipient_device_id = raw_entry.get("recipient_device_id")
+                prekey_id = raw_entry.get("prekey_id")
+                identity_key = raw_entry.get("identity_key")
+                public_key = raw_entry.get("public_key")
+                session_id = raw_entry.get("session_id")
+                for name, value in (
+                        ("recipient_device_id", recipient_device_id),
+                        ("prekey_id", prekey_id),
+                        ("identity_key", identity_key),
+                        ("public_key", public_key),
+                        ("session_id", session_id)):
+                    if not isinstance(value, str) or not value:
+                        raise ValueError(
+                            f"{e_where}.{name} must be a non-empty string")
+                if recipient_device_id != frozen.device_id:
+                    raise ValueError(
+                        f"{e_where} recipient does not match the batch claim "
+                        f"order: expected {frozen.device_id}, got "
+                        f"{recipient_device_id}")
+                # Frozen material is checked against the claim record and
+                # the session snapshot only — never against a device's
+                # post-rotation current key.
+                if (prekey_id != frozen.key_id
+                        or identity_key != frozen.identity_key
+                        or public_key != frozen.public_key):
+                    raise ValueError(
+                        f"{e_where} frozen material does not match the "
+                        f"batch claim record")
+                bound_session = sessions.get(session_id)
+                if bound_session is None:
+                    raise ValueError(
+                        f"{e_where} references an unknown session: "
+                        f"{session_id}")
+                if (session_id in binding_session_ids
+                        or session_id in batch_bound_sessions
+                        or session_id in bound_sessions):
+                    raise ValueError(
+                        f"{e_where} session is already bound to another "
+                        f"claim: {session_id}")
+                if (bound_session.recipient_device_id != recipient_device_id
+                        or bound_session.prekey_id != prekey_id
+                        or bound_session.identity_key != identity_key
+                        or bound_session.public_key != public_key):
+                    raise ValueError(
+                        f"{e_where} session does not match the frozen batch "
+                        f"claim material")
+                if bound_session.initiator_device_id != initiator_device_id:
+                    raise ValueError(
+                        f"{e_where} session initiator does not match the "
+                        f"binding initiator")
+                binding_session_ids.add(session_id)
+                entries.append(BatchClaimSessionEntry(
+                    recipient_device_id=recipient_device_id,
+                    prekey_id=prekey_id, identity_key=identity_key,
+                    public_key=public_key, session_id=session_id))
+            # Equal-length position-by-position matching enforces both the
+            # exact device set and the frozen order.
+            if initiator_device_id not in device_index:
+                raise ValueError(
+                    f"{where} references an unknown initiator device: "
+                    f"{initiator_device_id}")
+            if any(entry.recipient_device_id == initiator_device_id
+                   for entry in entries):
+                raise ValueError(
+                    f"{where} initiator is one of the claimed devices")
+            batch_bound_sessions.update(binding_session_ids)
+            batch_claim_session_bindings[claim_id] = BatchClaimSessionBinding(
+                claim_id=claim_id, initiator_device_id=initiator_device_id,
+                entries=entries, created_at=created_at)
 
         groups: Dict[str, Group] = {}
         for index, raw in enumerate(raw_groups):
@@ -2091,6 +2397,7 @@ class DeviceStore:
             self._prekey_claims = prekey_claims
             self._prekey_batch_claims = prekey_batch_claims
             self._claim_session_bindings = claim_session_bindings
+            self._batch_claim_session_bindings = batch_claim_session_bindings
             self._groups = groups
             self._group_sessions = group_sessions
             self._messages = messages

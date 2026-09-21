@@ -13,6 +13,15 @@ from .storage import (
     BATCH_CLAIM_NO_ACTIVE_DEVICE,
     BATCH_CLAIM_NO_PREKEY,
     BATCH_CLAIM_USER_UNKNOWN,
+    BATCH_SESSION_CLAIM_UNKNOWN,
+    BATCH_SESSION_CLAIM_WRONG_KIND,
+    BATCH_SESSION_DEVICE_SET_MISMATCH,
+    BATCH_SESSION_DUPLICATE,
+    BATCH_SESSION_INITIATOR_IN_SNAPSHOT,
+    BATCH_SESSION_INITIATOR_REVOKED,
+    BATCH_SESSION_INITIATOR_UNKNOWN,
+    BATCH_SESSION_PREKEY_REVOKED,
+    BATCH_SESSION_RECIPIENT_REVOKED,
     CLAIM_ID_CONFLICT,
     CLAIM_NO_PREKEY,
     CLAIM_RECIPIENT_REVOKED,
@@ -64,6 +73,7 @@ from .storage import (
     SYNC_SESSION_UNKNOWN,
     DeviceStore,
     DeviceUpdateError,
+    BatchClaimSessionError,
     ClaimSessionError,
     DeliveryError,
     GroupError,
@@ -514,6 +524,134 @@ class DeviceService:
             raise ServiceError(message, field, status_code=status_code)
 
         return self.store.session_view(session.session_id)  # type: ignore[return-value]
+
+    def create_sessions_from_batch_claim(self, payload: object
+                                          ) -> Dict[str, Any]:
+        """Validate a batch-claim session payload and atomically create all.
+
+        ``claim_id`` and ``initiator_device_id`` must be non-empty strings;
+        ``ephemeral_keys`` must be a non-empty array whose elements each
+        carry a unique non-empty ``device_id`` and a valid public key
+        ``ephemeral_key``. The request's device set must equal the frozen
+        batch-claim snapshot (a mismatch is a 400 naming the whole array, or
+        the offending item's ``device_id`` path when an extra device is
+        given). An unknown batch claim id (including one naming a single
+        claim) is a 404/field=claim_id; an already-bound batch claim is a
+        409/claim_id. The initiator is 404/409 on unknown/revoked, and an
+        initiator that is itself one of the claimed devices is a 400 naming
+        ``initiator_device_id`` with no sessions created. A recipient device
+        or claimed pre-key revoked after the claim is a 409 naming
+        ``recipient_device_id`` / ``prekey_id``. On success the body carries
+        ``claim_id`` and ``sessions``, the eight-field session views listed
+        in the claim's frozen device order.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("claim_id", "initiator_device_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        if "ephemeral_keys" not in payload:
+            raise ServiceError("missing required field: ephemeral_keys",
+                               "ephemeral_keys")
+        raw_entries = payload["ephemeral_keys"]
+        if not isinstance(raw_entries, list) or not raw_entries:
+            raise ServiceError(
+                "field must be a non-empty array: ephemeral_keys",
+                "ephemeral_keys")
+        ordered: List[Tuple[str, str]] = []
+        seen_devices: set = set()
+        for index, element in enumerate(raw_entries):
+            prefix = f"ephemeral_keys[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(f"array element must be an object: {prefix}",
+                                   prefix)
+            for subfield in ("device_id", "ephemeral_key"):
+                path = f"{prefix}.{subfield}"
+                if subfield not in element:
+                    raise ServiceError(f"missing required field: {path}", path)
+                if not is_nonempty_string(element[subfield]):
+                    raise ServiceError(
+                        f"field must be a non-empty string: {path}", path)
+            if element["device_id"] in seen_devices:
+                raise ServiceError(
+                    f"duplicate device_id in ephemeral_keys: "
+                    f"{element['device_id']}",
+                    f"{prefix}.device_id")
+            if load_public_key(element["ephemeral_key"]) is None:
+                raise ServiceError(
+                    f"field is not a valid public key: {prefix}.ephemeral_key",
+                    f"{prefix}.ephemeral_key")
+            seen_devices.add(element["device_id"])
+            ordered.append((element["device_id"], element["ephemeral_key"]))
+
+        try:
+            binding = self.store.create_sessions_from_batch_claim(
+                payload["claim_id"], payload["initiator_device_id"], ordered)
+        except BatchClaimSessionError as error:
+            raise self._batch_session_error(error, payload, raw_entries)
+
+        sessions = [self.store.session_view(entry.session_id)
+                    for entry in binding.entries]
+        return {"claim_id": binding.claim_id, "sessions": sessions}
+
+    @staticmethod
+    def _batch_session_error(error: BatchClaimSessionError,
+                              payload: Dict[str, Any],
+                              raw_entries: List[Dict[str, Any]]
+                              ) -> ServiceError:
+        """Translate a batch-session storage failure into a ServiceError."""
+        reason = error.reason
+        if reason == BATCH_SESSION_CLAIM_UNKNOWN:
+            return ServiceError(
+                f"batch claim not found: {payload['claim_id']}",
+                "claim_id", status_code=404)
+        if reason == BATCH_SESSION_CLAIM_WRONG_KIND:
+            # claim_ids share one namespace: an id consumed by a single
+            # claim is known but occupied by another claim kind -> 409.
+            return ServiceError(
+                "claim_id belongs to a single-device claim and cannot "
+                "establish batch sessions",
+                "claim_id", status_code=409)
+        if reason == BATCH_SESSION_DUPLICATE:
+            return ServiceError(
+                f"claim_id has already established batch sessions: "
+                f"{payload['claim_id']}", "claim_id", status_code=409)
+        if reason == BATCH_SESSION_INITIATOR_UNKNOWN:
+            return ServiceError(
+                f"device not found: {payload['initiator_device_id']}",
+                "initiator_device_id", status_code=404)
+        if reason == BATCH_SESSION_INITIATOR_REVOKED:
+            return ServiceError("initiator_device_id is revoked",
+                                "initiator_device_id", status_code=409)
+        if reason == BATCH_SESSION_INITIATOR_IN_SNAPSHOT:
+            return ServiceError(
+                "initiator_device_id must not be one of the claimed devices",
+                "initiator_device_id", status_code=400)
+        if reason == BATCH_SESSION_DEVICE_SET_MISMATCH:
+            if error.detail:
+                index = next((i for i, element in enumerate(raw_entries)
+                              if element.get("device_id") == error.detail), 0)
+                field = f"ephemeral_keys[{index}].device_id"
+                message = (f"device is not part of the claim snapshot: "
+                           f"{error.detail}")
+            else:
+                field = "ephemeral_keys"
+                message = ("ephemeral_keys devices must equal the claim "
+                           "snapshot devices")
+            return ServiceError(message, field, status_code=400)
+        if reason == BATCH_SESSION_RECIPIENT_REVOKED:
+            return ServiceError(
+                f"recipient_device_id is revoked: {error.detail}",
+                "recipient_device_id", status_code=409)
+        # BATCH_SESSION_PREKEY_REVOKED
+        return ServiceError(
+            f"prekey_id is revoked: {error.detail}",
+            "prekey_id", status_code=409)
 
     # -- groups ------------------------------------------------------------
 
