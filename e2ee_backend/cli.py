@@ -143,6 +143,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_claim_prekey.add_argument("--claim-id", required=True)
     p_claim_prekey.set_defaults(handler=cmd_claim_prekey)
 
+    p_claim_user_prekeys = sub.add_parser(
+        "claim-user-prekeys",
+        help="claim one pre-key from every active device of a user in one batch")
+    p_claim_user_prekeys.add_argument("--user-id", required=True)
+    p_claim_user_prekeys.add_argument("--claim-id", required=True)
+    p_claim_user_prekeys.set_defaults(handler=cmd_claim_user_prekeys)
+
     p_create_session = sub.add_parser(
         "create-session", help="negotiate a session between two devices")
     p_create_session.add_argument("--initiator-device-id", required=True)
@@ -432,6 +439,22 @@ def cmd_claim_prekey(args: argparse.Namespace) -> int:
     try:
         status, response = _request_json(
             "POST", f"{args.base_url}/v1/prekeys/claim", body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_claim_user_prekeys(args: argparse.Namespace) -> int:
+    """Call POST /v1/prekeys/claim-batch; 201 created or 200 idempotent replay.
+
+    Either success status prints the single-line batch claim JSON on stdout
+    and exits 0; any failure prints the server's single-line JSON on stderr
+    and exits non-zero.
+    """
+    payload = {"user_id": args.user_id, "claim_id": args.claim_id}
+    try:
+        status, response = _request_json(
+            "POST", f"{args.base_url}/v1/prekeys/claim-batch", body=payload)
     except ServerUnavailable:
         return _emit_server_error()
     return _emit_api_response(status, response)

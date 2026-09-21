@@ -74,6 +74,39 @@ class PreKeyClaim:
 
 
 @dataclass
+class BatchClaimDevice:
+    """One frozen device entry of a successful multi-device batch claim.
+
+    Freezes the device's (claimed-at) identity key together with the one
+    pre-key handed out for that device, so a replayed batch claim returns
+    byte-identical material even if the device later rotates or revokes.
+    """
+
+    device_id: str
+    identity_key: str
+    key_id: str
+    public_key: str
+
+
+@dataclass
+class PreKeyBatchClaim:
+    """The durable record of one successful user-wide batch pre-key claim.
+
+    A batch claim enumerates every active (un-revoked) device of a user in
+    registration order and hands out each device's first un-revoked,
+    un-consumed pre-key in one atomic transaction. The record is idempotent on
+    ``claim_id`` (a shared, globally unique namespace with single claims):
+    repeating it returns this same frozen record and never consumes a second
+    key. ``devices`` stays in the registration order captured at claim time.
+    """
+
+    claim_id: str
+    user_id: str
+    devices: List[BatchClaimDevice] = field(default_factory=list)
+    claimed_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class ClaimSessionBinding:
     """Durable binding of one pre-key claim to the session it established.
 

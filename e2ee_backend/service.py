@@ -10,6 +10,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from .crypto import is_nonempty_string, load_public_key
 from .models import Device, SignedPreKey
 from .storage import (
+    BATCH_CLAIM_NO_ACTIVE_DEVICE,
+    BATCH_CLAIM_NO_PREKEY,
+    BATCH_CLAIM_USER_UNKNOWN,
+    CLAIM_ID_CONFLICT,
     CLAIM_NO_PREKEY,
     CLAIM_RECIPIENT_REVOKED,
     CLAIM_RECIPIENT_UNKNOWN,
@@ -67,6 +71,7 @@ from .storage import (
     MessageCreateError,
     MessageListError,
     PreKeyClaimError,
+    PreKeyBatchClaimError,
     SessionCreateError,
 )
 
@@ -346,8 +351,62 @@ class DeviceService:
         if error.reason == CLAIM_RECIPIENT_REVOKED:
             return ServiceError("recipient_device_id is revoked",
                                 "recipient_device_id", status_code=409)
+        if error.reason == CLAIM_ID_CONFLICT:
+            return ServiceError(
+                "claim_id was already used by a different kind of claim",
+                "claim_id", status_code=409)
         return ServiceError("no pre-key available for this device",
                             "prekey_id", status_code=409)
+
+    # -- user-wide batch pre-key claims -----------------------------------
+
+    def claim_prekey_batch(self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate a batch-claim payload and atomically claim per device.
+
+        ``user_id`` and ``claim_id`` must be non-empty strings. Every active
+        device registered to the user (registration order) contributes its
+        first available (un-revoked, un-consumed) pre-key; all keys are
+        consumed in one locked transaction or none at all. Success returns
+        201 with ``claim_id``, ``user_id``, ``claimed_at`` and ``devices``;
+        a repeated batch ``claim_id`` returns the original frozen response
+        with 200 and consumes nothing. A user with no device is 404/field
+        ``user_id``; a user with no active device is 409/field
+        ``device_id``; an active device with no available key is
+        409/field ``prekey_id``. Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("user_id", "claim_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        try:
+            view, created = self.store.claim_prekey_batch(
+                payload["user_id"], payload["claim_id"])
+        except PreKeyBatchClaimError as error:
+            raise self._batch_claim_error(error, payload["user_id"])
+        return view, 201 if created else 200
+
+    @staticmethod
+    def _batch_claim_error(error: PreKeyBatchClaimError,
+                           user_id: str) -> ServiceError:
+        """Translate a batch-claim storage failure into a ServiceError."""
+        if error.reason == BATCH_CLAIM_USER_UNKNOWN:
+            return ServiceError(f"user not found: {user_id}",
+                                "user_id", status_code=404)
+        if error.reason == BATCH_CLAIM_NO_ACTIVE_DEVICE:
+            return ServiceError("user has no active device",
+                                "device_id", status_code=409)
+        if error.reason == CLAIM_ID_CONFLICT:
+            return ServiceError(
+                "claim_id was already used by a different kind of claim",
+                "claim_id", status_code=409)
+        return ServiceError("no pre-key available for one of the user's "
+                            "devices", "prekey_id", status_code=409)
 
     # -- sessions ----------------------------------------------------------
 
