@@ -6,9 +6,21 @@ understood makes the server refuse to start (state is never silently
 discarded). Every change is written atomically: serialize to a temporary file
 in the same directory, ``fsync`` it, then ``os.replace`` it over the target,
 so a crash never leaves a half-written state file.
+
+Persistence is transactional with respect to the in-memory store: the change
+hook fires while the store lock is held (the mutation is visible but not yet
+committed to callers). When the durable write succeeds it becomes the new
+last-known-good state. When writing the temporary file, ``fsync`` or the
+atomic replace fails (an :class:`OSError`), the previous last-known-good state
+is restored into memory under the same lock, the old state file is left
+untouched, any temporary file is cleaned up by :meth:`JsonStateStore.save`,
+and :class:`PersistenceUnavailable` is raised so the HTTP layer answers
+503/field=data_file. The failed mutation therefore never advances either
+memory or the file.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -23,6 +35,15 @@ STATE_VERSION = 1
 
 class StateFileError(Exception):
     """The state file is missing fields, corrupt, or has an unknown version."""
+
+
+class PersistenceUnavailable(Exception):
+    """A durable write failed; the transaction was rolled back in memory.
+
+    The in-memory store was restored to the last successfully persisted state
+    under the store lock, the previous state file is intact, and the temporary
+    file was removed. The HTTP layer reports this as 503/field=data_file.
+    """
 
 
 class JsonStateStore:
@@ -67,7 +88,9 @@ class JsonStateStore:
 
         Writes a sibling temporary file, fsyncs it, then ``os.replace`` — the
         target is either the previous full document or the new full one,
-        never a truncated mix.
+        never a truncated mix. Any failure removes the temporary file and
+        leaves the target untouched; the underlying :class:`OSError`
+        propagates to the caller.
         """
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
@@ -98,12 +121,19 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
     A missing file is created immediately (with an empty version-1 document).
     A corrupt or wrong-version file raises :class:`StateFileError` before the
     server starts; the in-memory store is never touched in that case. After
-    attachment, each committed mutation rewrites the file atomically.
+    attachment, each committed mutation rewrites the file atomically inside
+    the same store-lock transaction. A write/fsync/replace failure rolls the
+    in-memory store back to the last persisted state and raises
+    :class:`PersistenceUnavailable`; neither memory nor the file advances.
     """
     state_store = JsonStateStore(path)
     document = state_store.load()
     if document is None:
-        state_store.save(service.store.snapshot_state())
+        try:
+            state_store.save(service.store.snapshot_state())
+        except OSError as error:
+            raise StateFileError(
+                f"cannot create state file {path}: {error}") from None
     else:
         try:
             service.store.restore_state(
@@ -113,9 +143,25 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
             raise StateFileError(
                 f"state file has a malformed payload: {error}") from None
 
+    # Canonical deep copy of the last durably-committed state. It is only ever
+    # replaced with a snapshot whose save() succeeded, so it stays valid input
+    # for restore_state().
+    last_good: Dict[str, Any] = copy.deepcopy(service.store.snapshot_state())
+
     def persist() -> None:
-        state_store.save(service.store.snapshot_state())
+        # Called under the store lock at the end of a mutation. Snapshot the
+        # post-mutation state and try to durably commit it; on an I/O failure
+        # roll the in-memory store back to the last good state before
+        # surfacing the error, so the failed mutation is visible nowhere.
+        pending = service.store.snapshot_state()
+        try:
+            state_store.save(pending)
+        except OSError:
+            service.store.restore_state(copy.deepcopy(last_good))
+            raise PersistenceUnavailable(
+                f"could not persist state to {state_store.path}") from None
+        last_good.clear()
+        last_good.update(copy.deepcopy(pending))
 
     service.store.on_change = persist
     return state_store
-

@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .persistence import PersistenceUnavailable
 from .service import DeviceService, ServiceError
 
 _DEVICES_PATH = "/v1/devices"
@@ -23,9 +24,22 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
 
     service: DeviceService  # injected via :func:`handler_for`
 
+    def _send_data_file_unavailable(self) -> None:
+        """Answer 503/field=data_file after a durable write was rolled back."""
+        self._send_json(503, {
+            "message": "state file is temporarily unavailable; the change "
+                       "was not applied",
+            "field": "data_file"})
+
     # -- routing ----------------------------------------------------------
 
     def do_POST(self) -> None:
+        try:
+            self._route_POST()
+        except PersistenceUnavailable:
+            self._send_data_file_unavailable()
+
+    def _route_POST(self) -> None:
         path = urlsplit(self.path).path
         if path == _DEVICES_PATH:
             self._handle_register()
@@ -131,6 +145,12 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                   "field": "device_id"})
 
     def do_GET(self) -> None:
+        try:
+            self._route_GET()
+        except PersistenceUnavailable:
+            self._send_data_file_unavailable()
+
+    def _route_GET(self) -> None:
         path = urlsplit(self.path).path
         if path.startswith(_GROUPS_PATH + "/"):
             suffix = path[len(_GROUPS_PATH) + 1:]

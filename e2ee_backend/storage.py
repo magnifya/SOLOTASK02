@@ -1225,13 +1225,40 @@ class DeviceStore:
                 raise ValueError(
                     f"group_sync_cursors[{index}] cursor must be a "
                     "non-negative integer")
-            if not isinstance(updated_at, str):
+            if not isinstance(updated_at, str) or not updated_at:
                 raise ValueError(
-                    f"group_sync_cursors[{index}] updated_at must be a string")
+                    f"group_sync_cursors[{index}] updated_at must be a "
+                    "non-empty string")
             ckey = (sid, did)
             if ckey in group_sync_cursors:
                 raise ValueError(
                     f"duplicate group sync cursor in state: {ckey}")
+            # Association checks: a cursor belongs to a stored group session
+            # and to a registered device frozen into that session's member
+            # snapshot; its value cannot have passed the session's largest
+            # stored sequence. Any mismatch is a malformed document — startup
+            # is refused rather than silently dropping or clamping the record.
+            target_session = group_sessions.get(sid)
+            if target_session is None:
+                raise ValueError(
+                    f"group_sync_cursors[{index}] references an unknown "
+                    f"group session: {sid}")
+            device_key = device_index.get(did)
+            target_device = devices.get(device_key) if device_key else None
+            if target_device is None:
+                raise ValueError(
+                    f"group_sync_cursors[{index}] references an unknown "
+                    f"device: {did}")
+            if did not in target_session.members:
+                raise ValueError(
+                    f"group_sync_cursors[{index}] device is not a frozen "
+                    f"member of the group session: {did}")
+            stream = messages.get(sid, [])
+            max_sequence = stream[-1].sequence if stream else 0
+            if cursor > max_sequence:
+                raise ValueError(
+                    f"group_sync_cursors[{index}] cursor {cursor} exceeds the "
+                    f"session's max sequence {max_sequence}")
             group_sync_cursors[ckey] = GroupSyncCursor(
                 cursor=cursor, updated_at=updated_at)
 
