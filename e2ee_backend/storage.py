@@ -78,6 +78,16 @@ SYNC_DEVICE_NOT_MEMBER = "device_not_member"
 SYNC_CURSOR_CONFLICT = "cursor_conflict"
 
 
+def _is_nonempty_str(value: Any) -> bool:
+    """Return True for a plain, non-empty ``str``.
+
+    ``bool``/numbers/``None``/containers all fail: ``isinstance(True, str)``
+    is already False, so this is the single type-and-content gate used by
+    state recovery for every identifier and string-valued field.
+    """
+    return isinstance(value, str) and value != ""
+
+
 class SessionCreateError(Exception):
     """An atomic session lookup/revocation check failed (nothing was written)."""
 
@@ -1034,25 +1044,64 @@ class DeviceStore:
         for index, raw in enumerate(raw_devices):
             if not isinstance(raw, dict):
                 raise ValueError(f"devices[{index}] must be an object")
+            where = f"devices[{index}]"
             try:
-                prekeys = []
-                for pk in raw["prekeys"]:
-                    if not isinstance(pk, dict):
-                        raise ValueError("prekey must be an object")
-                    prekeys.append(SignedPreKey(
-                        key_id=pk["key_id"], public_key=pk["public_key"],
-                        revoked=bool(pk.get("revoked", False))))
-                device = Device(
-                    user_id=raw["user_id"], device_id=raw["device_id"],
-                    identity_key=raw["identity_key"],
-                    registered_at=raw["registered_at"],
-                    # Older version-1 files predate this field; then it equals
-                    # registered_at (Device.__post_init__ fills in the default).
-                    rotated_at=raw.get("rotated_at"),
-                    prekeys=prekeys, revoked=bool(raw.get("revoked", False)))
+                user_id = raw["user_id"]
+                device_id = raw["device_id"]
+                identity_key = raw["identity_key"]
+                registered_at = raw["registered_at"]
+                raw_prekeys = raw["prekeys"]
             except KeyError as error:
                 raise ValueError(
-                    f"devices[{index}] missing field: {error.args[0]}") from None
+                    f"{where} missing field: {error.args[0]}") from None
+            # Every identifier and string field must be a non-empty string;
+            # booleans/numbers/null are rejected.
+            if not all(_is_nonempty_str(value) for value in
+                       (user_id, device_id, identity_key, registered_at)):
+                raise ValueError(
+                    f"{where} string fields must be non-empty strings")
+            # Older version-1 files predate rotated_at; an absent value is
+            # filled from registered_at by Device.__post_init__. A present
+            # value must still be a non-empty string.
+            rotated_at = raw.get("rotated_at")
+            if rotated_at is not None and not _is_nonempty_str(rotated_at):
+                raise ValueError(
+                    f"{where} rotated_at must be a non-empty string")
+            revoked = raw.get("revoked", False)
+            if not isinstance(revoked, bool):
+                raise ValueError(f"{where} revoked must be a boolean")
+            if not isinstance(raw_prekeys, list):
+                raise ValueError(f"{where} prekeys must be a list")
+            prekeys = []
+            seen_key_ids: Set[str] = set()
+            for pk_index, pk in enumerate(raw_prekeys):
+                pk_where = f"{where}.prekeys[{pk_index}]"
+                if not isinstance(pk, dict):
+                    raise ValueError(f"{pk_where} must be an object")
+                key_id = pk.get("key_id")
+                public_key = pk.get("public_key")
+                if not (_is_nonempty_str(key_id)
+                        and _is_nonempty_str(public_key)):
+                    raise ValueError(
+                        f"{pk_where} key_id/public_key must be non-empty "
+                        "strings")
+                pk_revoked = pk.get("revoked", False)
+                if not isinstance(pk_revoked, bool):
+                    raise ValueError(
+                        f"{pk_where} revoked must be a boolean")
+                if key_id in seen_key_ids:
+                    raise ValueError(
+                        f"{where} has a duplicate prekey key_id: {key_id}")
+                seen_key_ids.add(key_id)
+                prekeys.append(SignedPreKey(
+                    key_id=key_id, public_key=public_key,
+                    revoked=pk_revoked))
+            device = Device(
+                user_id=user_id, device_id=device_id,
+                identity_key=identity_key,
+                registered_at=registered_at,
+                rotated_at=rotated_at,
+                prekeys=prekeys, revoked=revoked)
             key = (device.user_id, device.device_id)
             if key in devices or device.device_id in device_index:
                 raise ValueError(
@@ -1064,42 +1113,111 @@ class DeviceStore:
         for index, raw in enumerate(raw_sessions):
             if not isinstance(raw, dict):
                 raise ValueError(f"sessions[{index}] must be an object")
+            where = f"sessions[{index}]"
             try:
-                session = Session(
-                    session_id=raw["session_id"],
-                    initiator_device_id=raw["initiator_device_id"],
-                    recipient_device_id=raw["recipient_device_id"],
-                    prekey_id=raw["prekey_id"],
-                    ephemeral_key=raw["ephemeral_key"],
-                    identity_key=raw["identity_key"],
-                    public_key=raw["public_key"],
-                    created_at=raw["created_at"])
+                session_id = raw["session_id"]
+                initiator_id = raw["initiator_device_id"]
+                recipient_id = raw["recipient_device_id"]
+                prekey_id = raw["prekey_id"]
+                ephemeral_key = raw["ephemeral_key"]
+                identity_key = raw["identity_key"]
+                public_key = raw["public_key"]
+                created_at = raw["created_at"]
             except KeyError as error:
                 raise ValueError(
-                    f"sessions[{index}] missing field: {error.args[0]}") from None
-            if session.session_id in sessions:
+                    f"{where} missing field: {error.args[0]}") from None
+            # Every identifier, both snapshot public keys, the ephemeral key
+            # and the timestamp must be non-empty strings; booleans, numbers
+            # and null are rejected.
+            if not all(_is_nonempty_str(value) for value in (
+                    session_id, initiator_id, recipient_id, prekey_id,
+                    ephemeral_key, identity_key, public_key, created_at)):
                 raise ValueError(
-                    f"duplicate session in state: {session.session_id}")
+                    f"{where} fields must be non-empty strings")
+            if session_id in sessions:
+                raise ValueError(
+                    f"duplicate session in state: {session_id}")
+            # Both endpoints must name registered devices. A device revoked
+            # after the session was frozen keeps its historical sessions, so
+            # revocation is not checked here.
+            initiator = devices.get(device_index.get(initiator_id)) \
+                if initiator_id in device_index else None
+            if initiator is None:
+                raise ValueError(
+                    f"{where} initiator_device_id is not a registered "
+                    f"device: {initiator_id}")
+            recipient = devices.get(device_index.get(recipient_id)) \
+                if recipient_id in device_index else None
+            if recipient is None:
+                raise ValueError(
+                    f"{where} recipient_device_id is not a registered "
+                    f"device: {recipient_id}")
+            # The claimed pre-key must be one of the recipient's own keys
+            # (revoked keys remain stored and still count: the snapshot was
+            # taken at session creation and is immutable).
+            if not any(pk.key_id == prekey_id for pk in recipient.prekeys):
+                raise ValueError(
+                    f"{where} prekey_id {prekey_id} does not belong to "
+                    f"recipient device {recipient_id}")
+            session = Session(
+                session_id=session_id,
+                initiator_device_id=initiator_id,
+                recipient_device_id=recipient_id,
+                prekey_id=prekey_id,
+                ephemeral_key=ephemeral_key,
+                identity_key=identity_key,
+                public_key=public_key,
+                created_at=created_at)
             sessions[session.session_id] = session
 
         groups: Dict[str, Group] = {}
         for index, raw in enumerate(raw_groups):
             if not isinstance(raw, dict):
                 raise ValueError(f"groups[{index}] must be an object")
+            where = f"groups[{index}]"
             try:
+                group_id = raw["group_id"]
+                creator_id = raw["creator_device_id"]
                 members = raw["members"]
-                if not isinstance(members, list) or not all(
-                        isinstance(value, str) for value in members):
-                    raise ValueError("members must be a list of strings")
-                group = Group(
-                    group_id=raw["group_id"],
-                    creator_device_id=raw["creator_device_id"],
-                    members=list(members),
-                    revision=int(raw["revision"]),
-                    created_at=raw["created_at"])
+                revision = raw["revision"]
+                created_at = raw["created_at"]
             except KeyError as error:
                 raise ValueError(
-                    f"groups[{index}] missing field: {error.args[0]}") from None
+                    f"{where} missing field: {error.args[0]}") from None
+            if not (_is_nonempty_str(group_id)
+                    and _is_nonempty_str(creator_id)
+                    and _is_nonempty_str(created_at)):
+                raise ValueError(
+                    f"{where} group_id/creator_device_id/created_at must be "
+                    "non-empty strings")
+            if not isinstance(revision, int) or isinstance(revision, bool) \
+                    or revision < 1:
+                raise ValueError(
+                    f"{where} revision must be a positive integer")
+            if not isinstance(members, list) or not members:
+                raise ValueError(
+                    f"{where} members must be a non-empty list")
+            if not all(_is_nonempty_str(value) for value in members):
+                raise ValueError(
+                    f"{where} members must be non-empty strings")
+            if len(set(members)) != len(members):
+                raise ValueError(
+                    f"{where} members must not contain duplicates")
+            # The creator is a registered device and is frozen as the first
+            # member; a creator revoked later keeps its historical groups.
+            if creator_id not in device_index:
+                raise ValueError(
+                    f"{where} creator_device_id is not a registered device: "
+                    f"{creator_id}")
+            if members[0] != creator_id:
+                raise ValueError(
+                    f"{where} creator_device_id must be the first member")
+            group = Group(
+                group_id=group_id,
+                creator_device_id=creator_id,
+                members=list(members),
+                revision=revision,
+                created_at=created_at)
             if group.group_id in groups:
                 raise ValueError(
                     f"duplicate group in state: {group.group_id}")
@@ -1109,27 +1227,73 @@ class DeviceStore:
         for index, raw in enumerate(raw_group_sessions):
             if not isinstance(raw, dict):
                 raise ValueError(f"group_sessions[{index}] must be an object")
+            where = f"group_sessions[{index}]"
             try:
+                gs_session_id = raw["session_id"]
+                group_id = raw["group_id"]
+                initiator_id = raw["initiator_device_id"]
+                ephemeral_key = raw["ephemeral_key"]
                 members = raw["members"]
-                if not isinstance(members, list) or not all(
-                        isinstance(value, str) for value in members):
-                    raise ValueError("members must be a list of strings")
-                group_session = GroupSession(
-                    session_id=raw["session_id"],
-                    group_id=raw["group_id"],
-                    initiator_device_id=raw["initiator_device_id"],
-                    ephemeral_key=raw["ephemeral_key"],
-                    members=list(members),
-                    revision=int(raw["revision"]),
-                    created_at=raw["created_at"])
+                revision = raw["revision"]
+                created_at = raw["created_at"]
             except KeyError as error:
                 raise ValueError(
-                    f"group_sessions[{index}] missing field: "
+                    f"{where} missing field: "
                     f"{error.args[0]}") from None
-            if group_session.session_id in group_sessions:
+            if not all(_is_nonempty_str(value) for value in (
+                    gs_session_id, group_id, initiator_id, ephemeral_key,
+                    created_at)):
+                raise ValueError(
+                    f"{where} fields must be non-empty strings")
+            if not isinstance(revision, int) or isinstance(revision, bool) \
+                    or revision < 1:
+                raise ValueError(
+                    f"{where} revision must be a positive integer")
+            if not isinstance(members, list) or not members:
+                raise ValueError(
+                    f"{where} members must be a non-empty list")
+            if not all(_is_nonempty_str(value) for value in members):
+                raise ValueError(
+                    f"{where} members must be non-empty strings")
+            if len(set(members)) != len(members):
+                raise ValueError(
+                    f"{where} members must not contain duplicates")
+            if gs_session_id in group_sessions:
                 raise ValueError(
                     "duplicate group session in state: "
-                    f"{group_session.session_id}")
+                    f"{gs_session_id}")
+            # The id spaces of 1:1 and group sessions are shared (messages are
+            # keyed by session_id alone), so an id taken by a 1:1 session can
+            # never also name a group session.
+            if gs_session_id in sessions:
+                raise ValueError(
+                    "group session id collides with a 1:1 session: "
+                    f"{gs_session_id}")
+            # The session must belong to a stored group; a frozen snapshot
+            # naming no group is a dangling reference.
+            group = groups.get(group_id)
+            if group is None:
+                raise ValueError(
+                    f"{where} references an unknown group: {group_id}")
+            # The initiator must have been frozen into this member snapshot.
+            if initiator_id not in members:
+                raise ValueError(
+                    f"{where} initiator_device_id is not a frozen member: "
+                    f"{initiator_id}")
+            # The frozen revision cannot be ahead of the group's current
+            # revision: sessions only snapshot revisions the group reached.
+            if revision > group.revision:
+                raise ValueError(
+                    f"{where} revision {revision} exceeds the current group "
+                    f"revision {group.revision}")
+            group_session = GroupSession(
+                session_id=gs_session_id,
+                group_id=group_id,
+                initiator_device_id=initiator_id,
+                ephemeral_key=ephemeral_key,
+                members=list(members),
+                revision=revision,
+                created_at=created_at)
             group_sessions[group_session.session_id] = group_session
 
         messages: Dict[str, List[Message]] = {}
