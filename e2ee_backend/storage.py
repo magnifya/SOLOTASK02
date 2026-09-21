@@ -18,6 +18,8 @@ from .models import (
     GroupSyncCursor,
     Message,
     MessageDelivery,
+    PreKeyBatchClaim,
+    PreKeyBatchClaimItem,
     PreKeyClaim,
     Session,
     SignedPreKey,
@@ -45,6 +47,11 @@ CLAIM_SESSION_PREKEY_REVOKED = SESSION_PREKEY_REVOKED
 CLAIM_RECIPIENT_UNKNOWN = "recipient_unknown"
 CLAIM_RECIPIENT_REVOKED = "recipient_revoked"
 CLAIM_NO_PREKEY = "prekey_unavailable"
+
+#: Outcome codes for an atomic user-wide batch pre-key claim.
+BATCH_CLAIM_USER_UNKNOWN = "user_unknown"
+BATCH_CLAIM_NO_ACTIVE_DEVICE = "no_active_device"
+BATCH_CLAIM_NO_PREKEY = "prekey_unavailable"
 
 #: Outcome codes for a failed atomic message append.
 MESSAGE_SESSION_UNKNOWN = "session_unknown"
@@ -142,6 +149,14 @@ class PreKeyClaimError(Exception):
         self.reason = reason
 
 
+class PreKeyBatchClaimError(Exception):
+    """An atomic batch pre-key claim failed; nothing was consumed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class ClaimSessionError(Exception):
     """An atomic session-from-claim creation failed (nothing was written)."""
 
@@ -181,6 +196,10 @@ class DeviceStore:
         # Successful one-time pre-key claims keyed by the client-chosen
         # claim_id, which is globally unique and idempotency-bearing.
         self._prekey_claims: Dict[str, PreKeyClaim] = {}
+        # Successful user-wide batch claims, also keyed by claim_id. The
+        # claim_id namespace is shared with single claims, so the two maps are
+        # checked together for replays.
+        self._prekey_batch_claims: Dict[str, PreKeyBatchClaim] = {}
         # Sessions established via POST /v1/sessions/from-claim, keyed by the
         # claim_id they consumed. At most one binding per claim_id.
         self._claim_session_bindings: Dict[str, ClaimSessionBinding] = {}
@@ -434,6 +453,82 @@ class DeviceStore:
             self._prekey_claims[claim_id] = claim
             self._notify_change()
             return self.claim_view(claim), True
+
+    @staticmethod
+    def batch_claim_view(batch: PreKeyBatchClaim) -> Dict[str, Any]:
+        """Copy one batch claim into its public four-field view."""
+        return {
+            "claim_id": batch.claim_id,
+            "user_id": batch.user_id,
+            "claimed_at": batch.claimed_at,
+            "devices": [{
+                "device_id": item.device_id,
+                "identity_key": item.identity_key,
+                "key_id": item.key_id,
+                "public_key": item.public_key,
+            } for item in batch.devices],
+        }
+
+    def claim_prekeys_batch(self, user_id: str, claim_id: str
+                            ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically claim one pre-key from every active device of a user.
+
+        Enumerates the user's devices in registration order, skipping revoked
+        ones, and selects each device's first pre-key (insertion order) that
+        is neither revoked nor already consumed. The whole select-and-consume
+        runs under the store lock — the same lock single claims, session
+        creation, revocations and pre-key replenishment take — so the batch is
+        linearized against all of them as one transaction.
+
+        A previously committed batch *claim_id* is idempotent: its frozen
+        record is returned unchanged (``created`` False -> 200) and no further
+        key is consumed. A fresh *claim_id* fails without touching anything
+        when the user is unknown (:class:`PreKeyBatchClaimError`
+        ``user_unknown`` -> 404/field ``user_id``), when the user has no
+        active (un-revoked) device (``no_active_device`` -> 409/field
+        ``device_id``), or when any active device has no available pre-key
+        (``prekey_unavailable`` -> 409/field ``prekey_id``). Only when every
+        device has a key are all selected keys consumed together, the batch
+        record frozen (one shared ``claimed_at``) and persisted.
+        """
+        with self._lock:
+            existing = self._prekey_batch_claims.get(claim_id)
+            if existing is not None:
+                return self.batch_claim_view(existing), False
+
+            user_devices = [device for (_uid, _did), device
+                            in self._devices.items() if _uid == user_id]
+            if not user_devices:
+                raise PreKeyBatchClaimError(BATCH_CLAIM_USER_UNKNOWN)
+            active_devices = [device for device in user_devices
+                              if not device.revoked]
+            if not active_devices:
+                raise PreKeyBatchClaimError(BATCH_CLAIM_NO_ACTIVE_DEVICE)
+
+            selections: List[Tuple[Device, SignedPreKey]] = []
+            for device in active_devices:
+                available = next((pk for pk in device.prekeys
+                                  if not pk.revoked and not pk.consumed), None)
+                if available is None:
+                    raise PreKeyBatchClaimError(BATCH_CLAIM_NO_PREKEY)
+                selections.append((device, available))
+
+            # Every device has a key: consume them all as one transaction.
+            # No check remains that can fail, so a later exception cannot
+            # leave some keys consumed and others not.
+            items: List[PreKeyBatchClaimItem] = []
+            for device, prekey in selections:
+                prekey.consumed = True
+                items.append(PreKeyBatchClaimItem(
+                    device_id=device.device_id,
+                    identity_key=device.identity_key,
+                    key_id=prekey.key_id,
+                    public_key=prekey.public_key))
+            batch = PreKeyBatchClaim(
+                claim_id=claim_id, user_id=user_id, devices=items)
+            self._prekey_batch_claims[claim_id] = batch
+            self._notify_change()
+            return self.batch_claim_view(batch), True
 
     # -- sessions ----------------------------------------------------------
 
@@ -1143,6 +1238,17 @@ class DeviceStore:
                 "public_key": c.public_key,
                 "claimed_at": c.claimed_at,
             } for c in self._prekey_claims.values()]
+            prekey_batch_claims = [{
+                "claim_id": b.claim_id,
+                "user_id": b.user_id,
+                "claimed_at": b.claimed_at,
+                "devices": [{
+                    "device_id": item.device_id,
+                    "identity_key": item.identity_key,
+                    "key_id": item.key_id,
+                    "public_key": item.public_key,
+                } for item in b.devices],
+            } for b in self._prekey_batch_claims.values()]
             claim_session_bindings = [{
                 "claim_id": b.claim_id,
                 "session_id": b.session_id,
@@ -1200,6 +1306,7 @@ class DeviceStore:
             } for (sid, did), record in self._group_sync_cursors.items()]
             return {"devices": devices, "sessions": sessions,
                     "prekey_claims": prekey_claims,
+                    "prekey_batch_claims": prekey_batch_claims,
                     "claim_session_bindings": claim_session_bindings,
                     "groups": groups, "group_sessions": group_sessions,
                     "messages": messages, "delivery": delivery,
@@ -1218,6 +1325,7 @@ class DeviceStore:
         raw_devices = state.get("devices", [])
         raw_sessions = state.get("sessions", [])
         raw_prekey_claims = state.get("prekey_claims", [])
+        raw_prekey_batch_claims = state.get("prekey_batch_claims", [])
         raw_claim_session_bindings = state.get("claim_session_bindings", [])
         raw_groups = state.get("groups", [])
         raw_group_sessions = state.get("group_sessions", [])
@@ -1227,6 +1335,7 @@ class DeviceStore:
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
+                and isinstance(raw_prekey_batch_claims, list)
                 and isinstance(raw_claim_session_bindings, list)
                 and isinstance(raw_groups, list)
                 and isinstance(raw_group_sessions, list)
@@ -1427,6 +1536,110 @@ class DeviceStore:
                 claim_id=claim_id, recipient_device_id=device_id,
                 key_id=key_id, identity_key=identity_key,
                 public_key=public_key, claimed_at=claimed_at)
+
+        # User-wide batch claims. Older files predate the section: it is
+        # absent and treated as empty. A present section is fully validated —
+        # uniqueness of claim_id (shared namespace with single claims), the
+        # non-empty device list in registration order, every entry's field
+        # types, that each device belongs to the named user and carries the
+        # claimed key as its own, that the frozen public key agrees with the
+        # stored pre-key, the consumed flags agree, and that no (device, key)
+        # pair is claimed twice across singles and batches. As with singles,
+        # a batch may name a device/key revoked afterwards; records are
+        # immutable.
+        # claim_id uniqueness is enforced within the batch section; the
+        # (device, key) uniqueness check below is what prevents the same key
+        # from being backed by two records across both claim sections.
+        prekey_batch_claims: Dict[str, PreKeyBatchClaim] = {}
+        for index, raw in enumerate(raw_prekey_batch_claims):
+            where = f"prekey_batch_claims[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            claim_id = raw.get("claim_id")
+            user_id = raw.get("user_id")
+            claimed_at = raw.get("claimed_at")
+            raw_items = raw.get("devices")
+            for name, value in (("claim_id", claim_id),
+                                ("user_id", user_id),
+                                ("claimed_at", claimed_at)):
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"{where}.{name} must be a non-empty string")
+            if not isinstance(raw_items, list) or not raw_items:
+                raise ValueError(
+                    f"{where}.devices must be a non-empty list")
+            if claim_id in prekey_batch_claims:
+                raise ValueError(
+                    f"duplicate batch claim in state: {claim_id}")
+            items: List[PreKeyBatchClaimItem] = []
+            seen_devices: Set[str] = set()
+            last_registration_order: Optional[int] = None
+            for item_index, raw_item in enumerate(raw_items):
+                item_where = f"{where}.devices[{item_index}]"
+                if not isinstance(raw_item, dict):
+                    raise ValueError(f"{item_where} must be an object")
+                device_id = raw_item.get("device_id")
+                identity_key = raw_item.get("identity_key")
+                key_id = raw_item.get("key_id")
+                public_key = raw_item.get("public_key")
+                for name, value in (("device_id", device_id),
+                                    ("identity_key", identity_key),
+                                    ("key_id", key_id),
+                                    ("public_key", public_key)):
+                    if not isinstance(value, str) or not value:
+                        raise ValueError(
+                            f"{item_where}.{name} must be a non-empty string")
+                device_key = device_index.get(device_id)
+                target_device = devices.get(device_key) if device_key else None
+                if target_device is None:
+                    raise ValueError(
+                        f"{item_where} references an unknown device: "
+                        f"{device_id}")
+                if target_device.user_id != user_id:
+                    raise ValueError(
+                        f"{item_where} device {device_id} does not belong to "
+                        f"user {user_id}")
+                if device_id in seen_devices:
+                    raise ValueError(
+                        f"{item_where} lists device {device_id} more than "
+                        f"once in the batch")
+                target_prekey = next((pk for pk in target_device.prekeys
+                                      if pk.key_id == key_id), None)
+                if target_prekey is None:
+                    raise ValueError(
+                        f"{item_where} key_id does not belong to device "
+                        f"{device_id}: {key_id}")
+                if public_key != target_prekey.public_key:
+                    raise ValueError(
+                        f"{item_where} public_key does not match the stored "
+                        f"pre-key")
+                if not target_prekey.consumed:
+                    raise ValueError(
+                        f"{item_where} names a pre-key that is not marked "
+                        f"consumed: {key_id}")
+                pair = (device_id, key_id)
+                if pair in claimed_pairs:
+                    raise ValueError(
+                        f"{item_where} duplicates an existing claim for "
+                        f"device {device_id} key {key_id}")
+                # Entries must follow registration order (a subsequence of
+                # the user's device insertion order).
+                registration_order = next(
+                    i for i, ((_uid, did), _d) in enumerate(devices.items())
+                    if did == device_id)
+                if (last_registration_order is not None
+                        and registration_order <= last_registration_order):
+                    raise ValueError(
+                        f"{item_where} devices are not in registration order")
+                last_registration_order = registration_order
+                seen_devices.add(device_id)
+                claimed_pairs.add(pair)
+                items.append(PreKeyBatchClaimItem(
+                    device_id=device_id, identity_key=identity_key,
+                    key_id=key_id, public_key=public_key))
+            prekey_batch_claims[claim_id] = PreKeyBatchClaim(
+                claim_id=claim_id, user_id=user_id,
+                claimed_at=claimed_at, devices=items)
 
         # The two halves of consumption must agree: no consumed key may lack a
         # backing claim (otherwise it would be wrongly withheld after restart).
@@ -1868,6 +2081,7 @@ class DeviceStore:
             self._device_index = device_index
             self._sessions = sessions
             self._prekey_claims = prekey_claims
+            self._prekey_batch_claims = prekey_batch_claims
             self._claim_session_bindings = claim_session_bindings
             self._groups = groups
             self._group_sessions = group_sessions

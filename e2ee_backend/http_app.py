@@ -11,6 +11,7 @@ from .service import DeviceService, ServiceError
 
 _DEVICES_PATH = "/v1/devices"
 _PREKEYS_PATH = "/v1/prekeys"
+_PREKEYS_CLAIM_BATCH_PATH = "/v1/prekeys/claim-batch"
 _SESSIONS_PATH = "/v1/sessions"
 _SESSIONS_FROM_CLAIM_PATH = "/v1/sessions/from-claim"
 _MESSAGES_PATH = "/v1/messages"
@@ -47,6 +48,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_register()
         elif path == _PREKEYS_PATH + "/claim":
             self._handle_claim_prekey()
+        elif path == _PREKEYS_CLAIM_BATCH_PATH:
+            self._handle_claim_prekeys_batch()
         elif path == _SESSIONS_FROM_CLAIM_PATH:
             self._handle_create_session_from_claim()
         elif path == _SESSIONS_PATH:
@@ -280,6 +283,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.claim_prekey(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_claim_prekeys_batch(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.claim_prekeys_batch(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
