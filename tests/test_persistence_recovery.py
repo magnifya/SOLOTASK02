@@ -12,6 +12,12 @@ Covers:
   touching the file;
 * concurrent revocation is linearized against cursor advances, and when the
   durable write fails neither memory nor the file advances.
+* a parent-directory fsync failure *after* os.replace is undone via a
+  same-directory hard-link backup, restoring the old bytes AND inode;
+* startup reconciles crash-left .tmp snapshots: a valid formal file wins and
+  the leftovers are cleaned; a missing formal file is atomically restored
+  from the newest verifiable version=1 tmp; with no valid snapshot an empty
+  state is created; a corrupt formal file is never overwritten or bypassed.
 """
 import json
 import os
@@ -715,6 +721,185 @@ class MalformedDeliverySectionStartupTest(_MalformedSectionStartupBase):
         self.assertEqual(state.ack_sequence, 2)
         self.assertEqual(state.attempts, 1)
         self.assertEqual(state.attempt_ids, {"a1"})
+
+
+class ParentDirFsyncFailureRollbackTest(unittest.TestCase):
+    """A failure after os.replace (parent-dir fsync) still undoes the commit."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.mkdtemp()
+        self.service, self.state_store, self.path, self.sid = build_fixture(
+            self.directory)
+        with open(self.path, "rb") as handle:
+            self.good_bytes = handle.read()
+        self.good_ino = os.stat(self.path).st_ino
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def test_dir_fsync_failure_restores_old_bytes_inode_and_cleans_tmp(self) -> None:
+        real = persistence_mod.JsonStateStore.__dict__["_fsync_directory"]
+        calls = {"n": 0}
+
+        def fail_once(directory):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("simulated directory fsync failure")
+            return real(directory)
+
+        persistence_mod.JsonStateStore._fsync_directory = staticmethod(
+            fail_once)
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+        finally:
+            persistence_mod.JsonStateStore._fsync_directory = staticmethod(
+                real)
+
+        # Memory rolled back.
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        # The post-rename failure was undone: the exact previous bytes AND
+        # inode are back, and no temporary/backup file lingers.
+        with open(self.path, "rb") as handle:
+            self.assertEqual(handle.read(), self.good_bytes)
+        self.assertEqual(os.stat(self.path).st_ino, self.good_ino)
+        self.assertEqual(
+            [n for n in os.listdir(self.directory) if n.endswith(".tmp")],
+            [])
+        # The repaired store keeps serving and durably commits.
+        body = self.service.revoke_device("alice")
+        self.assertEqual(body["revoked"], True)
+        self.assertNotEqual(os.stat(self.path).st_ino, self.good_ino)
+
+
+class CrashLeftoverRecoveryTest(unittest.TestCase):
+    """Startup reconciles .tmp snapshots left by a crashed earlier process."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.mkdtemp()
+        self.service, _store, self.path, self.sid = build_fixture(
+            self.directory)
+        with open(self.path, "rb") as handle:
+            self.good_bytes = handle.read()
+        self.good_document = json.loads(self.good_bytes)
+        self.good_ino = os.stat(self.path).st_ino
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def _write_tmp(self, name: str, data: str, mtime: float = None) -> str:
+        path = os.path.join(self.directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(data)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def _tmp_files(self):
+        return [n for n in os.listdir(self.directory)
+                if n.endswith(".tmp")]
+
+    def test_valid_formal_file_wins_and_leftovers_are_cleaned(self) -> None:
+        empty = json.dumps({"version": 1, "devices": [], "sessions": [],
+                            "groups": [], "group_sessions": [],
+                            "messages": {}, "delivery": [],
+                            "used_nonces": {}, "group_sync_cursors": []})
+        self._write_tmp(".state-crash.tmp", empty)
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        # The formal document is untouched (bytes + inode) and its content,
+        # not the empty leftover, was loaded.
+        with open(self.path, "rb") as handle:
+            self.assertEqual(handle.read(), self.good_bytes)
+        self.assertEqual(os.stat(self.path).st_ino, self.good_ino)
+        self.assertIsNotNone(service.store.find_by_device_id("creator"))
+        self.assertEqual(self._tmp_files(), [])
+
+    def test_missing_formal_file_is_recovered_from_newest_tmp(self) -> None:
+        os.unlink(self.path)
+        self._write_tmp(".state-crash.tmp", self.good_bytes.decode("utf-8"))
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertIsNotNone(service.store.find_by_device_id("creator"))
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(self._tmp_files(), [])
+
+    def test_recovery_prefers_newest_verifiable_snapshot(self) -> None:
+        os.unlink(self.path)
+        older = self._write_tmp(
+            ".state-old.tmp", self.good_bytes.decode("utf-8"), mtime=1000.0)
+        self._write_tmp(".state-new.tmp", "{not valid json", mtime=2000.0)
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        # The newest tmp was unverifiable and discarded; the older valid one
+        # was promoted instead.
+        self.assertIsNotNone(service.store.find_by_device_id("creator"))
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(self._tmp_files(), [])
+        self.assertFalse(os.path.exists(older))
+
+    def test_no_valid_snapshot_creates_empty_state(self) -> None:
+        os.unlink(self.path)
+        self._write_tmp(".state-junk.tmp", "garbage")
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertIsNone(service.store.find_by_device_id("creator"))
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["version"], 1)
+        self.assertEqual(self._tmp_files(), [])
+
+    def test_bad_version_tmp_is_not_a_recovery_candidate(self) -> None:
+        os.unlink(self.path)
+        self._write_tmp(".state-v2.tmp", json.dumps({"version": 2}))
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertIsNone(service.store.find_by_device_id("creator"))
+        self.assertEqual(self._tmp_files(), [])
+
+    def test_semantically_bad_tmp_is_not_a_recovery_candidate(self) -> None:
+        # cursor 1 in a group session with no messages exceeds max sequence.
+        bad = dict(self.good_document)
+        bad["group_sync_cursors"] = [{
+            "session_id": self.sid, "device_id": "alice", "cursor": 9,
+            "updated_at": "2026-01-01T00:00:00+00:00"}]
+        os.unlink(self.path)
+        self._write_tmp(".state-bad.tmp", json.dumps(bad))
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertIsNone(service.store.find_by_device_id("creator"))
+        self.assertEqual(self._tmp_files(), [])
+
+    def test_corrupt_formal_file_is_left_untouched_with_leftovers_present(
+            self) -> None:
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write("CORRUPT")
+        before = open(self.path, "rb").read()
+        before_ino = os.stat(self.path).st_ino
+        tmp = self._write_tmp(".state-keep.tmp",
+                              self.good_bytes.decode("utf-8"))
+        with self.assertRaises(StateFileError):
+            attach_persistence(DeviceService(), self.path)
+        # Startup neither overwrites the corrupt formal file nor silently
+        # adopts a leftover while a (broken) formal file is present.
+        self.assertEqual(open(self.path, "rb").read(), before)
+        self.assertEqual(os.stat(self.path).st_ino, before_ino)
+        self.assertTrue(os.path.exists(tmp))
+
+    def test_recovered_snapshot_resumes_default_sync_from_saved_cursor(
+            self) -> None:
+        # alice advances to cursor 3 via a default sync; simulate a crash
+        # that removed the formal file but left the fsynced tmp snapshot.
+        self.service.sync_group_messages(self.sid, "alice", None, 100)
+        persisted = open(self.path, "rb").read()
+        os.unlink(self.path)
+        self._write_tmp(".state-crash.tmp", persisted.decode("utf-8"))
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        body = service.sync_group_messages(self.sid, "alice", None, 100)
+        self.assertEqual(body["messages"], [])
+        self.assertEqual(body["next_cursor"], 3)
+        self.assertFalse(body["has_more"])
 
 
 if __name__ == "__main__":
