@@ -1136,62 +1136,164 @@ class DeviceStore:
         for sid, stream in raw_messages.items():
             if not isinstance(sid, str) or not isinstance(stream, list):
                 raise ValueError("messages must map session_id to a list")
+            # Every stream belongs to a saved session (direct or group); a
+            # stream keyed by an unknown session id is a dangling reference.
+            if sid not in sessions and sid not in group_sessions:
+                raise ValueError(
+                    f"messages references an unknown session: {sid}")
+            group_session = group_sessions.get(sid)
             parsed: List[Message] = []
+            seen_message_ids: Set[str] = set()
+            seen_nonces: Set[str] = set()
             for index, raw in enumerate(stream):
                 if not isinstance(raw, dict):
                     raise ValueError(f"messages[{sid}][{index}] must be an object")
                 try:
-                    parsed.append(Message(
+                    envelope = Message(
                         session_id=raw["session_id"],
                         sender_device_id=raw["sender_device_id"],
                         message_id=raw["message_id"],
                         sequence=raw["sequence"], nonce=raw["nonce"],
                         ciphertext=raw["ciphertext"],
-                        created_at=raw["created_at"]))
+                        created_at=raw["created_at"])
                 except KeyError as error:
                     raise ValueError(
                         f"messages[{sid}][{index}] missing field: "
                         f"{error.args[0]}") from None
+                where = f"messages[{sid}][{index}]"
+                for field_name in ("session_id", "sender_device_id",
+                                   "message_id", "nonce", "ciphertext",
+                                   "created_at"):
+                    if not isinstance(getattr(envelope, field_name), str):
+                        raise ValueError(
+                            f"{where} field {field_name} must be a string")
+                if not isinstance(envelope.sequence, int) \
+                        or isinstance(envelope.sequence, bool):
+                    raise ValueError(f"{where} sequence must be an integer")
+                # The envelope must agree with the stream it is filed under.
+                if envelope.session_id != sid:
+                    raise ValueError(
+                        f"{where} session_id does not match the stream key")
+                # Sequences start at 1 and increase strictly by one.
+                if envelope.sequence != index + 1:
+                    raise ValueError(
+                        f"{where} sequence {envelope.sequence} breaks the "
+                        f"consecutive run starting at 1")
+                if envelope.message_id in seen_message_ids:
+                    raise ValueError(
+                        f"{where} duplicates message_id "
+                        f"{envelope.message_id} in this session")
+                if envelope.nonce in seen_nonces:
+                    raise ValueError(
+                        f"{where} duplicates a nonce in this session")
+                # The sender must be a registered device. A revoked sender is
+                # fine: its history stays readable after revocation.
+                if envelope.sender_device_id not in device_index:
+                    raise ValueError(
+                        f"{where} references an unknown sender device: "
+                        f"{envelope.sender_device_id}")
+                # Group-session messages may only come from frozen members.
+                if group_session is not None and envelope.sender_device_id \
+                        not in group_session.members:
+                    raise ValueError(
+                        f"{where} sender is not a frozen member of the "
+                        f"group session: {envelope.sender_device_id}")
+                seen_message_ids.add(envelope.message_id)
+                seen_nonces.add(envelope.nonce)
+                parsed.append(envelope)
             messages[sid] = parsed
 
         # Session-scoped replay protection. Older version-1 files predate the
         # section: rebuild it from stored message history, which lists every
         # nonce ever accepted. A present section must map session_id to a list
-        # of plain strings; anything else is a malformed document.
+        # of distinct plain strings and must equal the rebuilt sets exactly —
+        # an extra, missing or altered nonce means the file disagrees with
+        # its own message history and startup is refused.
         used_nonces: Dict[str, Set[str]] = {}
         for sid, stream in messages.items():
-            rebuilt = used_nonces.setdefault(sid, set())
-            for message in stream:
-                rebuilt.add(message.nonce)
+            nonces = {message.nonce for message in stream}
+            if nonces:
+                used_nonces[sid] = nonces
         if raw_used_nonces is not None:
             if not isinstance(raw_used_nonces, dict):
                 raise ValueError("used_nonces must be an object")
+            persisted_nonces: Dict[str, Set[str]] = {}
             for sid, nonce_list in raw_used_nonces.items():
                 if not isinstance(sid, str) or not isinstance(nonce_list, list) \
                         or not all(isinstance(value, str)
                                    for value in nonce_list):
                     raise ValueError(
                         "used_nonces must map session_id to a list of strings")
-                used_nonces.setdefault(sid, set()).update(nonce_list)
+                if len(set(nonce_list)) != len(nonce_list):
+                    raise ValueError(
+                        f"used_nonces[{sid}] contains duplicate nonces")
+                persisted_nonces[sid] = set(nonce_list)
+            if persisted_nonces != used_nonces:
+                raise ValueError(
+                    "used_nonces does not match the stored message nonces")
 
         delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         for index, raw in enumerate(raw_delivery):
             if not isinstance(raw, dict):
                 raise ValueError(f"delivery[{index}] must be an object")
+            where = f"delivery[{index}]"
             try:
+                session_id = raw["session_id"]
+                message_id = raw["message_id"]
+                attempts = raw["attempts"]
                 attempt_ids = raw["attempt_ids"]
-                if not isinstance(attempt_ids, list) or not all(
-                        isinstance(value, str) for value in attempt_ids):
-                    raise ValueError("attempt_ids must be a list of strings")
-                record = MessageDelivery(
-                    attempts=int(raw["attempts"]),
-                    attempt_ids=set(attempt_ids),
-                    acked=bool(raw["acked"]),
-                    ack_sequence=int(raw["ack_sequence"]))
-                dkey = (raw["session_id"], raw["message_id"])
+                acked = raw["acked"]
+                ack_sequence = raw["ack_sequence"]
             except KeyError as error:
                 raise ValueError(
-                    f"delivery[{index}] missing field: {error.args[0]}") from None
+                    f"{where} missing field: {error.args[0]}") from None
+            if not isinstance(session_id, str) \
+                    or not isinstance(message_id, str):
+                raise ValueError(
+                    f"{where} session_id/message_id must be strings")
+            if not isinstance(attempt_ids, list) or not all(
+                    isinstance(value, str) for value in attempt_ids):
+                raise ValueError(
+                    f"{where} attempt_ids must be a list of strings")
+            if len(set(attempt_ids)) != len(attempt_ids):
+                raise ValueError(f"{where} attempt_ids must be distinct")
+            if not isinstance(attempts, int) or isinstance(attempts, bool) \
+                    or attempts < 0:
+                raise ValueError(
+                    f"{where} attempts must be a non-negative integer")
+            # The counter is derived from the distinct attempt ids; a file
+            # whose count disagrees with its own list is inconsistent.
+            if attempts != len(attempt_ids):
+                raise ValueError(
+                    f"{where} attempts does not match the number of "
+                    "attempt_ids")
+            if not isinstance(acked, bool):
+                raise ValueError(f"{where} acked must be a boolean")
+            if not isinstance(ack_sequence, int) \
+                    or isinstance(ack_sequence, bool):
+                raise ValueError(f"{where} ack_sequence must be an integer")
+            # A delivery record may only point at a stored message.
+            stream = messages.get(session_id, [])
+            message = next((m for m in stream if m.message_id == message_id),
+                           None)
+            if message is None:
+                raise ValueError(
+                    f"{where} references an unknown message: "
+                    f"{session_id}/{message_id}")
+            # The ack cursor is meaningful only together with the ack flag:
+            # acked pins it to the message's sequence, unacked keeps it 0.
+            if acked:
+                if ack_sequence != message.sequence:
+                    raise ValueError(
+                        f"{where} ack_sequence must equal the message "
+                        f"sequence {message.sequence} when acked")
+            elif ack_sequence != 0:
+                raise ValueError(
+                    f"{where} ack_sequence must be 0 while not acked")
+            record = MessageDelivery(
+                attempts=attempts, attempt_ids=set(attempt_ids), acked=acked,
+                ack_sequence=ack_sequence)
+            dkey = (session_id, message_id)
             if dkey in delivery:
                 raise ValueError(
                     f"duplicate delivery record in state: {dkey}")
