@@ -17,6 +17,7 @@ from .models import (
     GroupSyncCursor,
     Message,
     MessageDelivery,
+    PreKeyClaim,
     Session,
     SignedPreKey,
     utc_now_iso,
@@ -29,6 +30,12 @@ SESSION_PREKEY_UNKNOWN = "prekey_unknown"
 SESSION_INITIATOR_REVOKED = "initiator_revoked"
 SESSION_RECIPIENT_REVOKED = "recipient_revoked"
 SESSION_PREKEY_REVOKED = "prekey_revoked"
+SESSION_PREKEY_CONSUMED = "prekey_consumed"
+
+#: Outcome codes for a failed atomic pre-key claim.
+CLAIM_DEVICE_UNKNOWN = "device_unknown"
+CLAIM_DEVICE_REVOKED = "device_revoked"
+CLAIM_NO_PREKEY = "no_prekey_available"
 
 #: Outcome codes for a failed atomic message append.
 MESSAGE_SESSION_UNKNOWN = "session_unknown"
@@ -80,6 +87,14 @@ SYNC_CURSOR_CONFLICT = "cursor_conflict"
 
 class SessionCreateError(Exception):
     """An atomic session lookup/revocation check failed (nothing was written)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class PreKeyClaimError(Exception):
+    """An atomic pre-key claim check failed (nothing was written)."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -146,6 +161,8 @@ class DeviceStore:
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
+        # Pre-key claims keyed by the client-chosen claim_id (idempotency).
+        self._prekey_claims: Dict[str, PreKeyClaim] = {}
         self._groups: Dict[str, Group] = {}
         self._group_sessions: Dict[str, GroupSession] = {}
         # Per-device group-session read cursors, keyed by
@@ -192,9 +209,10 @@ class DeviceStore:
             return self._devices.get(key) if key is not None else None
 
     def active_prekey_ids(self, device: Device) -> List[str]:
-        """Return key ids of non-revoked pre-keys, in stable insertion order."""
+        """Return key ids of non-revoked, unclaimed pre-keys, in order."""
         with self._lock:
-            return [pk.key_id for pk in device.prekeys if not pk.revoked]
+            return [pk.key_id for pk in device.prekeys
+                    if not pk.revoked and not pk.consumed]
 
     def revoke_prekey(self, device: Device, key_id: str) -> bool:
         """Mark one of the device's pre-keys revoked. Return ``False`` if absent."""
@@ -325,9 +343,63 @@ class DeviceStore:
             return {
                 "identity_key": device.identity_key,
                 "prekey_ids": [pk.key_id for pk in device.prekeys
-                               if not pk.revoked],
+                               if not pk.revoked and not pk.consumed],
                 "registered_at": device.registered_at,
             }
+
+    # -- pre-key claims ----------------------------------------------------
+
+    @staticmethod
+    def prekey_claim_view(claim: PreKeyClaim) -> Dict[str, Any]:
+        """Copy one claim record into its public six-field view."""
+        return {
+            "claim_id": claim.claim_id,
+            "recipient_device_id": claim.device_id,
+            "identity_key": claim.identity_key,
+            "key_id": claim.key_id,
+            "public_key": claim.public_key,
+            "claimed_at": claim.claimed_at,
+        }
+
+    def claim_prekey(self, recipient_device_id: str,
+                     claim_id: str) -> Tuple[PreKeyClaim, bool]:
+        """Atomically claim the recipient's first available pre-key.
+
+        Returns ``(claim, created)``. A repeated ``claim_id`` replays the
+        stored record (``created`` False) without consuming another key. A
+        fresh id takes the first non-revoked, unclaimed pre-key in
+        registration order, marks it consumed and freezes the recipient's
+        current identity key into the record. Lookups, revocation checks, the
+        consumption mark and the insert all happen under the store lock (the
+        same lock session creation and revocations take), so concurrent
+        claims, sessions and revocations are linearized: exactly one claim
+        wins a race for a key. On failure nothing is written and
+        :class:`PreKeyClaimError` carries the reason.
+        """
+        with self._lock:
+            existing = self._prekey_claims.get(claim_id)
+            if existing is not None:
+                return existing, False
+            device = self._find_device(recipient_device_id)
+            if device is None:
+                raise PreKeyClaimError(CLAIM_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise PreKeyClaimError(CLAIM_DEVICE_REVOKED)
+            prekey = next((pk for pk in device.prekeys
+                           if not pk.revoked and not pk.consumed), None)
+            if prekey is None:
+                raise PreKeyClaimError(CLAIM_NO_PREKEY)
+            prekey.consumed = True
+            claim = PreKeyClaim(
+                claim_id=claim_id,
+                device_id=device.device_id,
+                key_id=prekey.key_id,
+                identity_key=device.identity_key,
+                public_key=prekey.public_key,
+            )
+            self._prekey_claims[claim_id] = claim
+            self._notify_change()
+            return claim, True
 
     # -- sessions ----------------------------------------------------------
 
@@ -364,6 +436,8 @@ class DeviceStore:
                 raise SessionCreateError(SESSION_PREKEY_UNKNOWN)
             if used_prekey.revoked:
                 raise SessionCreateError(SESSION_PREKEY_REVOKED)
+            if used_prekey.consumed:
+                raise SessionCreateError(SESSION_PREKEY_CONSUMED)
 
             session = Session(
                 session_id=uuid.uuid4().hex,
@@ -939,7 +1013,8 @@ class DeviceStore:
                     "revoked": device.revoked,
                     "prekeys": [{"key_id": pk.key_id,
                                  "public_key": pk.public_key,
-                                 "revoked": pk.revoked}
+                                 "revoked": pk.revoked,
+                                 "consumed": pk.consumed}
                                 for pk in device.prekeys],
                 })
             sessions = [{
@@ -998,11 +1073,20 @@ class DeviceStore:
                 "cursor": record.cursor,
                 "updated_at": record.updated_at,
             } for (sid, did), record in self._group_sync_cursors.items()]
+            prekey_claims = [{
+                "claim_id": claim.claim_id,
+                "device_id": claim.device_id,
+                "key_id": claim.key_id,
+                "identity_key": claim.identity_key,
+                "public_key": claim.public_key,
+                "claimed_at": claim.claimed_at,
+            } for claim in self._prekey_claims.values()]
             return {"devices": devices, "sessions": sessions,
                     "groups": groups, "group_sessions": group_sessions,
                     "messages": messages, "delivery": delivery,
                     "used_nonces": used_nonces,
-                    "group_sync_cursors": group_sync_cursors}
+                    "group_sync_cursors": group_sync_cursors,
+                    "prekey_claims": prekey_claims}
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         """Replace all in-memory state from a persisted (version-stripped) doc.
@@ -1021,12 +1105,16 @@ class DeviceStore:
         raw_delivery = state.get("delivery", [])
         raw_used_nonces = state.get("used_nonces")
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
+        # Older files predate pre-key claims: absent means nothing claimed.
+        raw_prekey_claims = state.get("prekey_claims")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_groups, list)
                 and isinstance(raw_group_sessions, list)
                 and isinstance(raw_messages, dict)
                 and isinstance(raw_delivery, list)
-                and isinstance(raw_group_sync_cursors, list)):
+                and isinstance(raw_group_sync_cursors, list)
+                and (raw_prekey_claims is None
+                     or isinstance(raw_prekey_claims, list))):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -1080,13 +1168,20 @@ class DeviceStore:
                 if not isinstance(pk_revoked, bool):
                     raise ValueError(
                         f"{pk_where}.revoked must be a boolean")
+                # Older files predate the consumed flag; absent means the key
+                # was never claimed.
+                pk_consumed = pk.get("consumed", False)
+                if not isinstance(pk_consumed, bool):
+                    raise ValueError(
+                        f"{pk_where}.consumed must be a boolean")
                 if key_id in seen_key_ids:
                     raise ValueError(
                         f"duplicate prekey key_id in device "
                         f"{device_id}: {key_id}")
                 seen_key_ids.add(key_id)
                 prekeys.append(SignedPreKey(
-                    key_id=key_id, public_key=public_key, revoked=pk_revoked))
+                    key_id=key_id, public_key=public_key, revoked=pk_revoked,
+                    consumed=pk_consumed))
             device = Device(
                 user_id=user_id, device_id=device_id,
                 identity_key=identity_key, registered_at=registered_at,
@@ -1097,6 +1192,62 @@ class DeviceStore:
                     f"duplicate device in state: {device.device_id}")
             devices[key] = device
             device_index[device.device_id] = key
+
+        # Pre-key claims. An absent section means no key was ever claimed
+        # (older files); a present section must be a list of well-formed
+        # records whose claim ids are unique and whose (device_id, key_id)
+        # pairs name that device's own pre-keys. The section is derived state
+        # for the consumed flags: it must match them exactly — a claim whose
+        # key is not marked consumed, or a consumed key with no claim, is a
+        # malformed document and refuses startup.
+        prekey_claims: Dict[str, PreKeyClaim] = {}
+        claimed_keys: Set[Tuple[str, str]] = set()
+        for index, raw in enumerate(raw_prekey_claims or []):
+            where = f"prekey_claims[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            claim_values: Dict[str, str] = {}
+            for name in ("claim_id", "device_id", "key_id", "identity_key",
+                         "public_key", "claimed_at"):
+                value = raw.get(name)
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"{where}.{name} must be a non-empty string")
+                claim_values[name] = value
+            claim_id = claim_values["claim_id"]
+            if claim_id in prekey_claims:
+                raise ValueError(
+                    f"duplicate prekey claim in state: {claim_id}")
+            claim_device_key = device_index.get(claim_values["device_id"])
+            claim_device = (devices.get(claim_device_key)
+                            if claim_device_key is not None else None)
+            if claim_device is None:
+                raise ValueError(
+                    f"{where} references an unknown device: "
+                    f"{claim_values['device_id']}")
+            if not any(pk.key_id == claim_values["key_id"]
+                       for pk in claim_device.prekeys):
+                raise ValueError(
+                    f"{where} key_id does not belong to device "
+                    f"{claim_values['device_id']}: {claim_values['key_id']}")
+            pair = (claim_values["device_id"], claim_values["key_id"])
+            if pair in claimed_keys:
+                raise ValueError(
+                    f"{where} claims an already-claimed pre-key: {pair}")
+            claimed_keys.add(pair)
+            prekey_claims[claim_id] = PreKeyClaim(
+                claim_id=claim_id,
+                device_id=claim_values["device_id"],
+                key_id=claim_values["key_id"],
+                identity_key=claim_values["identity_key"],
+                public_key=claim_values["public_key"],
+                claimed_at=claim_values["claimed_at"])
+        consumed_keys = {(device.device_id, pk.key_id)
+                         for device in devices.values()
+                         for pk in device.prekeys if pk.consumed}
+        if claimed_keys != consumed_keys:
+            raise ValueError(
+                "prekey_claims does not match the consumed pre-key flags")
 
         sessions: Dict[str, Session] = {}
         for index, raw in enumerate(raw_sessions):
@@ -1516,6 +1667,7 @@ class DeviceStore:
             self._devices = devices
             self._device_index = device_index
             self._sessions = sessions
+            self._prekey_claims = prekey_claims
             self._groups = groups
             self._group_sessions = group_sessions
             self._messages = messages

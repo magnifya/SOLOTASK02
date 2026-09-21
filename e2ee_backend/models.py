@@ -20,12 +20,16 @@ class SignedPreKey:
     """A signed pre-key: an identifier plus a public key, revocable.
 
     Pre-keys are kept in insertion order; revoked keys remain stored (so the
-    fact of revocation is durable) but are excluded from public listings.
+    fact of revocation is durable) but are excluded from public listings. A
+    claimed (consumed) key is likewise retained but leaves the public listing
+    and can never be claimed or negotiated again.
     """
 
     key_id: str
     public_key: str
     revoked: bool = False
+    #: Set atomically when the key is handed out by a pre-key claim.
+    consumed: bool = False
 
 
 @dataclass
@@ -45,6 +49,24 @@ class Device:
     def __post_init__(self) -> None:
         if self.rotated_at is None:
             self.rotated_at = self.registered_at
+
+
+@dataclass
+class PreKeyClaim:
+    """An immutable record of one signed pre-key being claimed.
+
+    Keyed by the client-chosen ``claim_id``: a repeated claim id replays this
+    exact record without consuming another key. The recipient's identity key
+    and the pre-key's public key are frozen at claim time, so later rotations
+    or revocations never alter the record. Only public material is retained.
+    """
+
+    claim_id: str
+    device_id: str
+    key_id: str
+    identity_key: str
+    public_key: str
+    claimed_at: str = field(default_factory=utc_now_iso)
 
 
 @dataclass

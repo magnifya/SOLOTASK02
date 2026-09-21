@@ -14,6 +14,7 @@ _SESSIONS_PATH = "/v1/sessions"
 _MESSAGES_PATH = "/v1/messages"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
+_PREKEY_CLAIM_PATH = "/v1/prekeys/claim"
 
 #: Sentinel meaning a 400 for a malformed body was already sent.
 _BAD_REQUEST = object()
@@ -51,6 +52,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_create_group()
         elif path == _GROUP_SESSIONS_PATH:
             self._handle_create_group_session()
+        elif path == _PREKEY_CLAIM_PATH:
+            self._handle_claim_prekey()
         elif path.startswith(_GROUP_SESSIONS_PATH + "/") \
                 and path.endswith("/sync/checkpoint"):
             self._route_group_sync_checkpoint(path)
@@ -263,6 +266,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.add_prekey(device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_claim_prekey(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.claim_prekey(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
