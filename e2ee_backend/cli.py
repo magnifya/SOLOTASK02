@@ -15,6 +15,7 @@ from urllib import request as urllib_request
 
 from .crypto import CryptoError, decrypt_message, encrypt_message
 from .http_app import create_server
+from .locking import StateFileLocked, acquire_state_file_lock
 from .persistence import StateFileError, attach_persistence
 from .service import DeviceService
 
@@ -295,7 +296,7 @@ def _build_serve_service(data_file: Optional[str]) -> DeviceService:
     every subsequent change is persisted atomically; a corrupt or
     wrong-version file makes startup fail with :class:`StateFileError`.
     """
-    path = data_file or os.environ.get("E2EE_DATA_FILE")
+    path = _serve_data_file_path(data_file)
     service = DeviceService()
     if path:
         attach_persistence(service, path)
@@ -691,24 +692,56 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
     return 0
 
 
+def _serve_data_file_path(data_file: Optional[str]) -> Optional[str]:
+    """Resolve the state-file path for ``serve``: flag, env var, or ``None``."""
+    return data_file or os.environ.get("E2EE_DATA_FILE")
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the HTTP server until interrupted."""
+    # A configured state file gets a process-exclusive lock in its own
+    # directory before any recovery, load, or write touches it. Another live
+    # serve process on the same file refuses to start (single stderr JSON
+    # line, field=data_file, exit 1) without altering the formal file. The
+    # in-memory mode (no flag, no env var) is unchanged. The kernel releases
+    # the lock when this process exits, even after SIGKILL.
+    path = _serve_data_file_path(args.data_file)
+    state_lock = None
+    if path is not None:
+        try:
+            state_lock = acquire_state_file_lock(path)
+        except StateFileLocked as error:
+            print(json.dumps({"message": str(error), "field": "data_file"},
+                             separators=(",", ":")),
+                  file=sys.stderr)
+            return 1
+        except OSError as error:
+            print(json.dumps(
+                {"message": f"cannot lock state file {path}: {error}",
+                 "field": "data_file"},
+                separators=(",", ":")),
+                  file=sys.stderr)
+            return 1
     try:
-        service = _build_serve_service(args.data_file)
-    except StateFileError as error:
-        # Corrupt or wrong-version state file: refuse to start cleanly.
-        print(json.dumps({"message": str(error), "field": "data_file"},
-                         separators=(",", ":")),
-              file=sys.stderr)
-        return 1
-    server, _ = create_server(args.host, args.port, service)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        try:
+            service = _build_serve_service(args.data_file)
+        except StateFileError as error:
+            # Corrupt or wrong-version state file: refuse to start cleanly.
+            print(json.dumps({"message": str(error), "field": "data_file"},
+                             separators=(",", ":")),
+                  file=sys.stderr)
+            return 1
+        server, _ = create_server(args.host, args.port, service)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+        return 0
     finally:
-        server.server_close()
-    return 0
+        if state_lock is not None:
+            state_lock.release()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
