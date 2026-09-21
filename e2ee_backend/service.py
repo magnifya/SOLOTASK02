@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from .crypto import is_nonempty_string, load_public_key
 from .models import Device, SignedPreKey
 from .storage import (
+    CLAIM_NO_PREKEY,
+    CLAIM_RECIPIENT_REVOKED,
+    CLAIM_RECIPIENT_UNKNOWN,
     DELIVERY_BAD_SEQUENCE,
     DELIVERY_DEVICE_INACTIVE,
     DELIVERY_DEVICE_MISMATCH,
@@ -39,6 +42,7 @@ from .storage import (
     PREKEY_CONFLICT,
     SESSION_INITIATOR_REVOKED,
     SESSION_INITIATOR_UNKNOWN,
+    SESSION_PREKEY_CONSUMED,
     SESSION_PREKEY_REVOKED,
     SESSION_PREKEY_UNKNOWN,
     SESSION_RECIPIENT_REVOKED,
@@ -55,6 +59,7 @@ from .storage import (
     GroupSyncError,
     MessageCreateError,
     MessageListError,
+    PreKeyClaimError,
     SessionCreateError,
 )
 
@@ -81,6 +86,7 @@ _SESSION_ERROR_MAP = {
     SESSION_INITIATOR_REVOKED: (409, "initiator_device_id"),
     SESSION_RECIPIENT_REVOKED: (409, "recipient_device_id"),
     SESSION_PREKEY_REVOKED: (409, "prekey_id"),
+    SESSION_PREKEY_CONSUMED: (409, "prekey_id"),
 }
 
 
@@ -282,6 +288,50 @@ class DeviceService:
                 "key_id", status_code=409)
         raise  # pragma: no cover - defensive
 
+    # -- one-time pre-key claims ------------------------------------------
+
+    def claim_prekey(self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate a claim payload and atomically claim one pre-key.
+
+        ``recipient_device_id`` and ``claim_id`` must be non-empty strings.
+        The first available (registered-order, un-revoked, un-consumed)
+        pre-key is marked consumed and returned with 201. A repeated
+        ``claim_id`` returns the original response with 200 and consumes no
+        further key; a different ``claim_id`` claims the next available key.
+        Unknown recipient is 404, revoked recipient 409 (field
+        ``recipient_device_id``), and no available key is 409/field
+        ``prekey_id``. Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("recipient_device_id", "claim_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        try:
+            view, created = self.store.claim_prekey(
+                payload["recipient_device_id"], payload["claim_id"])
+        except PreKeyClaimError as error:
+            raise self._claim_error(error, payload["recipient_device_id"])
+        return view, 201 if created else 200
+
+    @staticmethod
+    def _claim_error(error: PreKeyClaimError,
+                     recipient_device_id: str) -> ServiceError:
+        """Translate a claim storage failure into a ServiceError."""
+        if error.reason == CLAIM_RECIPIENT_UNKNOWN:
+            return ServiceError(f"device not found: {recipient_device_id}",
+                                "recipient_device_id", status_code=404)
+        if error.reason == CLAIM_RECIPIENT_REVOKED:
+            return ServiceError("recipient_device_id is revoked",
+                                "recipient_device_id", status_code=409)
+        return ServiceError("no pre-key available for this device",
+                            "prekey_id", status_code=409)
+
     # -- sessions ----------------------------------------------------------
 
     def create_session(self, payload: object) -> Dict[str, Any]:
@@ -325,6 +375,9 @@ class DeviceService:
                 else:
                     device_id = payload[field]
                     message = f"device not found: {device_id}"
+            elif error.reason == SESSION_PREKEY_CONSUMED:
+                message = (f"prekey_id has already been claimed: "
+                           f"{payload['prekey_id']}")
             else:
                 message = f"{field} is revoked"
             raise ServiceError(message, field, status_code=status_code)

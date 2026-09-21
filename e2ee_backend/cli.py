@@ -137,6 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="pre-key public key (string), or @path to read it from a file")
     p_add_prekey.set_defaults(handler=cmd_add_prekey)
 
+    p_claim_prekey = sub.add_parser(
+        "claim-prekey", help="claim one of a device's one-time pre-keys")
+    p_claim_prekey.add_argument("--recipient-device-id", required=True)
+    p_claim_prekey.add_argument("--claim-id", required=True)
+    p_claim_prekey.set_defaults(handler=cmd_claim_prekey)
+
     p_create_session = sub.add_parser(
         "create-session", help="negotiate a session between two devices")
     p_create_session.add_argument("--initiator-device-id", required=True)
@@ -397,6 +403,23 @@ def cmd_add_prekey(args: argparse.Namespace) -> int:
                "public_key": _read_key_argument(args.public_key)}
     try:
         status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_claim_prekey(args: argparse.Namespace) -> int:
+    """Call POST /v1/prekeys/claim; 201 created or 200 idempotent replay.
+
+    Either success status prints the single-line claim JSON on stdout and
+    exits 0; any failure prints the server's single-line JSON on stderr and
+    exits non-zero.
+    """
+    payload = {"recipient_device_id": args.recipient_device_id,
+               "claim_id": args.claim_id}
+    try:
+        status, response = _request_json(
+            "POST", f"{args.base_url}/v1/prekeys/claim", body=payload)
     except ServerUnavailable:
         return _emit_server_error()
     return _emit_api_response(status, response)

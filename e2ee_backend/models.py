@@ -26,6 +26,11 @@ class SignedPreKey:
     key_id: str
     public_key: str
     revoked: bool = False
+    #: True once the key has been handed out by a (committed) pre-key claim.
+    #: A consumed key behaves like a revoked one for listings and claims, but
+    #: the distinct flag records *why* it left the available pool. Like
+    #: revocation, consumption is durable and never reset.
+    consumed: bool = False
 
 
 @dataclass
@@ -45,6 +50,27 @@ class Device:
     def __post_init__(self) -> None:
         if self.rotated_at is None:
             self.rotated_at = self.registered_at
+
+
+@dataclass
+class PreKeyClaim:
+    """The durable record of one successful one-time pre-key claim.
+
+    A claim hands out the recipient's first un-revoked, un-consumed pre-key
+    and is idempotent on ``claim_id``: repeating a claim returns this same
+    record and never consumes a second key. The record freezes the public
+    material returned to the claimant (the recipient's identity key and the
+    claimed pre-key's public key) together with the UTC ``claimed_at``
+    timestamp, so a replayed claim returns byte-identical values even if the
+    device later rotates or revokes.
+    """
+
+    claim_id: str
+    recipient_device_id: str
+    key_id: str
+    identity_key: str
+    public_key: str
+    claimed_at: str = field(default_factory=utc_now_iso)
 
 
 @dataclass

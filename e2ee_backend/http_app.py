@@ -10,6 +10,7 @@ from .persistence import PersistenceUnavailable
 from .service import DeviceService, ServiceError
 
 _DEVICES_PATH = "/v1/devices"
+_PREKEYS_PATH = "/v1/prekeys"
 _SESSIONS_PATH = "/v1/sessions"
 _MESSAGES_PATH = "/v1/messages"
 _GROUPS_PATH = "/v1/groups"
@@ -43,6 +44,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == _DEVICES_PATH:
             self._handle_register()
+        elif path == _PREKEYS_PATH + "/claim":
+            self._handle_claim_prekey()
         elif path == _SESSIONS_PATH:
             self._handle_create_session()
         elif path == _MESSAGES_PATH:
@@ -263,6 +266,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.add_prekey(device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_claim_prekey(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.claim_prekey(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

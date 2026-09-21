@@ -17,6 +17,7 @@ from .models import (
     GroupSyncCursor,
     Message,
     MessageDelivery,
+    PreKeyClaim,
     Session,
     SignedPreKey,
     utc_now_iso,
@@ -29,6 +30,12 @@ SESSION_PREKEY_UNKNOWN = "prekey_unknown"
 SESSION_INITIATOR_REVOKED = "initiator_revoked"
 SESSION_RECIPIENT_REVOKED = "recipient_revoked"
 SESSION_PREKEY_REVOKED = "prekey_revoked"
+SESSION_PREKEY_CONSUMED = "prekey_consumed"
+
+#: Outcome codes for an atomic pre-key claim.
+CLAIM_RECIPIENT_UNKNOWN = "recipient_unknown"
+CLAIM_RECIPIENT_REVOKED = "recipient_revoked"
+CLAIM_NO_PREKEY = "prekey_unavailable"
 
 #: Outcome codes for a failed atomic message append.
 MESSAGE_SESSION_UNKNOWN = "session_unknown"
@@ -118,6 +125,14 @@ class DeviceUpdateError(Exception):
         self.reason = reason
 
 
+class PreKeyClaimError(Exception):
+    """An atomic pre-key claim failed (unknown/revoked device, no key)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class GroupError(Exception):
     """An atomic group or group-session operation failed; nothing changed."""
 
@@ -146,6 +161,9 @@ class DeviceStore:
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
+        # Successful one-time pre-key claims keyed by the client-chosen
+        # claim_id, which is globally unique and idempotency-bearing.
+        self._prekey_claims: Dict[str, PreKeyClaim] = {}
         self._groups: Dict[str, Group] = {}
         self._group_sessions: Dict[str, GroupSession] = {}
         # Per-device group-session read cursors, keyed by
@@ -192,9 +210,14 @@ class DeviceStore:
             return self._devices.get(key) if key is not None else None
 
     def active_prekey_ids(self, device: Device) -> List[str]:
-        """Return key ids of non-revoked pre-keys, in stable insertion order."""
+        """Return key ids of available (non-revoked, un-consumed) pre-keys.
+
+        Order is the stable insertion order; revoked keys and keys already
+        handed out by a committed claim are both excluded.
+        """
         with self._lock:
-            return [pk.key_id for pk in device.prekeys if not pk.revoked]
+            return [pk.key_id for pk in device.prekeys
+                    if not pk.revoked and not pk.consumed]
 
     def revoke_prekey(self, device: Device, key_id: str) -> bool:
         """Mark one of the device's pre-keys revoked. Return ``False`` if absent."""
@@ -325,9 +348,72 @@ class DeviceStore:
             return {
                 "identity_key": device.identity_key,
                 "prekey_ids": [pk.key_id for pk in device.prekeys
-                               if not pk.revoked],
+                               if not pk.revoked and not pk.consumed],
                 "registered_at": device.registered_at,
             }
+
+    # -- pre-key claims ----------------------------------------------------
+
+    @staticmethod
+    def claim_view(claim: PreKeyClaim) -> Dict[str, Any]:
+        """Copy one claim into its public six-field view."""
+        return {
+            "claim_id": claim.claim_id,
+            "recipient_device_id": claim.recipient_device_id,
+            "identity_key": claim.identity_key,
+            "key_id": claim.key_id,
+            "public_key": claim.public_key,
+            "claimed_at": claim.claimed_at,
+        }
+
+    def claim_prekey(self, recipient_device_id: str, claim_id: str
+                     ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically claim one of a device's one-time pre-keys.
+
+        The whole check-and-consume runs under the store lock — the same lock
+        session creation and device/key revocations take — so concurrent
+        claims, session creations and revocations are linearized and exactly
+        one claim wins a race for the last available key.
+
+        A previously committed *claim_id* is idempotent: its frozen record is
+        returned unchanged (``created`` False -> 200) and no further key is
+        consumed, regardless of intervening rotation or revocation. A fresh
+        *claim_id* takes the first pre-key (insertion order) that is neither
+        revoked nor already consumed, marks it consumed, and records the
+        claim. Unknown recipient -> :class:`PreKeyClaimError`
+        ``recipient_unknown`` (404); revoked recipient -> ``recipient_revoked``
+        (409); no available key -> ``prekey_unavailable`` (409/field
+        ``prekey_id``). On failure nothing is written.
+        """
+        with self._lock:
+            existing = self._prekey_claims.get(claim_id)
+            if existing is not None:
+                return self.claim_view(existing), False
+
+            recipient_key = self._device_index.get(recipient_device_id)
+            recipient = (self._devices.get(recipient_key)
+                         if recipient_key is not None else None)
+            if recipient is None:
+                raise PreKeyClaimError(CLAIM_RECIPIENT_UNKNOWN)
+            if recipient.revoked:
+                raise PreKeyClaimError(CLAIM_RECIPIENT_REVOKED)
+
+            available = next((pk for pk in recipient.prekeys
+                              if not pk.revoked and not pk.consumed), None)
+            if available is None:
+                raise PreKeyClaimError(CLAIM_NO_PREKEY)
+
+            available.consumed = True
+            claim = PreKeyClaim(
+                claim_id=claim_id,
+                recipient_device_id=recipient_device_id,
+                key_id=available.key_id,
+                identity_key=recipient.identity_key,
+                public_key=available.public_key,
+            )
+            self._prekey_claims[claim_id] = claim
+            self._notify_change()
+            return self.claim_view(claim), True
 
     # -- sessions ----------------------------------------------------------
 
@@ -364,6 +450,8 @@ class DeviceStore:
                 raise SessionCreateError(SESSION_PREKEY_UNKNOWN)
             if used_prekey.revoked:
                 raise SessionCreateError(SESSION_PREKEY_REVOKED)
+            if used_prekey.consumed:
+                raise SessionCreateError(SESSION_PREKEY_CONSUMED)
 
             session = Session(
                 session_id=uuid.uuid4().hex,
@@ -939,7 +1027,8 @@ class DeviceStore:
                     "revoked": device.revoked,
                     "prekeys": [{"key_id": pk.key_id,
                                  "public_key": pk.public_key,
-                                 "revoked": pk.revoked}
+                                 "revoked": pk.revoked,
+                                 "consumed": pk.consumed}
                                 for pk in device.prekeys],
                 })
             sessions = [{
@@ -952,6 +1041,14 @@ class DeviceStore:
                 "public_key": s.public_key,
                 "created_at": s.created_at,
             } for s in self._sessions.values()]
+            prekey_claims = [{
+                "claim_id": c.claim_id,
+                "device_id": c.recipient_device_id,
+                "key_id": c.key_id,
+                "identity_key": c.identity_key,
+                "public_key": c.public_key,
+                "claimed_at": c.claimed_at,
+            } for c in self._prekey_claims.values()]
             groups = [{
                 "group_id": g.group_id,
                 "creator_device_id": g.creator_device_id,
@@ -999,6 +1096,7 @@ class DeviceStore:
                 "updated_at": record.updated_at,
             } for (sid, did), record in self._group_sync_cursors.items()]
             return {"devices": devices, "sessions": sessions,
+                    "prekey_claims": prekey_claims,
                     "groups": groups, "group_sessions": group_sessions,
                     "messages": messages, "delivery": delivery,
                     "used_nonces": used_nonces,
@@ -1015,6 +1113,7 @@ class DeviceStore:
 
         raw_devices = state.get("devices", [])
         raw_sessions = state.get("sessions", [])
+        raw_prekey_claims = state.get("prekey_claims", [])
         raw_groups = state.get("groups", [])
         raw_group_sessions = state.get("group_sessions", [])
         raw_messages = state.get("messages", {})
@@ -1022,6 +1121,7 @@ class DeviceStore:
         raw_used_nonces = state.get("used_nonces")
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
+                and isinstance(raw_prekey_claims, list)
                 and isinstance(raw_groups, list)
                 and isinstance(raw_group_sessions, list)
                 and isinstance(raw_messages, dict)
@@ -1080,13 +1180,20 @@ class DeviceStore:
                 if not isinstance(pk_revoked, bool):
                     raise ValueError(
                         f"{pk_where}.revoked must be a boolean")
+                # A missing consumed flag means the key was never claimed
+                # (older files); a present flag must be a real boolean.
+                pk_consumed = pk.get("consumed", False)
+                if not isinstance(pk_consumed, bool):
+                    raise ValueError(
+                        f"{pk_where}.consumed must be a boolean")
                 if key_id in seen_key_ids:
                     raise ValueError(
                         f"duplicate prekey key_id in device "
                         f"{device_id}: {key_id}")
                 seen_key_ids.add(key_id)
                 prekeys.append(SignedPreKey(
-                    key_id=key_id, public_key=public_key, revoked=pk_revoked))
+                    key_id=key_id, public_key=public_key, revoked=pk_revoked,
+                    consumed=pk_consumed))
             device = Device(
                 user_id=user_id, device_id=device_id,
                 identity_key=identity_key, registered_at=registered_at,
@@ -1151,6 +1258,79 @@ class DeviceStore:
                 identity_key=values["identity_key"],
                 public_key=values["public_key"],
                 created_at=values["created_at"])
+
+        # One-time pre-key claims. Older files predate the section: it is
+        # absent and treated as empty (and absent flags on prekeys already
+        # mark every key un-consumed). A present section is fully validated —
+        # uniqueness of claim_id and of the claimed (device, key) pair, field
+        # types, and references to a registered device and one of its own
+        # pre-keys, with the frozen public key agreeing. A claim may name a
+        # device/key that was revoked afterwards (records are immutable) but
+        # the key it names must carry the consumed flag, and every consumed
+        # key must be backed by exactly one claim.
+        prekey_claims: Dict[str, PreKeyClaim] = {}
+        claimed_pairs: Set[Tuple[str, str]] = set()
+        for index, raw in enumerate(raw_prekey_claims):
+            where = f"prekey_claims[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            claim_id = raw.get("claim_id")
+            device_id = raw.get("device_id")
+            key_id = raw.get("key_id")
+            identity_key = raw.get("identity_key")
+            public_key = raw.get("public_key")
+            claimed_at = raw.get("claimed_at")
+            for name, value in (("claim_id", claim_id),
+                                ("device_id", device_id),
+                                ("key_id", key_id),
+                                ("identity_key", identity_key),
+                                ("public_key", public_key),
+                                ("claimed_at", claimed_at)):
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"{where}.{name} must be a non-empty string")
+            if claim_id in prekey_claims:
+                raise ValueError(
+                    f"duplicate prekey claim in state: {claim_id}")
+            device_key = device_index.get(device_id)
+            target_device = devices.get(device_key) if device_key else None
+            if target_device is None:
+                raise ValueError(
+                    f"{where} references an unknown recipient device: "
+                    f"{device_id}")
+            target_prekey = next((pk for pk in target_device.prekeys
+                                  if pk.key_id == key_id), None)
+            if target_prekey is None:
+                raise ValueError(
+                    f"{where} key_id does not belong to device "
+                    f"{device_id}: {key_id}")
+            if public_key != target_prekey.public_key:
+                raise ValueError(
+                    f"{where} public_key does not match the stored pre-key")
+            if not target_prekey.consumed:
+                raise ValueError(
+                    f"{where} names a pre-key that is not marked consumed: "
+                    f"{key_id}")
+            pair = (device_id, key_id)
+            if pair in claimed_pairs:
+                raise ValueError(
+                    f"{where} duplicates an existing claim for device "
+                    f"{device_id} key {key_id}")
+            claimed_pairs.add(pair)
+            prekey_claims[claim_id] = PreKeyClaim(
+                claim_id=claim_id, recipient_device_id=device_id,
+                key_id=key_id, identity_key=identity_key,
+                public_key=public_key, claimed_at=claimed_at)
+
+        # The two halves of consumption must agree: no consumed key may lack a
+        # backing claim (otherwise it would be wrongly withheld after restart).
+        for (_user, _did), device in devices.items():
+            for pk in device.prekeys:
+                if pk.consumed and (device.device_id, pk.key_id) \
+                        not in claimed_pairs:
+                    raise ValueError(
+                        f"pre-key {pk.key_id} of device {device.device_id} is "
+                        f"consumed but has no prekey_claims record")
 
         groups: Dict[str, Group] = {}
         for index, raw in enumerate(raw_groups):
@@ -1516,6 +1696,7 @@ class DeviceStore:
             self._devices = devices
             self._device_index = device_index
             self._sessions = sessions
+            self._prekey_claims = prekey_claims
             self._groups = groups
             self._group_sessions = group_sessions
             self._messages = messages
