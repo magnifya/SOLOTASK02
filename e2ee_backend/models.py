@@ -107,6 +107,39 @@ class PreKeyBatchClaim:
 
 
 @dataclass
+class BatchClaimSessionEntry:
+    """One session created from a batch claim's frozen device entry.
+
+    Repeats the entry's frozen recipient/pre-key material so recovery can
+    reconcile the binding with both the batch claim record and the stored
+    session snapshot without consulting the device's (possibly rotated or
+    revoked) current values.
+    """
+
+    session_id: str
+    recipient_device_id: str
+    prekey_id: str
+    identity_key: str
+    public_key: str
+
+
+@dataclass
+class BatchClaimSessionBinding:
+    """Durable binding of one batch claim to the sessions it established.
+
+    Exactly one batch of sessions may ever be established per batch
+    ``claim_id``; this record is written together with those sessions and
+    makes a repeated ``POST /v1/sessions/from-batch-claim`` a conflict.
+    ``entries`` stays in the frozen registration order of the batch claim,
+    one entry per claimed device.
+    """
+
+    claim_id: str
+    entries: List[BatchClaimSessionEntry] = field(default_factory=list)
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class ClaimSessionBinding:
     """Durable binding of one pre-key claim to the session it established.
 

@@ -12,6 +12,15 @@ from .models import Device, SignedPreKey
 from .storage import (
     BATCH_CLAIM_NO_ACTIVE_DEVICE,
     BATCH_CLAIM_NO_PREKEY,
+    BATCH_CLAIM_SESSION_CLAIM_UNKNOWN,
+    BATCH_CLAIM_SESSION_DUPLICATE,
+    BATCH_CLAIM_SESSION_EPHEMERAL_KEYS_MISMATCH,
+    BATCH_CLAIM_SESSION_INITIATOR_IN_SNAPSHOT,
+    BATCH_CLAIM_SESSION_INITIATOR_REVOKED,
+    BATCH_CLAIM_SESSION_INITIATOR_UNKNOWN,
+    BATCH_CLAIM_SESSION_PREKEY_REVOKED,
+    BATCH_CLAIM_SESSION_RECIPIENT_REVOKED,
+    BATCH_CLAIM_SESSION_SINGLE_CLAIM,
     BATCH_CLAIM_USER_UNKNOWN,
     CLAIM_ID_CONFLICT,
     CLAIM_NO_PREKEY,
@@ -64,6 +73,7 @@ from .storage import (
     SYNC_SESSION_UNKNOWN,
     DeviceStore,
     DeviceUpdateError,
+    BatchClaimSessionError,
     ClaimSessionError,
     DeliveryError,
     GroupError,
@@ -109,6 +119,21 @@ _CLAIM_SESSION_ERROR_MAP = {
     CLAIM_SESSION_INITIATOR_REVOKED: (409, "initiator_device_id"),
     CLAIM_SESSION_RECIPIENT_REVOKED: (409, "recipient_device_id"),
     CLAIM_SESSION_PREKEY_REVOKED: (409, "prekey_id"),
+}
+
+#: Maps a storage-level multi-device session-from-batch-claim failure to its
+#: HTTP status. The field is derived per error (recipient/prekey failures name
+#: the offending snapshot entry; the two request-shape failures are 400s).
+_BATCH_CLAIM_SESSION_STATUSES = {
+    BATCH_CLAIM_SESSION_CLAIM_UNKNOWN: 404,
+    BATCH_CLAIM_SESSION_DUPLICATE: 409,
+    BATCH_CLAIM_SESSION_SINGLE_CLAIM: 409,
+    BATCH_CLAIM_SESSION_INITIATOR_UNKNOWN: 404,
+    BATCH_CLAIM_SESSION_INITIATOR_REVOKED: 409,
+    BATCH_CLAIM_SESSION_INITIATOR_IN_SNAPSHOT: 400,
+    BATCH_CLAIM_SESSION_EPHEMERAL_KEYS_MISMATCH: 400,
+    BATCH_CLAIM_SESSION_RECIPIENT_REVOKED: 409,
+    BATCH_CLAIM_SESSION_PREKEY_REVOKED: 409,
 }
 
 
@@ -514,6 +539,122 @@ class DeviceService:
             raise ServiceError(message, field, status_code=status_code)
 
         return self.store.session_view(session.session_id)  # type: ignore[return-value]
+
+    def create_sessions_from_batch_claim(self, payload: object) -> Dict[str, Any]:
+        """Validate a from-batch-claim payload and atomically create sessions.
+
+        ``claim_id`` and ``initiator_device_id`` must be non-empty strings and
+        ``ephemeral_keys`` a non-empty array; each element is an object with a
+        non-empty, unique ``device_id`` and a ``ephemeral_key`` that parses as
+        a public key. The devices named there are not validated by the service:
+        their set must equal the frozen batch-claim snapshot exactly (one
+        ephemeral key per claimed device, no more and no fewer), and that check
+        — together with every status check and all inserts — runs in the store
+        transaction. Each batch ``claim_id`` establishes at most one batch of
+        sessions; a repeat is 409/field=claim_id, as is a claim_id that names a
+        single-device claim. On success returns ``claim_id`` plus ``sessions``,
+        the eight-field session snapshots listed in the claim's frozen
+        registration order (201 at the HTTP layer).
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+
+        for name in ("claim_id", "initiator_device_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        if "ephemeral_keys" not in payload:
+            raise ServiceError("missing required field: ephemeral_keys",
+                               "ephemeral_keys")
+        raw_keys = payload["ephemeral_keys"]
+        if not isinstance(raw_keys, list) or not raw_keys:
+            raise ServiceError(
+                "field must be a non-empty array: ephemeral_keys",
+                "ephemeral_keys")
+
+        ephemeral_keys: Dict[str, str] = {}
+        for index, element in enumerate(raw_keys):
+            prefix = f"ephemeral_keys[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(f"array element must be an object: {prefix}",
+                                   prefix)
+            device_id = element.get("device_id")
+            ephemeral_key = element.get("ephemeral_key")
+            if not is_nonempty_string(device_id):
+                raise ServiceError(
+                    f"field must be a non-empty string: {prefix}.device_id",
+                    f"{prefix}.device_id")
+            if not is_nonempty_string(ephemeral_key):
+                raise ServiceError(
+                    f"field must be a non-empty string: "
+                    f"{prefix}.ephemeral_key",
+                    f"{prefix}.ephemeral_key")
+            if load_public_key(ephemeral_key) is None:
+                raise ServiceError(
+                    f"field is not a valid public key: "
+                    f"{prefix}.ephemeral_key",
+                    f"{prefix}.ephemeral_key")
+            if device_id in ephemeral_keys:
+                raise ServiceError(
+                    f"duplicate device_id in ephemeral_keys: {device_id}",
+                    f"{prefix}.device_id")
+            ephemeral_keys[device_id] = ephemeral_key
+
+        try:
+            sessions = self.store.create_sessions_from_batch_claim(
+                payload["claim_id"],
+                payload["initiator_device_id"],
+                ephemeral_keys)
+        except BatchClaimSessionError as error:
+            raise self._batch_claim_session_error(error, payload["claim_id"])
+
+        return {"claim_id": payload["claim_id"],
+                "sessions": [self.store.session_view(session.session_id)
+                             for session in sessions]}
+
+    @staticmethod
+    def _batch_claim_session_error(error: BatchClaimSessionError,
+                                   claim_id: str) -> ServiceError:
+        """Translate a batch-from-claim storage failure to a ServiceError."""
+        status_code = _BATCH_CLAIM_SESSION_STATUSES[error.reason]
+        if error.reason == BATCH_CLAIM_SESSION_CLAIM_UNKNOWN:
+            return ServiceError(f"claim not found: {claim_id}", "claim_id",
+                                status_code=404)
+        if error.reason == BATCH_CLAIM_SESSION_DUPLICATE:
+            return ServiceError(
+                f"claim_id has already established sessions: {claim_id}",
+                "claim_id", status_code=409)
+        if error.reason == BATCH_CLAIM_SESSION_SINGLE_CLAIM:
+            return ServiceError(
+                "claim_id belongs to a single-device claim; use "
+                "/v1/sessions/from-claim", "claim_id", status_code=409)
+        if error.reason == BATCH_CLAIM_SESSION_INITIATOR_UNKNOWN:
+            return ServiceError(
+                "device not found: initiator_device_id",
+                "initiator_device_id", status_code=404)
+        if error.reason == BATCH_CLAIM_SESSION_INITIATOR_REVOKED:
+            return ServiceError("initiator_device_id is revoked",
+                                "initiator_device_id", status_code=409)
+        if error.reason == BATCH_CLAIM_SESSION_INITIATOR_IN_SNAPSHOT:
+            return ServiceError(
+                "initiator_device_id must not be one of the claimed devices",
+                "initiator_device_id", status_code=400)
+        if error.reason == BATCH_CLAIM_SESSION_EPHEMERAL_KEYS_MISMATCH:
+            return ServiceError(
+                "ephemeral_keys device set must equal the batch claim "
+                "snapshot exactly", "ephemeral_keys", status_code=400)
+        if error.reason == BATCH_CLAIM_SESSION_RECIPIENT_REVOKED:
+            return ServiceError(
+                f"recipient_device_id is revoked: {error.device_id}",
+                "recipient_device_id", status_code=409)
+        return ServiceError(
+            f"prekey_id is revoked: {error.prekey_id} "
+            f"(recipient {error.device_id})",
+            "prekey_id", status_code=409)
 
     # -- groups ------------------------------------------------------------
 

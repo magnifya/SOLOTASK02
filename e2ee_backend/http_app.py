@@ -13,6 +13,7 @@ _DEVICES_PATH = "/v1/devices"
 _PREKEYS_PATH = "/v1/prekeys"
 _SESSIONS_PATH = "/v1/sessions"
 _SESSIONS_FROM_CLAIM_PATH = "/v1/sessions/from-claim"
+_SESSIONS_FROM_BATCH_CLAIM_PATH = "/v1/sessions/from-batch-claim"
 _MESSAGES_PATH = "/v1/messages"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
@@ -51,6 +52,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_claim_prekey()
         elif path == _SESSIONS_FROM_CLAIM_PATH:
             self._handle_create_session_from_claim()
+        elif path == _SESSIONS_FROM_BATCH_CLAIM_PATH:
+            self._handle_create_sessions_from_batch_claim()
         elif path == _SESSIONS_PATH:
             self._handle_create_session()
         elif path == _MESSAGES_PATH:
@@ -315,6 +318,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self.service.create_session_from_claim(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(201, body)
+
+    def _handle_create_sessions_from_batch_claim(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.create_sessions_from_batch_claim(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

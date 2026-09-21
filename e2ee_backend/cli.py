@@ -55,6 +55,31 @@ def _parse_prekey(spec: str) -> Dict[str, str]:
     return {"key_id": key_id, "public_key": public_key.strip()}
 
 
+def _parse_ephemeral_key(spec: str) -> Dict[str, str]:
+    """Parse ``DEVICE_ID:EPHEMERAL_KEY``; a leading ``@`` loads a JSON object."""
+    if spec.startswith("@"):
+        with open(spec[1:], "r", encoding="utf-8") as handle:
+            element = json.load(handle)
+        if (not isinstance(element, dict)
+                or not isinstance(element.get("device_id"), str)
+                or not isinstance(element.get("ephemeral_key"), str)):
+            raise ValueError(
+                "ephemeral-key file must contain device_id and "
+                f"ephemeral_key: {spec}")
+        return {"device_id": element["device_id"],
+                "ephemeral_key": element["ephemeral_key"]}
+
+    device_id, sep, ephemeral_key = spec.partition(":")
+    # Ephemeral keys use the same base64/PEM encodings as pre-keys, so the
+    # first colon cleanly separates the device id from the key.
+    if not sep or not device_id or not ephemeral_key.strip():
+        raise ValueError(
+            "ephemeral key must have the form "
+            f"DEVICE_ID:EPHEMERAL_KEY (got: {spec!r})")
+    return {"device_id": device_id,
+            "ephemeral_key": ephemeral_key.strip()}
+
+
 def _request_json(method: str, url: str, body: Any = None) -> Tuple[int, Any]:
     data = None
     headers = {"Accept": "application/json"}
@@ -171,6 +196,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="ephemeral public key (string), or @path to read it from a file")
     p_create_session_from_claim.set_defaults(
         handler=cmd_create_session_from_claim)
+
+    p_create_batch_sessions = sub.add_parser(
+        "create-batch-sessions",
+        help="establish one session per device of a user-wide batch claim")
+    p_create_batch_sessions.add_argument("--claim-id", required=True)
+    p_create_batch_sessions.add_argument("--initiator-device-id",
+                                         required=True)
+    p_create_batch_sessions.add_argument(
+        "--ephemeral-key", action="append", default=[],
+        metavar="DEVICE_ID:EPHEMERAL_KEY",
+        help="recipient device id and its ephemeral public key; repeat once "
+             "per claimed device. Use @path for a JSON object file.")
+    p_create_batch_sessions.set_defaults(
+        handler=cmd_create_batch_sessions)
 
     p_show_session = sub.add_parser("show-session", help="show a session snapshot")
     p_show_session.add_argument("session_id")
@@ -488,6 +527,39 @@ def cmd_create_session_from_claim(args: argparse.Namespace) -> int:
     try:
         status, response = _request_json(
             "POST", f"{args.base_url}/v1/sessions/from-claim", body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 201 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 201 else 1
+
+
+def cmd_create_batch_sessions(args: argparse.Namespace) -> int:
+    """Call POST /v1/sessions/from-batch-claim; print the single-line JSON.
+
+    One ``--ephemeral-key DEVICE_ID:EPHEMERAL_KEY`` per claimed device (or an
+    ``@``-prefixed JSON object file); the order is the order given on the
+    command line, though the server lists the returned sessions in the claim's
+    frozen registration order. Success (201) prints the server body on stdout
+    and exits 0; any failure prints the server body on stderr and exits 1.
+    """
+    try:
+        ephemeral_keys: List[Dict[str, str]] = [
+            _parse_ephemeral_key(spec) for spec in args.ephemeral_key]
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(json.dumps({"message": str(error), "field": "ephemeral_keys"}),
+              file=sys.stderr)
+        return 2
+
+    payload = {
+        "claim_id": args.claim_id,
+        "initiator_device_id": args.initiator_device_id,
+        "ephemeral_keys": ephemeral_keys,
+    }
+    try:
+        status, response = _request_json(
+            "POST", f"{args.base_url}/v1/sessions/from-batch-claim",
+            body=payload)
     except ServerUnavailable:
         return _emit_server_error()
     stream = sys.stdout if status == 201 else sys.stderr
