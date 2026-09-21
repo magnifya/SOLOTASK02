@@ -74,6 +74,26 @@ class PreKeyClaim:
 
 
 @dataclass
+class ClaimSessionBinding:
+    """Durable binding of one pre-key claim to the session it established.
+
+    Exactly one session may ever be established per ``claim_id``; this record
+    is written together with that session and makes a repeated
+    ``POST /v1/sessions/from-claim`` a conflict. It freezes the claimed
+    recipient/pre-key material the session was built from so the one-session
+    guarantee survives a restart.
+    """
+
+    claim_id: str
+    session_id: str
+    recipient_device_id: str
+    prekey_id: str
+    identity_key: str
+    public_key: str
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class Message:
     """An encrypted message envelope stored inside a session.
 

@@ -153,6 +153,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="ephemeral public key (string), or @path to read it from a file")
     p_create_session.set_defaults(handler=cmd_create_session)
 
+    p_create_session_from_claim = sub.add_parser(
+        "create-session-from-claim",
+        help="establish a session from a one-time pre-key claim")
+    p_create_session_from_claim.add_argument("--claim-id", required=True)
+    p_create_session_from_claim.add_argument("--initiator-device-id",
+                                             required=True)
+    p_create_session_from_claim.add_argument(
+        "--ephemeral-key", required=True,
+        help="ephemeral public key (string), or @path to read it from a file")
+    p_create_session_from_claim.set_defaults(
+        handler=cmd_create_session_from_claim)
+
     p_show_session = sub.add_parser("show-session", help="show a session snapshot")
     p_show_session.add_argument("session_id")
     p_show_session.set_defaults(handler=cmd_show_session)
@@ -436,6 +448,23 @@ def cmd_create_session(args: argparse.Namespace) -> int:
     try:
         status, response = _request_json("POST", f"{args.base_url}/v1/sessions",
                                          body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 201 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 201 else 1
+
+
+def cmd_create_session_from_claim(args: argparse.Namespace) -> int:
+    """Call POST /v1/sessions/from-claim; print the single-line JSON response."""
+    payload = {
+        "claim_id": args.claim_id,
+        "initiator_device_id": args.initiator_device_id,
+        "ephemeral_key": _read_key_argument(args.ephemeral_key),
+    }
+    try:
+        status, response = _request_json(
+            "POST", f"{args.base_url}/v1/sessions/from-claim", body=payload)
     except ServerUnavailable:
         return _emit_server_error()
     stream = sys.stdout if status == 201 else sys.stderr
