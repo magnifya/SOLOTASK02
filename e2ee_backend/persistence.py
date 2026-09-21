@@ -103,7 +103,14 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
     state_store = JsonStateStore(path)
     document = state_store.load()
     if document is None:
-        state_store.save(service.store.snapshot_state())
+        try:
+            state_store.save(service.store.snapshot_state())
+        except OSError as error:
+            # The very first write (temp file, fsync, or atomic replace) is a
+            # startup failure, not a runtime 503: refuse to serve without a
+            # durable state file and report it as a data_file problem.
+            raise StateFileError(
+                f"cannot initialize state file {path}: {error}") from None
     else:
         try:
             service.store.restore_state(
@@ -114,6 +121,10 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
                 f"state file has a malformed payload: {error}") from None
 
     def persist() -> None:
+        # Propagate temp-file/fsync/replace failures verbatim; the store has
+        # already rolled its memory back, and the HTTP layer answers 503 with
+        # field=data_file. JsonStateStore.save leaves the previous file in
+        # place and removes its temp file on any failure.
         state_store.save(service.store.snapshot_state())
 
     service.store.on_change = persist

@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .service import DeviceService, ServiceError
+from .storage import PersistenceError
 
 _DEVICES_PATH = "/v1/devices"
 _SESSIONS_PATH = "/v1/sessions"
@@ -26,6 +27,15 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     # -- routing ----------------------------------------------------------
 
     def do_POST(self) -> None:
+        try:
+            self._route_post()
+        except PersistenceError as error:
+            # The durable commit failed; the store already rolled its memory
+            # back and the previous state file is intact.
+            self._send_json(503, {"message": f"state file unavailable: {error}",
+                                  "field": "data_file"})
+
+    def _route_post(self) -> None:
         path = urlsplit(self.path).path
         if path == _DEVICES_PATH:
             self._handle_register()
@@ -131,6 +141,13 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                   "field": "device_id"})
 
     def do_GET(self) -> None:
+        try:
+            self._route_get()
+        except PersistenceError as error:
+            self._send_json(503, {"message": f"state file unavailable: {error}",
+                                  "field": "data_file"})
+
+    def _route_get(self) -> None:
         path = urlsplit(self.path).path
         if path.startswith(_GROUPS_PATH + "/"):
             suffix = path[len(_GROUPS_PATH) + 1:]

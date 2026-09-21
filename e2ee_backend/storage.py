@@ -6,9 +6,11 @@ order, so repeated requests list them identically.
 """
 from __future__ import annotations
 
+import copy
 import threading
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from .models import (
     Device,
@@ -134,6 +136,16 @@ class GroupSyncError(Exception):
         self.reason = reason
 
 
+class PersistenceError(Exception):
+    """Durable storage failed while committing a transaction.
+
+    Raised after the in-memory state has been rolled back to the exact
+    pre-transaction snapshot; the state file on disk is the previous complete
+    document (the atomic temp-file write never replaced it). With no
+    persistence attached this can never be raised.
+    """
+
+
 class DeviceStore:
     """In-memory store keyed by ``(user_id, device_id)``.
 
@@ -159,10 +171,80 @@ class DeviceStore:
         self._delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         # Called (under the lock) after any state mutation, for persistence.
         self.on_change: Optional[Callable[[], None]] = None
+        # Transaction bookkeeping: inside a _mutation() block a mutation only
+        # marks the transaction dirty; persistence runs once at commit time.
+        self._in_transaction = False
+        self._transaction_dirty = False
+
+    #: Every mutable state container, snapshotted for transaction rollback.
+    _MUTABLE_STATE_ATTRS = (
+        "_devices", "_device_index", "_sessions", "_groups",
+        "_group_sessions", "_group_sync_cursors", "_messages",
+        "_used_nonces", "_delivery",
+    )
+
+    @contextmanager
+    def _mutation(self) -> Iterator[None]:
+        """Run one state mutation as a single linearizable, durable transaction.
+
+        The body runs under the store lock exactly like the old plain
+        ``with self._lock:`` blocks; business-rule failures raise out of the
+        body and nothing is written. A successful *dirty* body is committed by
+        invoking the persistence hook **once**, still under the lock, so the
+        in-memory advance and the file rewrite share one transaction boundary
+        (concurrent work is serialized either wholly before or wholly after).
+        If the durable write fails, a deep snapshot taken on entry restores
+        the pre-transaction memory verbatim and :class:`PersistenceError` is
+        raised; the atomic file write leaves the previous document in place.
+        Nested blocks (the lock is re-entrant) defer to the outermost one.
+        """
+        nested = self._in_transaction
+        self._lock.acquire()
+        if nested:
+            try:
+                yield
+            finally:
+                self._lock.release()
+            return
+        # A rollback snapshot is only needed when a durable write can fail;
+        # a pure in-memory deployment keeps its original, snapshot-free path.
+        durable = self.on_change is not None
+        before = ({name: copy.deepcopy(getattr(self, name))
+                   for name in self._MUTABLE_STATE_ATTRS}
+                  if durable else {})
+        self._in_transaction = True
+        self._transaction_dirty = False
+        try:
+            yield
+        except BaseException:
+            self._in_transaction = False
+            self._transaction_dirty = False
+            self._lock.release()
+            raise
+        try:
+            if self._transaction_dirty and self.on_change is not None:
+                try:
+                    self.on_change()
+                except Exception as error:
+                    for name, snapshot in before.items():
+                        setattr(self, name, snapshot)
+                    raise PersistenceError(str(error)) from error
+        finally:
+            self._in_transaction = False
+            self._transaction_dirty = False
+            self._lock.release()
 
     def _notify_change(self) -> None:
-        """Invoke the persistence hook after a committed mutation."""
-        if self.on_change is not None:
+        """Mark the enclosing transaction dirty, or persist immediately.
+
+        Inside :meth:`_mutation` this only records that the state changed; the
+        durable write happens once at commit. Outside a transaction (only
+        possible for callers bypassing the transaction helpers) the hook runs
+        straight away, preserving the pre-transaction contract.
+        """
+        if self._in_transaction:
+            self._transaction_dirty = True
+        elif self.on_change is not None:
             self.on_change()
 
     def add_device(self, device: Device) -> bool:
@@ -172,7 +254,7 @@ class DeviceStore:
         already registered, whether under the same user or another one.
         """
         key = (device.user_id, device.device_id)
-        with self._lock:
+        with self._mutation():
             if key in self._devices or device.device_id in self._device_index:
                 return False
             self._devices[key] = device
@@ -198,7 +280,7 @@ class DeviceStore:
 
     def revoke_prekey(self, device: Device, key_id: str) -> bool:
         """Mark one of the device's pre-keys revoked. Return ``False`` if absent."""
-        with self._lock:
+        with self._mutation():
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
                     prekey.revoked = True
@@ -212,7 +294,7 @@ class DeviceStore:
         Idempotent: a previously revoked device stays revoked. Returns the
         device or ``None`` when the id is unknown.
         """
-        with self._lock:
+        with self._mutation():
             key = self._device_index.get(device_id)
             device = self._devices.get(key) if key is not None else None
             if device is None:
@@ -231,7 +313,7 @@ class DeviceStore:
         device; otherwise ``key_found`` says whether *key_id* existed. Revoking
         an already-revoked key is idempotent and reports it as found.
         """
-        with self._lock:
+        with self._mutation():
             key = self._device_index.get(device_id)
             device = self._devices.get(key) if key is not None else None
             if device is None:
@@ -262,7 +344,7 @@ class DeviceStore:
         revoked -> ``device_revoked`` (409). All checks and the write happen
         under the store lock; a failure writes nothing.
         """
-        with self._lock:
+        with self._mutation():
             key = self._device_index.get(device_id)
             device = self._devices.get(key) if key is not None else None
             if device is None:
@@ -288,7 +370,7 @@ class DeviceStore:
         device -> ``device_unknown`` (404), revoked device -> ``device_revoked``
         (409). Locked; a failure writes nothing.
         """
-        with self._lock:
+        with self._mutation():
             key = self._device_index.get(device_id)
             device = self._devices.get(key) if key is not None else None
             if device is None:
@@ -342,7 +424,7 @@ class DeviceStore:
         On any failure nothing is written and :class:`SessionCreateError`
         carries the reason.
         """
-        with self._lock:
+        with self._mutation():
             initiator = self._device_index.get(initiator_device_id)
             initiator = self._devices.get(initiator) if initiator is not None else None
             if initiator is None:
@@ -425,7 +507,7 @@ class DeviceStore:
         linearized either wholly before this call (then it fails) or wholly
         after it (then the group is retained). On failure nothing is written.
         """
-        with self._lock:
+        with self._mutation():
             if group_id in self._groups:
                 raise GroupError(GROUP_DUPLICATE_ID)
 
@@ -496,7 +578,7 @@ class DeviceStore:
         successful append advances the group revision; an idempotent repeat
         does not.
         """
-        with self._lock:
+        with self._mutation():
             group = self._authorize_group_actor(group_id, actor_device_id)
             if device_id in group.members:
                 return group, False
@@ -523,7 +605,7 @@ class DeviceStore:
         cannot leave their own group; that request is a no-op that keeps
         the creator as the first member.
         """
-        with self._lock:
+        with self._mutation():
             group = self._authorize_group_actor(group_id, actor_device_id)
             if device_id == group.creator_device_id:
                 return group
@@ -557,7 +639,7 @@ class DeviceStore:
         alter the snapshot. The initiator must be an active *current* member
         of the group. On failure nothing is written.
         """
-        with self._lock:
+        with self._mutation():
             group = self._groups.get(group_id)
             if group is None:
                 raise GroupError(GROUP_SESSION_GROUP_UNKNOWN)
@@ -644,7 +726,7 @@ class DeviceStore:
         page leaves it unchanged). An explicit *after* is a one-off query:
         the stored cursor is neither read nor moved.
         """
-        with self._lock:
+        with self._mutation():
             self._authorize_sync_device(session_id, device_id)
             cursor_key = (session_id, device_id)
             record = self._group_sync_cursors.get(cursor_key)
@@ -687,7 +769,7 @@ class DeviceStore:
         raises the matching device reason (all mapped to 409/device_id by the
         service). Returns ``(view, advanced)``.
         """
-        with self._lock:
+        with self._mutation():
             session = self._authorize_sync_device(session_id, device_id)
             stream = self._messages.get(session_id, [])
             max_sequence = stream[-1].sequence if stream else 0
@@ -746,7 +828,7 @@ class DeviceStore:
         different session is accepted. On any failure nothing is written and
         :class:`MessageCreateError` carries the reason.
         """
-        with self._lock:
+        with self._mutation():
             group_session = self._group_sessions.get(session_id)
             if session_id not in self._sessions and group_session is None:
                 raise MessageCreateError(MESSAGE_SESSION_UNKNOWN)
@@ -869,7 +951,7 @@ class DeviceStore:
         whether this is the first ever attempt for the message (201 vs 200).
         Nothing changes on a failed authorization check.
         """
-        with self._lock:
+        with self._mutation():
             _, message = self._delivery_target(
                 session_id, message_id, device_id)
             key = (session_id, message_id)
@@ -893,7 +975,7 @@ class DeviceStore:
         marks the message acked; repeated acks are idempotent. Returns
         ``(view, first_ack)``.
         """
-        with self._lock:
+        with self._mutation():
             _, message = self._delivery_target(
                 session_id, message_id, device_id)
             if sequence != message.sequence:
@@ -1232,6 +1314,29 @@ class DeviceStore:
             if ckey in group_sync_cursors:
                 raise ValueError(
                     f"duplicate group sync cursor in state: {ckey}")
+            # Referential integrity: a cursor belongs to a stored group
+            # session and one of its frozen, still-registered member devices,
+            # and may not point past the session's largest stored sequence
+            # (an empty session only admits cursor 0). A file with a dangling
+            # or out-of-range cursor is corrupt and refused at startup.
+            group_session = group_sessions.get(sid)
+            if group_session is None:
+                raise ValueError(
+                    f"group sync cursor references an unknown group session: "
+                    f"{sid}")
+            if did not in device_index:
+                raise ValueError(
+                    f"group sync cursor references an unknown device: {did}")
+            if did not in group_session.members:
+                raise ValueError(
+                    "group sync cursor references a device outside the "
+                    f"frozen member set: {sid}/{did}")
+            stream = messages.get(sid, [])
+            max_sequence = max((m.sequence for m in stream), default=0)
+            if cursor > max_sequence:
+                raise ValueError(
+                    f"group sync cursor {cursor} exceeds the max sequence "
+                    f"{max_sequence} of session {sid}")
             group_sync_cursors[ckey] = GroupSyncCursor(
                 cursor=cursor, updated_at=updated_at)
 
