@@ -14,6 +14,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from .crypto import CryptoError, decrypt_message, encrypt_message
+from .file_lock import StateFileLock, StateFileLocked
 from .http_app import create_server
 from .persistence import StateFileError, attach_persistence
 from .service import DeviceService
@@ -693,22 +694,41 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the HTTP server until interrupted."""
+    # File-backed mode is single-process: take the sibling process lock
+    # before touching (or recovering) the state file. The kernel releases it
+    # automatically on exit or abnormal termination; in-memory mode takes no
+    # lock and keeps its previous behavior.
+    lock: Optional[StateFileLock] = None
+    path = args.data_file or os.environ.get("E2EE_DATA_FILE")
+    if path:
+        lock = StateFileLock(path)
+        try:
+            lock.acquire()
+        except (StateFileLocked, OSError) as error:
+            print(json.dumps({"message": str(error), "field": "data_file"},
+                             separators=(",", ":")),
+                  file=sys.stderr)
+            return 1
     try:
-        service = _build_serve_service(args.data_file)
-    except StateFileError as error:
-        # Corrupt or wrong-version state file: refuse to start cleanly.
-        print(json.dumps({"message": str(error), "field": "data_file"},
-                         separators=(",", ":")),
-              file=sys.stderr)
-        return 1
-    server, _ = create_server(args.host, args.port, service)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        try:
+            service = _build_serve_service(args.data_file)
+        except StateFileError as error:
+            # Corrupt or wrong-version state file: refuse to start cleanly.
+            print(json.dumps({"message": str(error), "field": "data_file"},
+                             separators=(",", ":")),
+                  file=sys.stderr)
+            return 1
+        server, _ = create_server(args.host, args.port, service)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+        return 0
     finally:
-        server.server_close()
-    return 0
+        if lock is not None:
+            lock.release()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
