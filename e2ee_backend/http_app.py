@@ -48,6 +48,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_claim_prekey()
         elif path == _SESSIONS_PATH:
             self._handle_create_session()
+        elif path == _SESSIONS_PATH + "/from-claim":
+            self._handle_create_session_from_claim()
         elif path == _MESSAGES_PATH:
             self._handle_post_message()
         elif path == _GROUPS_PATH:
@@ -288,6 +290,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self.service.create_session(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(201, body)
+
+    def _handle_create_session_from_claim(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.create_session_from_claim(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

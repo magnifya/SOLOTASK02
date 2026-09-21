@@ -31,6 +31,9 @@ SESSION_INITIATOR_REVOKED = "initiator_revoked"
 SESSION_RECIPIENT_REVOKED = "recipient_revoked"
 SESSION_PREKEY_REVOKED = "prekey_revoked"
 SESSION_PREKEY_CONSUMED = "prekey_consumed"
+#: Outcome codes for a failed claim-based session creation.
+SESSION_CLAIM_UNKNOWN = "claim_unknown"
+SESSION_CLAIM_BOUND = "claim_bound"
 
 #: Outcome codes for an atomic pre-key claim.
 CLAIM_RECIPIENT_UNKNOWN = "recipient_unknown"
@@ -164,6 +167,10 @@ class DeviceStore:
         # Successful one-time pre-key claims keyed by the client-chosen
         # claim_id, which is globally unique and idempotency-bearing.
         self._prekey_claims: Dict[str, PreKeyClaim] = {}
+        # Bindings from a claim_id to the one session established from it.
+        # A claim_id can found at most one session; the binding is written
+        # atomically with that session under the store lock.
+        self._claim_sessions: Dict[str, str] = {}
         self._groups: Dict[str, Group] = {}
         self._group_sessions: Dict[str, GroupSession] = {}
         # Per-device group-session read cursors, keyed by
@@ -463,6 +470,66 @@ class DeviceStore:
                 public_key=used_prekey.public_key,
             )
             self._sessions[session.session_id] = session
+            self._notify_change()
+            return session
+
+    def create_session_from_claim(self, claim_id: str,
+                                  initiator_device_id: str,
+                                  ephemeral_key: str) -> Session:
+        """Atomically establish the one session bound to a pre-key claim.
+
+        The claim lookup, the once-per-claim binding check, the initiator and
+        frozen-claim status checks, the session insert and the binding write
+        all happen while holding the store lock — the same lock claims,
+        session creations and revocations take — so they are linearized
+        against each other. The session freezes the claim's recorded values
+        (``recipient_device_id``, ``key_id`` -> ``prekey_id``, ``identity_key``
+        and ``public_key``), not the recipient's current ones.
+
+        Unknown claim -> :class:`SessionCreateError` ``claim_unknown`` (404);
+        a claim already bound to a session -> ``claim_bound`` (409, nothing
+        new is created); unknown/revoked initiator -> ``initiator_unknown`` /
+        ``initiator_revoked``; the claim's recipient device revoked ->
+        ``recipient_revoked``; the claim's pre-key revoked ->
+        ``prekey_revoked``. On any failure nothing is written and the claim
+        stays unbound.
+        """
+        with self._lock:
+            claim = self._prekey_claims.get(claim_id)
+            if claim is None:
+                raise SessionCreateError(SESSION_CLAIM_UNKNOWN)
+            if claim_id in self._claim_sessions:
+                raise SessionCreateError(SESSION_CLAIM_BOUND)
+
+            initiator = self._find_device(initiator_device_id)
+            if initiator is None:
+                raise SessionCreateError(SESSION_INITIATOR_UNKNOWN)
+            if initiator.revoked:
+                raise SessionCreateError(SESSION_INITIATOR_REVOKED)
+
+            recipient = self._find_device(claim.recipient_device_id)
+            # A claim implies its recipient was registered; a missing device
+            # would mean corrupt state, which restore_state refuses to load.
+            if recipient is not None and recipient.revoked:
+                raise SessionCreateError(SESSION_RECIPIENT_REVOKED)
+            used_prekey = None
+            if recipient is not None:
+                used_prekey = next((pk for pk in recipient.prekeys
+                                    if pk.key_id == claim.key_id), None)
+            if used_prekey is not None and used_prekey.revoked:
+                raise SessionCreateError(SESSION_PREKEY_REVOKED)
+
+            session = Session(
+                session_id=uuid.uuid4().hex,
+                initiator_device_id=initiator_device_id,
+                recipient_device_id=claim.recipient_device_id,
+                prekey_id=claim.key_id,
+                ephemeral_key=ephemeral_key,
+                identity_key=claim.identity_key,
+                public_key=claim.public_key,
+            )
+            self._sessions[session.session_id] = session
+            self._claim_sessions[claim_id] = session.session_id
             self._notify_change()
             return session
 
@@ -1049,6 +1116,10 @@ class DeviceStore:
                 "public_key": c.public_key,
                 "claimed_at": c.claimed_at,
             } for c in self._prekey_claims.values()]
+            claim_sessions = [{
+                "claim_id": claim_id,
+                "session_id": session_id,
+            } for claim_id, session_id in self._claim_sessions.items()]
             groups = [{
                 "group_id": g.group_id,
                 "creator_device_id": g.creator_device_id,
@@ -1097,6 +1168,7 @@ class DeviceStore:
             } for (sid, did), record in self._group_sync_cursors.items()]
             return {"devices": devices, "sessions": sessions,
                     "prekey_claims": prekey_claims,
+                    "claim_sessions": claim_sessions,
                     "groups": groups, "group_sessions": group_sessions,
                     "messages": messages, "delivery": delivery,
                     "used_nonces": used_nonces,
@@ -1114,6 +1186,7 @@ class DeviceStore:
         raw_devices = state.get("devices", [])
         raw_sessions = state.get("sessions", [])
         raw_prekey_claims = state.get("prekey_claims", [])
+        raw_claim_sessions = state.get("claim_sessions", [])
         raw_groups = state.get("groups", [])
         raw_group_sessions = state.get("group_sessions", [])
         raw_messages = state.get("messages", {})
@@ -1122,6 +1195,7 @@ class DeviceStore:
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
+                and isinstance(raw_claim_sessions, list)
                 and isinstance(raw_groups, list)
                 and isinstance(raw_group_sessions, list)
                 and isinstance(raw_messages, dict)
@@ -1331,6 +1405,47 @@ class DeviceStore:
                     raise ValueError(
                         f"pre-key {pk.key_id} of device {device.device_id} is "
                         f"consumed but has no prekey_claims record")
+
+        # Claim-to-session bindings. Older version-1 files predate the
+        # section: it is absent and treated as empty (no claim has founded a
+        # session yet). A present section is fully validated: each binding
+        # names an existing claim and an existing 1:1 session, the mapping is
+        # one-to-one in both directions, and the bound session must carry the
+        # claim's frozen recipient and pre-key.
+        claim_sessions: Dict[str, str] = {}
+        bound_session_ids: Set[str] = set()
+        for index, raw in enumerate(raw_claim_sessions):
+            where = f"claim_sessions[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            claim_id = raw.get("claim_id")
+            session_id = raw.get("session_id")
+            for name, value in (("claim_id", claim_id),
+                                ("session_id", session_id)):
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"{where}.{name} must be a non-empty string")
+            if claim_id in claim_sessions:
+                raise ValueError(
+                    f"duplicate claim session binding in state: {claim_id}")
+            claim = prekey_claims.get(claim_id)
+            if claim is None:
+                raise ValueError(
+                    f"{where} references an unknown claim: {claim_id}")
+            session = sessions.get(session_id)
+            if session is None:
+                raise ValueError(
+                    f"{where} references an unknown session: {session_id}")
+            if session_id in bound_session_ids:
+                raise ValueError(
+                    f"{where} duplicates a binding for session: {session_id}")
+            if session.recipient_device_id != claim.recipient_device_id \
+                    or session.prekey_id != claim.key_id:
+                raise ValueError(
+                    f"{where} session does not match the claim's frozen "
+                    f"recipient and pre-key: {claim_id}")
+            claim_sessions[claim_id] = session_id
+            bound_session_ids.add(session_id)
 
         groups: Dict[str, Group] = {}
         for index, raw in enumerate(raw_groups):
@@ -1697,6 +1812,7 @@ class DeviceStore:
             self._device_index = device_index
             self._sessions = sessions
             self._prekey_claims = prekey_claims
+            self._claim_sessions = claim_sessions
             self._groups = groups
             self._group_sessions = group_sessions
             self._messages = messages

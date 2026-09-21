@@ -42,6 +42,8 @@ from .storage import (
     PREKEY_CONFLICT,
     SESSION_INITIATOR_REVOKED,
     SESSION_INITIATOR_UNKNOWN,
+    SESSION_CLAIM_BOUND,
+    SESSION_CLAIM_UNKNOWN,
     SESSION_PREKEY_CONSUMED,
     SESSION_PREKEY_REVOKED,
     SESSION_PREKEY_UNKNOWN,
@@ -391,6 +393,59 @@ class DeviceService:
             raise ServiceError(f"session not found: {session_id}",
                                "session_id", status_code=404)
         return view
+
+    #: Maps a claim-based session failure reason to (HTTP status, field).
+    _CLAIM_SESSION_ERROR_MAP = {
+        SESSION_CLAIM_UNKNOWN: (404, "claim_id"),
+        SESSION_CLAIM_BOUND: (409, "claim_id"),
+        SESSION_INITIATOR_UNKNOWN: (404, "initiator_device_id"),
+        SESSION_INITIATOR_REVOKED: (409, "initiator_device_id"),
+        SESSION_RECIPIENT_REVOKED: (409, "recipient_device_id"),
+        SESSION_PREKEY_REVOKED: (409, "prekey_id"),
+    }
+
+    def create_session_from_claim(self, payload: object) -> Dict[str, Any]:
+        """Validate a claim-based session payload and atomically create it.
+
+        ``claim_id``, ``initiator_device_id`` and ``ephemeral_key`` must be
+        non-empty strings and the key must parse as a public key. The session
+        freezes the claim's recorded recipient, pre-key and public material.
+        Each ``claim_id`` founds at most one session: a repeat submission is
+        a 409 naming ``claim_id`` and creates nothing.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("claim_id", "initiator_device_id", "ephemeral_key"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if load_public_key(payload["ephemeral_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: ephemeral_key",
+                "ephemeral_key")
+
+        try:
+            session = self.store.create_session_from_claim(
+                payload["claim_id"], payload["initiator_device_id"],
+                payload["ephemeral_key"])
+        except SessionCreateError as error:
+            status_code, field = self._CLAIM_SESSION_ERROR_MAP[error.reason]
+            if error.reason == SESSION_CLAIM_UNKNOWN:
+                message = f"claim not found: {payload['claim_id']}"
+            elif error.reason == SESSION_CLAIM_BOUND:
+                message = (f"claim_id has already established a session: "
+                           f"{payload['claim_id']}")
+            elif error.reason == SESSION_INITIATOR_UNKNOWN:
+                message = (f"device not found: "
+                           f"{payload['initiator_device_id']}")
+            else:
+                message = f"{field} is revoked"
+            raise ServiceError(message, field, status_code=status_code)
+
+        return self.store.session_view(session.session_id)  # type: ignore[return-value]
 
     # -- groups ------------------------------------------------------------
 
