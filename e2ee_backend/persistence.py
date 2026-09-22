@@ -24,13 +24,21 @@ A crash between steps can leave ``.state-*.tmp`` (staged document) or
 ``.state-*.bak`` (pinned previous inode) files beside the target. At the next
 :func:`attach_persistence` these are resolved by
 :func:`recover_crash_leftovers`: a valid formal file stays authoritative and
-the leftovers are removed; with the formal file missing the newest-mtime
-leftover that parses as version=1, carries the cursor and ``key_events``
-sections (the footprint of one complete durable transaction), and passes
-every semantic restore check is atomically recovered into place; with none
-valid the leftovers are removed and an empty state is created. An
-existing-but-corrupt formal file still makes startup refuse rather than
-being silently overwritten.
+the leftovers are removed; with the formal file missing the highest
+``commit_seq`` leftover that parses as version=1, carries the cursor and
+``key_events`` sections (the footprint of one complete durable transaction),
+and passes every semantic restore check is atomically recovered into place
+(modification time newest-first breaks equal generations, and files without
+the field keep the legacy newest-mtime rule); with none valid the leftovers
+are removed and an empty state is created. An existing-but-corrupt formal
+file still makes startup refuse rather than being silently overwritten.
+
+Every document carries a strictly-consecutive top-level ``commit_seq``: the
+first empty state is written at 0 and each successful durable transaction
+advances it exactly once (a failed write consumes no generation). A legacy
+version=1 file without the field loads as generation 0; a present field must
+be a non-negative integer or startup refuses (bool, negative, float and
+string values are rejected) with the file untouched.
 """
 from __future__ import annotations
 
@@ -57,6 +65,28 @@ _TMP_SUFFIX = ".tmp"
 #: Suffix of the pre-replace hard-link backup pinning the previous inode.
 _BAK_SUFFIX = ".bak"
 
+#: Top-level commit-generation field. Every successful durable transaction
+#: writes a document whose ``commit_seq`` is exactly one higher than the
+#: previous one; the first (empty) state is created at 0. A legacy version-1
+#: file written before this field loads as if it carried 0.
+COMMIT_SEQ_KEY = "commit_seq"
+
+
+def _valid_commit_seq(value: Any) -> bool:
+    """A commit generation is a non-negative JSON integer (never a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _commit_seq_of(document: Dict[str, Any]) -> int:
+    """Rank a candidate by its commit generation; a missing/malformed one is 0.
+
+    Leftover snapshots are ranked leniently here (a leftover without the field
+    predates commit generations and sorts at generation 0); the *formal*
+    file's field is validated strictly by :meth:`JsonStateStore.load`.
+    """
+    value = document.get(COMMIT_SEQ_KEY, 0)
+    return value if _valid_commit_seq(value) else 0
+
 
 class StateFileError(Exception):
     """The state file is missing fields, corrupt, or has an unknown version."""
@@ -76,12 +106,22 @@ class JsonStateStore:
 
     def __init__(self, path: str) -> None:
         self.path = path
+        #: Commit generation the *next* save writes. The first (empty) state
+        #: is created at 0; :func:`attach_persistence` re-seeds it from a
+        #: loaded or recovered document (plus one) so generations stay
+        #: strictly consecutive across restarts and recovery. It advances
+        #: only once a save has completed durably, so a failed transaction
+        #: never consumes a generation.
+        self.commit_seq = 0
 
     def load(self) -> Optional[Dict[str, Any]]:
         """Load the document, or ``None`` when the file does not exist yet.
 
         Raises :class:`StateFileError` if the file cannot be decoded as JSON,
-        is not a JSON object, or carries a missing/unknown ``version``.
+        is not a JSON object, carries a missing/unknown ``version``, or has a
+        ``commit_seq`` that is present but not a non-negative integer (a bool,
+        negative number, float or string). A file without ``commit_seq`` is a
+        legacy version-1 document and loads as generation 0.
         """
         try:
             with open(self.path, "r", encoding="utf-8") as handle:
@@ -106,6 +146,12 @@ class JsonStateStore:
             raise StateFileError(
                 f"unsupported state file version: {version} "
                 f"(this server supports {STATE_VERSION})")
+        if COMMIT_SEQ_KEY in document:
+            commit_seq = document[COMMIT_SEQ_KEY]
+            if not _valid_commit_seq(commit_seq):
+                raise StateFileError(
+                    f"state document '{COMMIT_SEQ_KEY}' must be a "
+                    f"non-negative integer")
         return document
 
     def save(self, state: Dict[str, Any]) -> None:
@@ -127,6 +173,13 @@ class JsonStateStore:
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
         document = {"version": STATE_VERSION, **state}
+        # Stamp the commit generation this save is committing. The counter
+        # advances only after the replace and directory fsync succeed, so a
+        # failed transaction (rolled back below) consumes no generation and
+        # the next retry rewrites the same one — generations on disk stay
+        # strictly consecutive.
+        seq = self.commit_seq
+        document[COMMIT_SEQ_KEY] = seq
         tmp_handle = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=directory, delete=False,
             prefix=".state-", suffix=".tmp")
@@ -179,6 +232,8 @@ class JsonStateStore:
                 _fsync_directory(directory)
             except OSError:
                 pass
+        # The generation advances exactly once per durable commit.
+        self.commit_seq = seq + 1
 
 
 def _directory_fsync_unsupported(error: OSError) -> bool:
@@ -358,14 +413,21 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
     * An existing but corrupt/invalid formal file is left untouched: the
       normal load then refuses startup, so present state is never silently
       discarded (and its leftovers are kept for inspection).
-    * With the formal file missing, candidates are tried newest-mtime-first;
-      the first that parses as version=1, explicitly carries the
-      ``group_sync_cursors``/``message_sync_cursors``/``key_events`` sections
-      (each a list — the footprint of one complete durable transaction), *and*
-      passes full semantic verification is atomically ``os.replace``-d into
-      place (plus a parent-directory fsync) and the remaining leftovers are
-      removed. A section-less legacy/partial snapshot is never promoted, so a
-      resume cursor or the audit chain cannot be silently lost.
+    * With the formal file missing, only candidates that parse as
+      version=1, explicitly carry the
+      ``group_sync_cursors``/``message_sync_cursors``/``key_events``
+      sections (each a list — the footprint of one complete durable
+      transaction), *and* pass full semantic verification are considered.
+      They rank by commit generation first — the highest ``commit_seq``
+      wins, so an older-mtime snapshot from a later generation is never
+      lost to a newer-mtime stale one — with modification time newest-first
+      among equal generations (a missing field counts as generation 0).
+      When every candidate predates commit generations (none carries the
+      field), selection stays the legacy newest-mtime rule. The chosen
+      snapshot is atomically ``os.replace``-d into place (plus a
+      parent-directory fsync) and the remaining leftovers are removed. A
+      section-less legacy/partial snapshot is never promoted, so a resume
+      cursor or the audit chain cannot be silently lost.
     * When no candidate is valid, all leftovers are removed; the normal
       missing-file path in :func:`attach_persistence` then creates an empty
       state.
@@ -377,31 +439,63 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
 
     if os.path.exists(state_store.path):
         # The formal file exists. A valid one stays authoritative and the
-        # leftovers are stale; an invalid one makes the normal load refuse
-        # startup, so neither the file nor the leftovers are touched here.
+        # leftovers are stale; an invalid one (including a present but
+        # malformed commit_seq) makes the normal load refuse startup, so
+        # neither the file nor the leftovers are touched here.
         formal = _read_version1_document(state_store.path)
-        if formal is not None and _document_restores(formal):
+        formal_valid = (
+            formal is not None
+            and (COMMIT_SEQ_KEY not in formal
+                 or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
+            and _document_restores(formal))
+        if formal_valid:
             for path in leftovers:
                 _remove_quietly(path)
         return
 
-    # Formal file missing: recover the newest verifiable snapshot, newest
-    # modification time first (ties broken by name for deterministic order).
-    def mtime_key(path: str) -> Any:
-        try:
-            return (os.stat(path).st_mtime_ns, path)
-        except OSError:
-            return (-1, path)
-
-    candidates = sorted(leftovers, key=mtime_key, reverse=True)
-    recovered = None
-    for candidate in candidates:
+    # Formal file missing. Verify every leftover first (unverifiable ones are
+    # skipped), then rank the survivors by commit generation, not mtime: the
+    # highest commit_seq wins even when a stale older-generation snapshot has
+    # a newer mtime, and equal generations order newest-mtime-first. A
+    # leftover without the field is a pre-generation snapshot at seq 0; when
+    # every candidate is such a snapshot the ranking collapses to the legacy
+    # pure-mtime rule. Ties in mtime break by name, deterministically.
+    verified: List[Tuple[str, int, int]] = []
+    any_with_seq = False
+    for candidate in leftovers:
         document = _read_version1_document(candidate)
-        if (document is not None
-                and _candidate_is_section_complete(document)
-                and _document_restores(document)):
-            recovered = candidate
-            break
+        if document is None or not _candidate_is_section_complete(document):
+            continue
+        # A present-but-malformed generation (bool, negative, float, string)
+        # can never come from this build's atomic writer; promoting it would
+        # only fail the strict formal-file load afterwards, so it is not a
+        # verifiable candidate. A missing field is the legacy case and ranks
+        # at generation 0.
+        if COMMIT_SEQ_KEY in document and not _valid_commit_seq(
+                document[COMMIT_SEQ_KEY]):
+            continue
+        if COMMIT_SEQ_KEY in document:
+            any_with_seq = True
+        if not _document_restores(document):
+            continue
+        try:
+            mtime_ns = os.stat(candidate).st_mtime_ns
+        except OSError:
+            mtime_ns = -1
+        verified.append((candidate, _commit_seq_of(document), mtime_ns))
+
+    recovered = None
+    if verified:
+        if any_with_seq:
+            # Generation-first ordering; missing field ranks at 0, so a
+            # present-generation snapshot always beats a field-less legacy
+            # one regardless of mtime.
+            verified.sort(key=lambda item: (item[1], item[2], item[0]))
+        else:
+            # Every candidate predates commit generations: keep the legacy
+            # newest-mtime rule.
+            verified.sort(key=lambda item: (item[2], item[0]))
+        recovered = verified[-1][0]
 
     if recovered is not None:
         os.replace(recovered, state_store.path)
@@ -442,6 +536,11 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
             raise StateFileError(
                 f"cannot create state file {path}: {error}") from None
     else:
+        # Resume commit generations exactly where the durable document left
+        # off (a legacy file without the field is generation 0): the next
+        # successful transaction writes commit_seq + 1, never repeating or
+        # skipping a generation after restart or crash recovery.
+        state_store.commit_seq = _commit_seq_of(document) + 1
         try:
             service.store.restore_state(
                 {key: value for key, value in document.items()
