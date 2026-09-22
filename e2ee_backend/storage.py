@@ -247,6 +247,10 @@ class DeviceStore:
         self._used_nonces: Dict[str, Set[str]] = {}
         # Delivery state keyed by (session_id, message_id).
         self._delivery: Dict[Tuple[str, str], MessageDelivery] = {}
+        # Per-device delivery state for group sessions, keyed by
+        # (session_id, message_id, device_id): every frozen non-sender
+        # member accumulates its own dedup/ack record.
+        self._group_delivery: Dict[Tuple[str, str, str], MessageDelivery] = {}
         # Called (under the lock) after any state mutation, for persistence.
         self.on_change: Optional[Callable[[], None]] = None
 
@@ -1283,14 +1287,20 @@ class DeviceStore:
 
     def _delivery_target(self, session_id: str, message_id: str,
                          device_id: str
-                         ) -> Tuple[Session, Message]:
+                         ) -> Tuple[Optional[Session],
+                                    Optional[GroupSession], Message]:
         """Resolve and authorize a (session, message, recipient) triple.
 
-        Must be called while holding the store lock. Raises
-        :class:`DeliveryError` with the mapped reason on any failure.
+        Must be called while holding the store lock. A 1:1 session authorizes
+        its active recipient only; a group session authorizes any active
+        device frozen into the member snapshot except the message's sender —
+        later group roster changes never widen or shrink that frozen set.
+        Raises :class:`DeliveryError` with the mapped reason on any failure.
         """
         session = self._sessions.get(session_id)
-        if session is None:
+        group_session = (self._group_sessions.get(session_id)
+                         if session is None else None)
+        if session is None and group_session is None:
             raise DeliveryError(DELIVERY_SESSION_UNKNOWN)
         message = next((m for m in self._messages.get(session_id, [])
                         if m.message_id == message_id), None)
@@ -1301,30 +1311,41 @@ class DeviceStore:
                   if device_key is not None else None)
         if device is None or device.revoked:
             raise DeliveryError(DELIVERY_DEVICE_INACTIVE)
-        if device_id != session.recipient_device_id:
+        if session is not None:
+            if device_id != session.recipient_device_id:
+                raise DeliveryError(DELIVERY_DEVICE_MISMATCH)
+        elif device_id not in group_session.members \
+                or device_id == message.sender_device_id:
             raise DeliveryError(DELIVERY_DEVICE_MISMATCH)
-        return session, message
+        return session, group_session, message
 
     def retry_message(self, session_id: str, message_id: str,
                       device_id: str, attempt_id: str
                       ) -> Tuple[Dict[str, Any], bool]:
         """Atomically record one delivery attempt for a message.
 
-        The recipient must be the session's active recipient. Each distinct
+        A 1:1 session tracks one record for its recipient; a group session
+        tracks one record per frozen non-sender member device. Each distinct
         ``attempt_id`` is counted exactly once, so retries with the same id
         are idempotent. Returns ``(view, created)`` where ``created`` says
-        whether this is the first ever attempt for the message (201 vs 200).
-        Nothing changes on a failed authorization check.
+        whether this is the first ever attempt for the message (for this
+        device, in a group session) — 201 vs 200. Nothing changes on a
+        failed authorization check.
         """
         with self._lock:
-            _, message = self._delivery_target(
+            _, group_session, message = self._delivery_target(
                 session_id, message_id, device_id)
-            key = (session_id, message_id)
-            state = self._delivery.get(key)
+            if group_session is not None:
+                bucket: Dict[Tuple, MessageDelivery] = self._group_delivery
+                key: Tuple = (session_id, message_id, device_id)
+            else:
+                bucket = self._delivery
+                key = (session_id, message_id)
+            state = bucket.get(key)
             created = state is None
             if created:
                 state = MessageDelivery()
-                self._delivery[key] = state
+                bucket[key] = state
             if attempt_id not in state.attempt_ids:
                 state.attempt_ids.add(attempt_id)
                 state.attempts += 1
@@ -1337,20 +1358,26 @@ class DeviceStore:
         """Atomically acknowledge a message for the active recipient.
 
         ``sequence`` must equal the message's stored sequence. The first ack
-        marks the message acked; repeated acks are idempotent. Returns
-        ``(view, first_ack)``.
+        marks the message acked (per device, in a group session); repeated
+        acks are idempotent and one device's ack never touches another's.
+        Returns ``(view, first_ack)``.
         """
         with self._lock:
-            _, message = self._delivery_target(
+            _, group_session, message = self._delivery_target(
                 session_id, message_id, device_id)
             if sequence != message.sequence:
                 raise DeliveryError(DELIVERY_BAD_SEQUENCE)
-            key = (session_id, message_id)
-            state = self._delivery.get(key)
+            if group_session is not None:
+                bucket: Dict[Tuple, MessageDelivery] = self._group_delivery
+                key: Tuple = (session_id, message_id, device_id)
+            else:
+                bucket = self._delivery
+                key = (session_id, message_id)
+            state = bucket.get(key)
             first_ack = state is None or not state.acked
             if state is None:
                 state = MessageDelivery()
-                self._delivery[key] = state
+                bucket[key] = state
             state.acked = True
             state.ack_sequence = sequence
             view = self._delivery_view(session_id, message, state)
@@ -1361,9 +1388,13 @@ class DeviceStore:
                                 device_id: str) -> Dict[str, Any]:
         """Atomically read one message's delivery status for its recipient."""
         with self._lock:
-            _, message = self._delivery_target(
+            _, group_session, message = self._delivery_target(
                 session_id, message_id, device_id)
-            state = self._delivery.get((session_id, message_id))
+            if group_session is not None:
+                state = self._group_delivery.get(
+                    (session_id, message_id, device_id))
+            else:
+                state = self._delivery.get((session_id, message_id))
             return self._delivery_view(session_id, message, state)
 
     # -- persistence snapshot ----------------------------------------------
@@ -1476,6 +1507,15 @@ class DeviceStore:
                 "acked": state.acked,
                 "ack_sequence": state.ack_sequence,
             } for (sid, mid), state in self._delivery.items()]
+            group_delivery = [{
+                "session_id": sid,
+                "message_id": mid,
+                "device_id": did,
+                "attempts": state.attempts,
+                "attempt_ids": sorted(state.attempt_ids),
+                "acked": state.acked,
+                "ack_sequence": state.ack_sequence,
+            } for (sid, mid, did), state in self._group_delivery.items()]
             used_nonces = {
                 sid: sorted(nonces)
                 for sid, nonces in self._used_nonces.items() if nonces
@@ -1494,6 +1534,7 @@ class DeviceStore:
                         batch_claim_session_bindings,
                     "groups": groups, "group_sessions": group_sessions,
                     "messages": messages, "delivery": delivery,
+                    "group_delivery": group_delivery,
                     "used_nonces": used_nonces,
                     "group_sync_cursors": group_sync_cursors}
 
@@ -1517,6 +1558,7 @@ class DeviceStore:
         raw_group_sessions = state.get("group_sessions", [])
         raw_messages = state.get("messages", {})
         raw_delivery = state.get("delivery", [])
+        raw_group_delivery = state.get("group_delivery", [])
         raw_used_nonces = state.get("used_nonces")
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
@@ -1528,6 +1570,7 @@ class DeviceStore:
                 and isinstance(raw_group_sessions, list)
                 and isinstance(raw_messages, dict)
                 and isinstance(raw_delivery, list)
+                and isinstance(raw_group_delivery, list)
                 and isinstance(raw_group_sync_cursors, list)):
             raise ValueError("state document has a malformed top-level section")
 
@@ -2325,6 +2368,92 @@ class DeviceStore:
                 attempts=attempts, attempt_ids=set(attempt_ids), acked=acked,
                 ack_sequence=ack_sequence)
 
+        # Per-device group-session delivery records. Older version-1 files
+        # predate the section: it is absent and treated as empty. A present
+        # section holds one record per (session, message, device); every
+        # record must name a stored group session, one of its stored
+        # messages, and a device frozen into the session's member snapshot,
+        # with the attempts counter agreeing with the dedup id list and the
+        # ack cursor mirroring the message sequence exactly as the live
+        # ack path writes it. Any contradiction refuses startup.
+        group_delivery: Dict[Tuple[str, str, str], MessageDelivery] = {}
+        for index, raw in enumerate(raw_group_delivery):
+            where = f"group_delivery[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            try:
+                g_session = raw["session_id"]
+                g_message = raw["message_id"]
+                g_device = raw["device_id"]
+                attempts = raw["attempts"]
+                attempt_ids = raw["attempt_ids"]
+                acked = raw["acked"]
+                ack_sequence = raw["ack_sequence"]
+            except KeyError as error:
+                raise ValueError(
+                    f"{where} missing field: {error.args[0]}") from None
+            if not (isinstance(g_session, str) and g_session
+                    and isinstance(g_message, str) and g_message
+                    and isinstance(g_device, str) and g_device):
+                raise ValueError(
+                    f"{where} session_id/message_id/device_id must be "
+                    "non-empty strings")
+            if not isinstance(attempts, int) or isinstance(attempts, bool) \
+                    or attempts < 0:
+                raise ValueError(
+                    f"{where} attempts must be a non-negative integer")
+            if not isinstance(attempt_ids, list) or not all(
+                    isinstance(value, str) and value for value in attempt_ids):
+                raise ValueError(
+                    f"{where} attempt_ids must be a list of non-empty strings")
+            if len(set(attempt_ids)) != len(attempt_ids):
+                raise ValueError(
+                    f"{where} attempt_ids must not contain duplicates")
+            # The counter is derived state: it must agree with the id list.
+            if attempts != len(attempt_ids):
+                raise ValueError(
+                    f"{where} attempts must equal the number of attempt_ids")
+            if not isinstance(acked, bool):
+                raise ValueError(f"{where} acked must be a boolean")
+            if not isinstance(ack_sequence, int) \
+                    or isinstance(ack_sequence, bool) or ack_sequence < 0:
+                raise ValueError(
+                    f"{where} ack_sequence must be a non-negative integer")
+            gkey = (g_session, g_message, g_device)
+            if gkey in group_delivery:
+                raise ValueError(
+                    f"duplicate group delivery record in state: {gkey}")
+            # The record belongs to a stored group session (never a 1:1 one)
+            # and to a message stored in that session's stream.
+            target_session = group_sessions.get(g_session)
+            if target_session is None:
+                raise ValueError(
+                    f"{where} references an unknown group session: "
+                    f"{g_session}")
+            target = next((m for m in messages.get(g_session, [])
+                           if m.message_id == g_message), None)
+            if target is None:
+                raise ValueError(
+                    f"{where} references an unknown message: {gkey}")
+            # Only a device frozen into the member snapshot can hold
+            # delivery state; later roster changes are irrelevant here.
+            if g_device not in target_session.members:
+                raise ValueError(
+                    f"{where} device is not a frozen member of the group "
+                    f"session: {g_device}")
+            # The ack cursor mirrors the message once acked and is 0 before.
+            if acked:
+                if ack_sequence != target.sequence:
+                    raise ValueError(
+                        f"{where} ack_sequence must equal the message "
+                        f"sequence {target.sequence}")
+            elif ack_sequence != 0:
+                raise ValueError(
+                    f"{where} ack_sequence must be 0 while not acked")
+            group_delivery[gkey] = MessageDelivery(
+                attempts=attempts, attempt_ids=set(attempt_ids), acked=acked,
+                ack_sequence=ack_sequence)
+
         # Per-device group-session sync cursors. Older version-1 files predate
         # the section: it is absent and treated as empty (every device starts
         # at cursor 0). A present section must be a list of well-formed
@@ -2402,5 +2531,6 @@ class DeviceStore:
             self._group_sessions = group_sessions
             self._messages = messages
             self._delivery = delivery
+            self._group_delivery = group_delivery
             self._used_nonces = used_nonces
             self._group_sync_cursors = group_sync_cursors
