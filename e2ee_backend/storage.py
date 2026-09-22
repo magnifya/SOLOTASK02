@@ -23,6 +23,7 @@ from .models import (
     Message,
     MessageDelivery,
     MessageSubmission,
+    MessageSyncCursor,
     PreKeyBatchClaim,
     PreKeyClaim,
     Session,
@@ -119,6 +120,13 @@ SYNC_DEVICE_UNKNOWN = "device_unknown"
 SYNC_DEVICE_INACTIVE = "device_inactive"
 SYNC_DEVICE_NOT_MEMBER = "device_not_member"
 SYNC_CURSOR_CONFLICT = "cursor_conflict"
+
+#: Outcome codes for unified 1:1/group-session message sync.
+MESSAGE_SYNC_SESSION_UNKNOWN = "session_unknown"
+MESSAGE_SYNC_DEVICE_UNKNOWN = "device_unknown"
+MESSAGE_SYNC_DEVICE_INACTIVE = "device_inactive"
+MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT = "device_not_participant"
+MESSAGE_SYNC_CURSOR_CONFLICT = "cursor_conflict"
 
 #: Outcome codes for group-session rotation.
 ROTATION_SESSION_UNKNOWN = "session_unknown"
@@ -223,6 +231,14 @@ class GroupSyncError(Exception):
         self.reason = reason
 
 
+class MessageSyncError(Exception):
+    """An atomic 1:1/group session sync/checkpoint failed; the cursor unchanged."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class GroupSessionRotationError(Exception):
     """An atomic group-session rotation failed; nothing was written."""
 
@@ -268,6 +284,10 @@ class DeviceStore:
         # Per-device group-session read cursors, keyed by
         # (session_id, device_id); created lazily on the first advance.
         self._group_sync_cursors: Dict[Tuple[str, str], GroupSyncCursor] = {}
+        # Per-device read cursors for the unified 1:1/group-session sync API
+        # (GET /v1/sessions/{id}/sync), keyed by (session_id, device_id);
+        # created lazily on the first advance.
+        self._message_sync_cursors: Dict[Tuple[str, str], MessageSyncCursor] = {}
         self._messages: Dict[str, List[Message]] = {}
         # Per-session set of nonces already accepted for replay protection.
         # Keyed independently of the streams so a nonce is scoped to a session.
@@ -1313,6 +1333,135 @@ class DeviceStore:
                                          updated_at=session.created_at)
             return self._checkpoint_view(session_id, device_id, record), advanced
 
+    # -- unified 1:1/group-session sync ------------------------------------
+
+    @staticmethod
+    def _message_sync_cursor_view(session_id: str, device_id: str,
+                                  record: MessageSyncCursor) -> Dict[str, Any]:
+        """Copy one unified sync checkpoint into its public four-field view."""
+        return {
+            "session_id": session_id,
+            "device_id": device_id,
+            "cursor": record.cursor,
+            "updated_at": record.updated_at,
+        }
+
+    def _authorize_message_sync_device(self, session_id: str,
+                                       device_id: str) -> str:
+        """Resolve a 1:1/group session and authorize a reading device.
+
+        Must be called while holding the store lock. Returns the anchor
+        session's ``created_at`` (the timestamp a never-advanced zero
+        checkpoint reports). An unknown session (neither a 1:1 nor a group
+        session) raises ``session_unknown``; an unknown/revoked device raises
+        ``device_unknown``/``device_inactive``. For a 1:1 session only its
+        initiator or recipient may sync; for a group session only a device
+        frozen into the member snapshot may (a removed member still syncs, a
+        later-added member cannot) — both failures raise
+        ``device_not_participant``.
+        """
+        session = self._sessions.get(session_id)
+        if session is not None:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            if device_id not in (session.initiator_device_id,
+                                 session.recipient_device_id):
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT)
+            return session.created_at
+        group_session = self._group_sessions.get(session_id)
+        if group_session is None:
+            raise MessageSyncError(MESSAGE_SYNC_SESSION_UNKNOWN)
+        device = self._find_device(device_id)
+        if device is None:
+            raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+        if device.revoked:
+            raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+        if device_id not in group_session.members:
+            raise MessageSyncError(MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT)
+        return group_session.created_at
+
+    def message_sync_page(self, session_id: str, device_id: str,
+                          after: Optional[int], limit: int) -> Dict[str, Any]:
+        """Atomically read one ascending unified sync page, advancing the cursor.
+
+        When *after* is ``None`` the device's stored cursor is the starting
+        point and advances to the page's last sequence (an empty page leaves
+        it unchanged). An explicit *after* is a one-off query: the stored
+        cursor is neither read nor moved. Works for both 1:1 and group
+        sessions; authorization is enforced under the same store lock.
+        """
+        with self._lock:
+            self._authorize_message_sync_device(session_id, device_id)
+            cursor_key = (session_id, device_id)
+            record = self._message_sync_cursors.get(cursor_key)
+            if after is None:
+                start = record.cursor if record is not None else 0
+                advance = True
+            else:
+                start = after
+                advance = False
+            stream = self._messages.get(session_id, [])
+            page = [m for m in stream if m.sequence > start][:limit]
+            next_cursor = page[-1].sequence if page else start
+            has_more = any(m.sequence > next_cursor for m in stream)
+            if advance and page and (record is None
+                                     or next_cursor > record.cursor):
+                if record is None:
+                    self._message_sync_cursors[cursor_key] = \
+                        MessageSyncCursor(cursor=next_cursor)
+                else:
+                    record.cursor = next_cursor
+                    record.updated_at = utc_now_iso()
+                self._notify_change()
+            return {
+                "messages": [self.message_view(m) for m in page],
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+            }
+
+    def message_sync_checkpoint(self, session_id: str, device_id: str,
+                                cursor: int
+                                ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically move a device's unified sync cursor forward, or confirm it.
+
+        *cursor* must not exceed the session's largest stored sequence. A
+        strictly greater cursor creates/advances the record (201, refreshed
+        ``updated_at``); an equal cursor is an idempotent no-op (200, the
+        timestamp untouched); a smaller cursor conflicts (409/cursor). The
+        authorization checks run first. Returns ``(view, advanced)``.
+        """
+        with self._lock:
+            anchor_created_at = self._authorize_message_sync_device(
+                session_id, device_id)
+            stream = self._messages.get(session_id, [])
+            max_sequence = stream[-1].sequence if stream else 0
+            if cursor > max_sequence:
+                raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
+            cursor_key = (session_id, device_id)
+            record = self._message_sync_cursors.get(cursor_key)
+            current = record.cursor if record is not None else 0
+            if cursor < current:
+                raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
+            advanced = cursor > current
+            if advanced:
+                if record is None:
+                    record = MessageSyncCursor(cursor=cursor)
+                    self._message_sync_cursors[cursor_key] = record
+                else:
+                    record.cursor = cursor
+                    record.updated_at = utc_now_iso()
+                self._notify_change()
+            if record is None:
+                # No cursor has ever been advanced: the checkpoint at 0 is an
+                # idempotent no-op anchored at the session's creation time.
+                record = MessageSyncCursor(cursor=0,
+                                           updated_at=anchor_created_at)
+            return self._message_sync_cursor_view(
+                session_id, device_id, record), advanced
+
     # -- messages ----------------------------------------------------------
 
     @staticmethod
@@ -1759,6 +1908,12 @@ class DeviceStore:
                 "cursor": record.cursor,
                 "updated_at": record.updated_at,
             } for (sid, did), record in self._group_sync_cursors.items()]
+            message_sync_cursors = [{
+                "session_id": sid,
+                "device_id": did,
+                "cursor": record.cursor,
+                "updated_at": record.updated_at,
+            } for (sid, did), record in self._message_sync_cursors.items()]
             message_submissions = [{
                 "request_id": r.request_id,
                 "session_id": r.session_id,
@@ -1781,6 +1936,7 @@ class DeviceStore:
                     "group_delivery": group_delivery,
                     "used_nonces": used_nonces,
                     "group_sync_cursors": group_sync_cursors,
+                    "message_sync_cursors": message_sync_cursors,
                     "message_submissions": message_submissions}
 
     def restore_state(self, state: Dict[str, Any]) -> None:
@@ -1808,6 +1964,7 @@ class DeviceStore:
         raw_group_delivery = state.get("group_delivery", [])
         raw_used_nonces = state.get("used_nonces")
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
+        raw_message_sync_cursors = state.get("message_sync_cursors", [])
         raw_message_submissions = state.get("message_submissions", [])
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -1821,6 +1978,7 @@ class DeviceStore:
                 and isinstance(raw_delivery, list)
                 and isinstance(raw_group_delivery, list)
                 and isinstance(raw_group_sync_cursors, list)
+                and isinstance(raw_message_sync_cursors, list)
                 and isinstance(raw_message_submissions, list)):
             raise ValueError("state document has a malformed top-level section")
 
@@ -2955,6 +3113,82 @@ class DeviceStore:
             group_sync_cursors[ckey] = GroupSyncCursor(
                 cursor=cursor, updated_at=updated_at)
 
+        # Per-device unified 1:1/group-session sync cursors written by
+        # GET /v1/sessions/{id}/sync and its checkpoint route. Older files
+        # predate the section: it is absent and treated as empty (every device
+        # starts at cursor 0). A present section must be a list of
+        # well-formed records — malformed records, a duplicate
+        # (session_id, device_id), a dangling session/device reference or a
+        # device that is not a session participant, a cursor past the
+        # session's max sequence, or an empty updated_at all make the
+        # document malformed and refuse startup rather than silently dropping
+        # the record.
+        message_sync_cursors: Dict[Tuple[str, str], MessageSyncCursor] = {}
+        for index, raw in enumerate(raw_message_sync_cursors):
+            if not isinstance(raw, dict):
+                raise ValueError(
+                    f"message_sync_cursors[{index}] must be an object")
+            try:
+                sid = raw["session_id"]
+                did = raw["device_id"]
+                cursor = raw["cursor"]
+                updated_at = raw["updated_at"]
+            except KeyError as error:
+                raise ValueError(
+                    f"message_sync_cursors[{index}] missing field: "
+                    f"{error.args[0]}") from None
+            if not (isinstance(sid, str) and sid
+                    and isinstance(did, str) and did):
+                raise ValueError(
+                    f"message_sync_cursors[{index}] session_id/device_id must "
+                    "be non-empty strings")
+            if not isinstance(cursor, int) or isinstance(cursor, bool) \
+                    or cursor < 0:
+                raise ValueError(
+                    f"message_sync_cursors[{index}] cursor must be a "
+                    "non-negative integer")
+            if not isinstance(updated_at, str) or not updated_at:
+                raise ValueError(
+                    f"message_sync_cursors[{index}] updated_at must be a "
+                    "non-empty string")
+            ckey = (sid, did)
+            if ckey in message_sync_cursors:
+                raise ValueError(
+                    f"duplicate message sync cursor in state: {ckey}")
+            # Association checks: a cursor belongs to a stored 1:1 or group
+            # session and to a registered device allowed to read it (an
+            # endpoint of a 1:1 session, or a frozen group member); its value
+            # cannot have passed the session's largest stored sequence.
+            target_11 = sessions.get(sid)
+            target_group = group_sessions.get(sid)
+            if target_11 is None and target_group is None:
+                raise ValueError(
+                    f"message_sync_cursors[{index}] references an unknown "
+                    f"session: {sid}")
+            device_key = device_index.get(did)
+            target_device = devices.get(device_key) if device_key else None
+            if target_device is None:
+                raise ValueError(
+                    f"message_sync_cursors[{index}] references an unknown "
+                    f"device: {did}")
+            if target_11 is not None:
+                is_participant = did in (target_11.initiator_device_id,
+                                         target_11.recipient_device_id)
+            else:
+                is_participant = did in target_group.members
+            if not is_participant:
+                raise ValueError(
+                    f"message_sync_cursors[{index}] device is not a "
+                    f"participant of the session: {did}")
+            stream = messages.get(sid, [])
+            max_sequence = stream[-1].sequence if stream else 0
+            if cursor > max_sequence:
+                raise ValueError(
+                    f"message_sync_cursors[{index}] cursor {cursor} exceeds "
+                    f"the session's max sequence {max_sequence}")
+            message_sync_cursors[ckey] = MessageSyncCursor(
+                cursor=cursor, updated_at=updated_at)
+
         with self._lock:
             self._devices = devices
             self._device_index = device_index
@@ -2977,4 +3211,5 @@ class DeviceStore:
             self._group_delivery = group_delivery
             self._used_nonces = used_nonces
             self._group_sync_cursors = group_sync_cursors
+            self._message_sync_cursors = message_sync_cursors
             self._message_submissions = message_submissions
