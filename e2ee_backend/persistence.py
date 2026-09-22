@@ -25,10 +25,12 @@ A crash between steps can leave ``.state-*.tmp`` (staged document) or
 :func:`attach_persistence` these are resolved by
 :func:`recover_crash_leftovers`: a valid formal file stays authoritative and
 the leftovers are removed; with the formal file missing the newest-mtime
-leftover that parses as version=1 and passes every semantic restore check is
-atomically recovered into place; with none valid the leftovers are removed and
-an empty state is created. An existing-but-corrupt formal file still makes
-startup refuse rather than being silently overwritten.
+leftover that parses as version=1, carries the cursor and ``key_events``
+sections (the footprint of one complete durable transaction), and passes
+every semantic restore check is atomically recovered into place; with none
+valid the leftovers are removed and an empty state is created. An
+existing-but-corrupt formal file still makes startup refuse rather than
+being silently overwritten.
 """
 from __future__ import annotations
 
@@ -243,6 +245,25 @@ def _read_version1_document(path: str) -> Optional[Dict[str, Any]]:
     return document
 
 
+def _candidate_is_section_complete(document: Dict[str, Any]) -> bool:
+    """Require the durable-transaction sections a real snapshot always has.
+
+    Every snapshot produced by :meth:`JsonStateStore.save` is one full
+    transaction and therefore carries the per-device sync cursor sections
+    (``group_sync_cursors`` and ``message_sync_cursors``) and the
+    ``key_events`` audit-chain section, each as a list — an empty list when
+    the section has no records, but never absent. A leftover that parses and
+    restores yet omits one of these sections is a partial/legacy document,
+    not a crashed atomic commit: recovering it could silently drop a device's
+    resume cursor or its audit chain, so it is not a valid crash-recovery
+    candidate (a section-less *formal* file is still loaded leniently on the
+    normal path; this gate applies only to leftover-snapshot recovery).
+    """
+    return all(isinstance(document.get(name), list)
+               for name in ("group_sync_cursors", "message_sync_cursors",
+                            "key_events"))
+
+
 def _document_restores(document: Dict[str, Any]) -> bool:
     """Full semantic verification against :meth:`DeviceStore.restore_state`.
 
@@ -301,9 +322,13 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
       normal load then refuses startup, so present state is never silently
       discarded (and its leftovers are kept for inspection).
     * With the formal file missing, candidates are tried newest-mtime-first;
-      the first that parses as version=1 *and* passes full semantic
-      verification is atomically ``os.replace``-d into place (plus a parent
-      directory fsync) and the remaining leftovers are removed.
+      the first that parses as version=1, explicitly carries the
+      ``group_sync_cursors``/``message_sync_cursors``/``key_events`` sections
+      (each a list — the footprint of one complete durable transaction), *and*
+      passes full semantic verification is atomically ``os.replace``-d into
+      place (plus a parent-directory fsync) and the remaining leftovers are
+      removed. A section-less legacy/partial snapshot is never promoted, so a
+      resume cursor or the audit chain cannot be silently lost.
     * When no candidate is valid, all leftovers are removed; the normal
       missing-file path in :func:`attach_persistence` then creates an empty
       state.
@@ -335,7 +360,9 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
     recovered = None
     for candidate in candidates:
         document = _read_version1_document(candidate)
-        if document is not None and _document_restores(document):
+        if (document is not None
+                and _candidate_is_section_complete(document)
+                and _document_restores(document)):
             recovered = candidate
             break
 
