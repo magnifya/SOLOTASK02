@@ -59,6 +59,7 @@ from .storage import (
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
     PREKEY_CONFLICT,
+    SUBMISSION_ID_CONFLICT,
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
     ROTATION_ACTOR_UNKNOWN,
@@ -106,6 +107,12 @@ _MESSAGE_CREATE_ERROR_MAP = {
     MESSAGE_DUPLICATE_ID: (409, "message_id"),
     MESSAGE_BAD_SEQUENCE: (409, "sequence"),
     MESSAGE_DUPLICATE_NONCE: (409, "nonce"),
+}
+
+#: Submit adds the idempotency-id conflict to the plain-append failures.
+_SUBMIT_ERROR_MAP = {
+    **_MESSAGE_CREATE_ERROR_MAP,
+    SUBMISSION_ID_CONFLICT: (409, "request_id"),
 }
 
 #: Maps a storage-level session failure reason to (HTTP status, field name).
@@ -1004,15 +1011,13 @@ class DeviceService:
 
     # -- messages ----------------------------------------------------------
 
-    def post_message(self, payload: object) -> Dict[str, Any]:
-        """Validate a message-send payload and atomically append the message.
+    @staticmethod
+    def _validate_message_envelope(payload: object) -> int:
+        """Validate the shared six message-envelope fields; return sequence.
 
-        ``sequence`` must continue the session's stream (starting at 1, no
-        gaps or duplicates), ``message_id`` must be unique within the session,
-        and ``nonce`` must not have been accepted before in the same session;
-        each violation is a 409 naming the offending field, as is a
-        revoked/unknown sender device. The identical nonce in a different
-        session is allowed.
+        Raises :class:`ServiceError` (400, naming the offending field) when
+        the body is not an object, a string field is missing/empty, or
+        ``sequence`` is missing/not an integer.
         """
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object",
@@ -1031,6 +1036,45 @@ class DeviceService:
         # bool is a subclass of int; reject it explicitly.
         if not isinstance(sequence, int) or isinstance(sequence, bool):
             raise ServiceError("field must be an integer: sequence", "sequence")
+        return sequence
+
+    @staticmethod
+    def _message_create_error(error: MessageCreateError,
+                              payload: Dict[str, Any],
+                              error_map: Dict[str, Tuple[int, str]]
+                              ) -> ServiceError:
+        """Translate a storage append/submit failure into a ServiceError."""
+        status_code, field = error_map[error.reason]
+        if error.reason == MESSAGE_SESSION_UNKNOWN:
+            message_text = f"session not found: {payload['session_id']}"
+        elif error.reason == MESSAGE_SENDER_INACTIVE:
+            message_text = "sender_device_id is not an active device"
+        elif error.reason == MESSAGE_DUPLICATE_ID:
+            message_text = (f"message_id already exists in session: "
+                            f"{payload['message_id']}")
+        elif error.reason == MESSAGE_BAD_SEQUENCE:
+            message_text = (f"sequence must continue the session stream "
+                            f"(got {payload['sequence']})")
+        elif error.reason == SUBMISSION_ID_CONFLICT:
+            message_text = ("request_id was already submitted with different "
+                            f"fields: {payload['request_id']}")
+        else:
+            message_text = (f"nonce already used in this session: "
+                            f"{payload['nonce']}")
+        return ServiceError(message_text, field, status_code=status_code)
+
+    def post_message(self, payload: object) -> Dict[str, Any]:
+        """Validate a message-send payload and atomically append the message.
+
+        ``sequence`` must continue the session's stream (starting at 1, no
+        gaps or duplicates), ``message_id`` must be unique within the session,
+        and ``nonce`` must not have been accepted before in the same session;
+        each violation is a 409 naming the offending field, as is a
+        revoked/unknown sender device. The identical nonce in a different
+        session is allowed.
+        """
+        sequence = self._validate_message_envelope(payload)
+        assert isinstance(payload, dict)  # narrowed by the validation above
 
         try:
             message = self.store.append_message(
@@ -1041,23 +1085,47 @@ class DeviceService:
                 payload["nonce"],
                 payload["ciphertext"])
         except MessageCreateError as error:
-            status_code, field = _MESSAGE_CREATE_ERROR_MAP[error.reason]
-            if error.reason == MESSAGE_SESSION_UNKNOWN:
-                message_text = f"session not found: {payload['session_id']}"
-            elif error.reason == MESSAGE_SENDER_INACTIVE:
-                message_text = "sender_device_id is not an active device"
-            elif error.reason == MESSAGE_DUPLICATE_ID:
-                message_text = (f"message_id already exists in session: "
-                                f"{payload['message_id']}")
-            elif error.reason == MESSAGE_BAD_SEQUENCE:
-                message_text = (f"sequence must continue the session stream "
-                                f"(got {sequence})")
-            else:
-                message_text = (f"nonce already used in this session: "
-                                f"{payload['nonce']}")
-            raise ServiceError(message_text, field, status_code=status_code)
+            raise self._message_create_error(
+                error, payload, _MESSAGE_CREATE_ERROR_MAP)
 
         return self.store.message_view(message)
+
+    def submit_message(self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate an idempotent submit payload and atomically commit it.
+
+        ``request_id`` must be a non-empty string; the six envelope fields
+        follow the plain ``post_message`` validation. A first-time
+        ``request_id`` commits message, sequence, nonce and idempotency
+        record in one locked transaction and returns ``(body, 201)`` with
+        ``request_id`` plus the seven message fields; any validation failure
+        leaves the id unconsumed. An exact replay of a committed id returns
+        the frozen first response with 200 — even if the sender device was
+        revoked meanwhile — while the same id carrying any changed field
+        (including another session) is a 409 naming ``request_id``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "request_id" not in payload:
+            raise ServiceError("missing required field: request_id",
+                               "request_id")
+        if not is_nonempty_string(payload["request_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: request_id", "request_id")
+        sequence = self._validate_message_envelope(payload)
+
+        try:
+            view, created = self.store.submit_message(
+                payload["request_id"],
+                payload["session_id"],
+                payload["sender_device_id"],
+                payload["message_id"],
+                sequence,
+                payload["nonce"],
+                payload["ciphertext"])
+        except MessageCreateError as error:
+            raise self._message_create_error(error, payload, _SUBMIT_ERROR_MAP)
+        return view, 201 if created else 200
 
     def list_messages(self, session_id: str, device_id: str, after: int,
                       limit: int) -> Dict[str, Any]:

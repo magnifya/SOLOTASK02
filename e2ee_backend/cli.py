@@ -275,6 +275,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_send_message.add_argument("--ciphertext", required=True)
     p_send_message.set_defaults(handler=cmd_send_message)
 
+    p_submit_message = sub.add_parser(
+        "submit-message",
+        help="submit an encrypted message envelope idempotently (request_id)")
+    p_submit_message.add_argument("--request-id", required=True)
+    p_submit_message.add_argument("--session-id", required=True)
+    p_submit_message.add_argument("--sender-device-id", required=True)
+    p_submit_message.add_argument("--message-id", required=True)
+    p_submit_message.add_argument("--sequence", required=True, type=int)
+    p_submit_message.add_argument("--nonce", required=True)
+    p_submit_message.add_argument("--ciphertext", required=True)
+    p_submit_message.set_defaults(handler=cmd_submit_message)
+
     p_pull_messages = sub.add_parser(
         "pull-messages", help="pull a page of messages from a session")
     p_pull_messages.add_argument("session_id")
@@ -751,6 +763,25 @@ def cmd_send_message(args: argparse.Namespace) -> int:
     stream = sys.stdout if status == 201 else sys.stderr
     print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
     return 0 if status == 201 else 1
+
+
+def cmd_submit_message(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages/submit; 201 (committed) or 200 (replay) succeed."""
+    payload = {
+        "request_id": args.request_id,
+        "session_id": args.session_id,
+        "sender_device_id": args.sender_device_id,
+        "message_id": args.message_id,
+        "sequence": args.sequence,
+        "nonce": args.nonce,
+        "ciphertext": args.ciphertext,
+    }
+    try:
+        status, response = _request_json(
+            "POST", f"{args.base_url}/v1/messages/submit", body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
 
 
 def cmd_pull_messages(args: argparse.Namespace) -> int:

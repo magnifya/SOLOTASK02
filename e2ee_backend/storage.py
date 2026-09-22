@@ -22,6 +22,7 @@ from .models import (
     GroupSyncCursor,
     Message,
     MessageDelivery,
+    MessageSubmission,
     PreKeyBatchClaim,
     PreKeyClaim,
     Session,
@@ -76,6 +77,10 @@ MESSAGE_SENDER_INACTIVE = "sender_inactive"
 MESSAGE_DUPLICATE_ID = "duplicate_message_id"
 MESSAGE_BAD_SEQUENCE = "bad_sequence"
 MESSAGE_DUPLICATE_NONCE = "duplicate_nonce"
+
+#: Outcome code for an idempotent submit whose request_id was already
+#: committed with different envelope fields (or in another session).
+SUBMISSION_ID_CONFLICT = "request_id_conflict"
 
 #: Outcome code for a failed message listing.
 MESSAGE_DEVICE_INACTIVE = "device_inactive"
@@ -266,6 +271,10 @@ class DeviceStore:
         # (session_id, device_id); created lazily on the first advance.
         self._group_sync_cursors: Dict[Tuple[str, str], GroupSyncCursor] = {}
         self._messages: Dict[str, List[Message]] = {}
+        # Idempotent message submissions keyed by the client-chosen
+        # request_id (globally unique across sessions). Each record was
+        # committed in the same locked transaction as the message it created.
+        self._message_submissions: Dict[str, MessageSubmission] = {}
         # Per-session set of nonces already accepted for replay protection.
         # Keyed independently of the streams so a nonce is scoped to a session.
         self._used_nonces: Dict[str, Set[str]] = {}
@@ -1321,6 +1330,59 @@ class DeviceStore:
             "created_at": message.created_at,
         }
 
+    def _append_message_locked(self, session_id: str, sender_device_id: str,
+                               message_id: str, sequence: int, nonce: str,
+                               ciphertext: str) -> Message:
+        """Validate and append one message; caller must hold the store lock.
+
+        Performs the session lookup, sender revocation/frozen-membership
+        check, duplicate-id check, sequence-continuity check and
+        session-scoped nonce-replay check in this one fixed priority order,
+        then appends the message and records its nonce. Does *not* fire the
+        change hook: the caller bundles the append with any further writes
+        (e.g. an idempotency record) into a single committed transaction.
+        On any failure nothing is written and :class:`MessageCreateError`
+        carries the reason.
+        """
+        group_session = self._group_sessions.get(session_id)
+        if session_id not in self._sessions and group_session is None:
+            raise MessageCreateError(MESSAGE_SESSION_UNKNOWN)
+
+        sender_key = self._device_index.get(sender_device_id)
+        sender = (self._devices.get(sender_key)
+                  if sender_key is not None else None)
+        if sender is None or sender.revoked:
+            raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
+        # Only devices frozen into a group session may post into it; a
+        # device removed after the freeze is rejected like an inactive one.
+        if (group_session is not None
+                and sender_device_id not in group_session.members):
+            raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
+
+        stream = self._messages.setdefault(session_id, [])
+        if any(m.message_id == message_id for m in stream):
+            raise MessageCreateError(MESSAGE_DUPLICATE_ID)
+        expected = stream[-1].sequence + 1 if stream else 1
+        if sequence != expected:
+            raise MessageCreateError(MESSAGE_BAD_SEQUENCE)
+        used_nonces = self._used_nonces.setdefault(session_id, set())
+        # Nonces are compared exactly as received (raw string equality);
+        # a replay neither appends a message nor advances any sequence.
+        if nonce in used_nonces:
+            raise MessageCreateError(MESSAGE_DUPLICATE_NONCE)
+
+        message = Message(
+            session_id=session_id,
+            sender_device_id=sender_device_id,
+            message_id=message_id,
+            sequence=sequence,
+            nonce=nonce,
+            ciphertext=ciphertext,
+        )
+        stream.append(message)
+        used_nonces.add(nonce)
+        return message
+
     def append_message(self, session_id: str, sender_device_id: str,
                        message_id: str, sequence: int, nonce: str,
                        ciphertext: str) -> Message:
@@ -1339,45 +1401,76 @@ class DeviceStore:
         :class:`MessageCreateError` carries the reason.
         """
         with self._lock:
-            group_session = self._group_sessions.get(session_id)
-            if session_id not in self._sessions and group_session is None:
-                raise MessageCreateError(MESSAGE_SESSION_UNKNOWN)
-
-            sender_key = self._device_index.get(sender_device_id)
-            sender = (self._devices.get(sender_key)
-                      if sender_key is not None else None)
-            if sender is None or sender.revoked:
-                raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
-            # Only devices frozen into a group session may post into it; a
-            # device removed after the freeze is rejected like an inactive one.
-            if (group_session is not None
-                    and sender_device_id not in group_session.members):
-                raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
-
-            stream = self._messages.setdefault(session_id, [])
-            if any(m.message_id == message_id for m in stream):
-                raise MessageCreateError(MESSAGE_DUPLICATE_ID)
-            expected = stream[-1].sequence + 1 if stream else 1
-            if sequence != expected:
-                raise MessageCreateError(MESSAGE_BAD_SEQUENCE)
-            used_nonces = self._used_nonces.setdefault(session_id, set())
-            # Nonces are compared exactly as received (raw string equality);
-            # a replay neither appends a message nor advances any sequence.
-            if nonce in used_nonces:
-                raise MessageCreateError(MESSAGE_DUPLICATE_NONCE)
-
-            message = Message(
-                session_id=session_id,
-                sender_device_id=sender_device_id,
-                message_id=message_id,
-                sequence=sequence,
-                nonce=nonce,
-                ciphertext=ciphertext,
-            )
-            stream.append(message)
-            used_nonces.add(nonce)
+            message = self._append_message_locked(
+                session_id, sender_device_id, message_id, sequence, nonce,
+                ciphertext)
             self._notify_change()
             return message
+
+    @staticmethod
+    def submission_view(record: MessageSubmission) -> Dict[str, Any]:
+        """Copy one submission record into its public eight-field view."""
+        return {
+            "request_id": record.request_id,
+            "session_id": record.session_id,
+            "sender_device_id": record.sender_device_id,
+            "message_id": record.message_id,
+            "sequence": record.sequence,
+            "nonce": record.nonce,
+            "ciphertext": record.ciphertext,
+            "created_at": record.created_at,
+        }
+
+    def submit_message(self, request_id: str, session_id: str,
+                       sender_device_id: str, message_id: str, sequence: int,
+                       nonce: str, ciphertext: str) -> Tuple[Dict[str, Any], bool]:
+        """Atomically submit one message with idempotency on ``request_id``.
+
+        A ``request_id`` never seen before is validated exactly like a plain
+        append (same fixed check order: unknown session, inactive sender,
+        duplicate message_id, bad sequence, duplicate nonce); on success the
+        message, its sequence position, its nonce and the idempotency record
+        are committed together under the store lock in one change
+        notification, so a durable-write failure rolls all of them back and
+        the ``request_id`` stays unconsumed. Returns ``(view, True)``.
+
+        A ``request_id`` that already has a committed record is a replay when
+        the six envelope fields match it exactly: the frozen first response
+        is returned with ``created`` False, without re-validating anything —
+        the record stays a valid replay even if the sender device was revoked
+        afterwards. The same id with any field changed (including a different
+        session) raises :class:`MessageCreateError` with
+        :data:`SUBMISSION_ID_CONFLICT`. Concurrent submits with the same id
+        are linearized by the store lock, so exactly one of them writes.
+        """
+        with self._lock:
+            record = self._message_submissions.get(request_id)
+            if record is not None:
+                if (record.session_id == session_id
+                        and record.sender_device_id == sender_device_id
+                        and record.message_id == message_id
+                        and record.sequence == sequence
+                        and record.nonce == nonce
+                        and record.ciphertext == ciphertext):
+                    return self.submission_view(record), False
+                raise MessageCreateError(SUBMISSION_ID_CONFLICT)
+
+            message = self._append_message_locked(
+                session_id, sender_device_id, message_id, sequence, nonce,
+                ciphertext)
+            record = MessageSubmission(
+                request_id=request_id,
+                session_id=message.session_id,
+                sender_device_id=message.sender_device_id,
+                message_id=message.message_id,
+                sequence=message.sequence,
+                nonce=message.nonce,
+                ciphertext=message.ciphertext,
+                created_at=message.created_at,
+            )
+            self._message_submissions[request_id] = record
+            self._notify_change()
+            return self.submission_view(record), True
 
     def message_page(self, session_id: str, device_id: str, after: int,
                      limit: int) -> Tuple[List[Dict[str, Any]], int]:
@@ -1650,6 +1743,16 @@ class DeviceStore:
                 } for m in stream]
                 for sid, stream in self._messages.items()
             }
+            message_submissions = [{
+                "request_id": r.request_id,
+                "session_id": r.session_id,
+                "sender_device_id": r.sender_device_id,
+                "message_id": r.message_id,
+                "sequence": r.sequence,
+                "nonce": r.nonce,
+                "ciphertext": r.ciphertext,
+                "created_at": r.created_at,
+            } for r in self._message_submissions.values()]
             delivery = [{
                 "session_id": sid,
                 "message_id": mid,
@@ -1686,6 +1789,7 @@ class DeviceStore:
                     "groups": groups, "group_sessions": group_sessions,
                     "group_session_rotations": group_session_rotations,
                     "messages": messages, "delivery": delivery,
+                    "message_submissions": message_submissions,
                     "group_delivery": group_delivery,
                     "used_nonces": used_nonces,
                     "group_sync_cursors": group_sync_cursors}
@@ -1711,6 +1815,7 @@ class DeviceStore:
         raw_group_session_rotations = state.get(
             "group_session_rotations", [])
         raw_messages = state.get("messages", {})
+        raw_message_submissions = state.get("message_submissions", [])
         raw_delivery = state.get("delivery", [])
         raw_group_delivery = state.get("group_delivery", [])
         raw_used_nonces = state.get("used_nonces")
@@ -1724,6 +1829,7 @@ class DeviceStore:
                 and isinstance(raw_group_sessions, list)
                 and isinstance(raw_group_session_rotations, list)
                 and isinstance(raw_messages, dict)
+                and isinstance(raw_message_submissions, list)
                 and isinstance(raw_delivery, list)
                 and isinstance(raw_group_delivery, list)
                 and isinstance(raw_group_sync_cursors, list)):
@@ -2541,6 +2647,68 @@ class DeviceStore:
                     ciphertext=ciphertext, created_at=created_at))
             messages[sid] = parsed
 
+        # Idempotent message submissions (version 1; older files predate the
+        # section, which is then absent and treated as empty). A present
+        # section is fully validated: request_id unique, the referenced
+        # session stored, the referenced message present in that session's
+        # stream, and the record's six envelope fields agreeing exactly with
+        # the stored message it created. Any contradiction refuses startup
+        # rather than silently dropping the idempotency guarantee.
+        message_submissions: Dict[str, MessageSubmission] = {}
+        for index, raw in enumerate(raw_message_submissions):
+            where = f"message_submissions[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            try:
+                request_id = raw["request_id"]
+                sub_session = raw["session_id"]
+                sub_sender = raw["sender_device_id"]
+                sub_message_id = raw["message_id"]
+                sub_sequence = raw["sequence"]
+                sub_nonce = raw["nonce"]
+                sub_ciphertext = raw["ciphertext"]
+                sub_created_at = raw["created_at"]
+            except KeyError as error:
+                raise ValueError(
+                    f"{where} missing field: {error.args[0]}") from None
+            if not all(isinstance(value, str) and value for value in (
+                    request_id, sub_session, sub_sender, sub_message_id,
+                    sub_nonce, sub_ciphertext, sub_created_at)):
+                raise ValueError(
+                    f"{where} string fields must be non-empty strings")
+            if not isinstance(sub_sequence, int) \
+                    or isinstance(sub_sequence, bool):
+                raise ValueError(f"{where} sequence must be an integer")
+            if request_id in message_submissions:
+                raise ValueError(
+                    f"duplicate message submission in state: {request_id}")
+            # The record belongs to a stored session and to a message stored
+            # in that session's stream; a dangling reference is corrupt.
+            if sub_session not in sessions and sub_session not in group_sessions:
+                raise ValueError(
+                    f"{where} references an unknown session: {sub_session}")
+            target = next((m for m in messages.get(sub_session, [])
+                           if m.message_id == sub_message_id), None)
+            if target is None:
+                raise ValueError(
+                    f"{where} references an unknown message: "
+                    f"{sub_message_id}")
+            # The frozen envelope must equal the message it stands for; a
+            # mismatch would let a replay return fields that were never
+            # committed.
+            if (target.sender_device_id != sub_sender
+                    or target.sequence != sub_sequence
+                    or target.nonce != sub_nonce
+                    or target.ciphertext != sub_ciphertext):
+                raise ValueError(
+                    f"{where} envelope fields do not match the stored "
+                    f"message")
+            message_submissions[request_id] = MessageSubmission(
+                request_id=request_id, session_id=sub_session,
+                sender_device_id=sub_sender, message_id=sub_message_id,
+                sequence=sub_sequence, nonce=sub_nonce,
+                ciphertext=sub_ciphertext, created_at=sub_created_at)
+
         # Session-scoped replay protection. Older version-1 files predate the
         # section: rebuild it from stored message history, which lists every
         # nonce ever accepted. A present section must map session_id to a
@@ -2705,12 +2873,23 @@ class DeviceStore:
             if target is None:
                 raise ValueError(
                     f"{where} references an unknown message: {gkey}")
-            # Only a device frozen into the member snapshot can hold
-            # delivery state; later roster changes are irrelevant here.
+            # The device must be registered (a record for a device that
+            # never existed is corrupt), frozen into the member snapshot
+            # (later roster changes are irrelevant here), and cannot be the
+            # message's own sender — a sender never holds delivery state for
+            # its own message. Revocation is *not* checked: a device revoked
+            # after the record was produced stays valid history, and the
+            # live write path keeps rejecting it with 409/device_id.
+            if g_device not in device_index:
+                raise ValueError(
+                    f"{where} references an unknown device: {g_device}")
             if g_device not in target_session.members:
                 raise ValueError(
                     f"{where} device is not a frozen member of the group "
                     f"session: {g_device}")
+            if g_device == target.sender_device_id:
+                raise ValueError(
+                    f"{where} device is the message's sender: {g_device}")
             # The ack cursor mirrors the message once acked and is 0 before.
             if acked:
                 if ack_sequence != target.sequence:
@@ -2807,6 +2986,7 @@ class DeviceStore:
                 rotation.successor_session_id: rotation
                 for rotation in group_session_rotations.values()}
             self._messages = messages
+            self._message_submissions = message_submissions
             self._delivery = delivery
             self._group_delivery = group_delivery
             self._used_nonces = used_nonces
