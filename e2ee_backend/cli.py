@@ -265,6 +265,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_checkpoint.add_argument("--cursor", required=True, type=int)
     p_sync_checkpoint.set_defaults(handler=cmd_sync_checkpoint)
 
+    p_sync_session_messages = sub.add_parser(
+        "sync-session-messages",
+        help="sync a page of a 1:1 or group session's messages for a device")
+    p_sync_session_messages.add_argument("session_id")
+    p_sync_session_messages.add_argument("--device-id", required=True)
+    p_sync_session_messages.add_argument(
+        "--after", type=int, default=None,
+        help="start after this sequence (default: use the device's stored "
+             "cursor and advance it)")
+    p_sync_session_messages.add_argument("--limit", type=int, default=100)
+    p_sync_session_messages.set_defaults(handler=cmd_sync_session_messages)
+
+    p_sync_session_checkpoint = sub.add_parser(
+        "sync-session-checkpoint",
+        help="move a device's session sync cursor forward (1:1 or group)")
+    p_sync_session_checkpoint.add_argument("session_id")
+    p_sync_session_checkpoint.add_argument("--device-id", required=True)
+    p_sync_session_checkpoint.add_argument("--cursor", required=True, type=int)
+    p_sync_session_checkpoint.set_defaults(
+        handler=cmd_sync_session_checkpoint)
+
     p_send_message = sub.add_parser(
         "send-message", help="send an encrypted message envelope into a session")
     p_send_message.add_argument("--session-id", required=True)
@@ -736,6 +757,44 @@ def cmd_sync_checkpoint(args: argparse.Namespace) -> int:
     from urllib.parse import quote
 
     url = (f"{args.base_url}/v1/group-sessions/"
+           f"{quote(args.session_id, safe='')}/sync/checkpoint")
+    payload = {"device_id": args.device_id, "cursor": args.cursor}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_sync_session_messages(args: argparse.Namespace) -> int:
+    """Call GET /v1/sessions/{sid}/sync (1:1 or group) and print single-line JSON.
+
+    With ``--after`` omitted the query carries no ``after`` parameter, so the
+    server starts from and advances the device's stored cursor; with
+    ``--after N`` it queries from N without moving the stored cursor.
+    """
+    from urllib.parse import quote, urlencode
+
+    params: Dict[str, Any] = {"device_id": args.device_id,
+                             "limit": args.limit}
+    if args.after is not None:
+        params["after"] = args.after
+    url = (f"{args.base_url}/v1/sessions/"
+           f"{quote(args.session_id, safe='')}/sync?{urlencode(params)}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def cmd_sync_session_checkpoint(args: argparse.Namespace) -> int:
+    """Call POST /v1/sessions/{sid}/sync/checkpoint (1:1 or group); 201/200 win."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/sessions/"
            f"{quote(args.session_id, safe='')}/sync/checkpoint")
     payload = {"device_id": args.device_id, "cursor": args.cursor}
     try:

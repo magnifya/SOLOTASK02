@@ -39,6 +39,11 @@ from .storage import (
     DELIVERY_SESSION_UNKNOWN,
     DEVICE_REVOKED,
     DEVICE_UNKNOWN,
+    MESSAGE_SYNC_CURSOR_CONFLICT,
+    MESSAGE_SYNC_DEVICE_INACTIVE,
+    MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT,
+    MESSAGE_SYNC_DEVICE_UNKNOWN,
+    MESSAGE_SYNC_SESSION_UNKNOWN,
     GROUP_ACTOR_NOT_CREATOR,
     GROUP_ACTOR_REVOKED,
     GROUP_ACTOR_UNKNOWN,
@@ -89,6 +94,7 @@ from .storage import (
     GroupSyncError,
     MessageCreateError,
     MessageListError,
+    MessageSyncError,
     PreKeyClaimError,
     PreKeyBatchClaimError,
     SessionCreateError,
@@ -1002,6 +1008,86 @@ class DeviceService:
                 session_id, payload["device_id"], cursor)
         except GroupSyncError as error:
             raise self._sync_error(error, session_id)
+        return view, 201 if advanced else 200
+
+    # -- unified session sync (1:1 and group sessions) --------------------
+
+    #: Maps a storage-level unified-sync failure to (HTTP status, field).
+    _MESSAGE_SYNC_ERROR_MAP = {
+        MESSAGE_SYNC_SESSION_UNKNOWN: (404, "session_id"),
+        MESSAGE_SYNC_DEVICE_UNKNOWN: (409, "device_id"),
+        MESSAGE_SYNC_DEVICE_INACTIVE: (409, "device_id"),
+        MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT: (409, "device_id"),
+        MESSAGE_SYNC_CURSOR_CONFLICT: (409, "cursor"),
+    }
+
+    def _message_sync_error(self, error: MessageSyncError,
+                            session_id: str) -> ServiceError:
+        """Translate a storage :class:`MessageSyncError` into a ServiceError."""
+        status_code, field = self._MESSAGE_SYNC_ERROR_MAP[error.reason]
+        if error.reason == MESSAGE_SYNC_SESSION_UNKNOWN:
+            text = f"session not found: {session_id}"
+        elif error.reason == MESSAGE_SYNC_CURSOR_CONFLICT:
+            text = "cursor is out of range or moved backwards"
+        elif error.reason == MESSAGE_SYNC_DEVICE_UNKNOWN:
+            text = "device_id is not a registered device"
+        elif error.reason == MESSAGE_SYNC_DEVICE_INACTIVE:
+            text = "device_id is revoked"
+        else:
+            text = "device_id is not a participant in this session"
+        return ServiceError(text, field, status_code=status_code)
+
+    def sync_session_messages(self, session_id: str, device_id: str,
+                              after: Optional[int], limit: int) -> Dict[str, Any]:
+        """Return one ascending sync page of a session's messages.
+
+        Works for both 1:1 and group sessions. With *after* ``None`` the
+        device's stored cursor is the start and is advanced under the store
+        lock (an empty page leaves it unchanged); an explicit non-negative
+        *after* queries from there without touching the stored cursor. A 1:1
+        session is readable by its initiator or recipient, a group session by
+        its frozen member set.
+        """
+        try:
+            return self.store.session_sync_page(
+                session_id, device_id, after, limit)
+        except MessageSyncError as error:
+            raise self._message_sync_error(error, session_id)
+
+    def sync_session_checkpoint(self, session_id: str,
+                                payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and move a device's unified session-sync cursor.
+
+        ``device_id`` must be a non-empty string and ``cursor`` an integer in
+        ``0..max_sequence``. A forward move returns 201 with a refreshed
+        ``updated_at``; an equal cursor returns 200 unchanged; a backward or
+        out-of-range cursor returns 409/field=cursor. Unknown session is
+        404/session_id; an unknown, revoked or non-participant device is
+        409/device_id.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id", "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        if "cursor" not in payload:
+            raise ServiceError("missing required field: cursor", "cursor")
+        cursor = payload["cursor"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(cursor, int) or isinstance(cursor, bool):
+            raise ServiceError("field must be an integer: cursor", "cursor")
+        if cursor < 0:
+            raise ServiceError("field must be a non-negative integer: cursor",
+                               "cursor")
+
+        try:
+            view, advanced = self.store.session_sync_checkpoint(
+                session_id, payload["device_id"], cursor)
+        except MessageSyncError as error:
+            raise self._message_sync_error(error, session_id)
         return view, 201 if advanced else 200
 
     # -- messages ----------------------------------------------------------

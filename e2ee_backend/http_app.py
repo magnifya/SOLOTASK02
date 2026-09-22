@@ -55,6 +55,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_create_sessions_from_batch_claim()
         elif path == _SESSIONS_FROM_CLAIM_PATH:
             self._handle_create_session_from_claim()
+        elif path.startswith(_SESSIONS_PATH + "/") \
+                and path.endswith("/sync/checkpoint"):
+            self._route_session_sync_checkpoint(path)
         elif path == _SESSIONS_PATH:
             self._handle_create_session()
         elif path == _MESSAGES_PATH:
@@ -126,6 +129,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                       -len("/sync/checkpoint")]
         if suffix and "/" not in suffix:
             self._handle_sync_checkpoint(unquote(suffix))
+        else:
+            self._send_json(404, {"message": "session not found",
+                                  "field": "session_id"})
+
+    def _route_session_sync_checkpoint(self, path: str) -> None:
+        suffix = path[len(_SESSIONS_PATH) + 1:-len("/sync/checkpoint")]
+        if suffix and "/" not in suffix:
+            self._handle_sync_session_checkpoint(unquote(suffix))
         else:
             self._send_json(404, {"message": "session not found",
                                   "field": "session_id"})
@@ -210,6 +221,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_show(unquote(suffix))
         elif path.startswith(_SESSIONS_PATH + "/"):
             suffix = path[len(_SESSIONS_PATH) + 1:]
+            if suffix.endswith("/sync"):
+                session_id = suffix[:-len("/sync")]
+                if not session_id or "/" in session_id:
+                    self._send_json(404, {"message": "session not found",
+                                          "field": "session_id"})
+                    return
+                self._handle_sync_session_messages(unquote(session_id))
+                return
             if not suffix or "/" in suffix:
                 self._send_json(404, {"message": "session not found",
                                       "field": "session_id"})
@@ -447,6 +466,31 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.sync_group_checkpoint(
+                session_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_sync_session_messages(self, session_id: str) -> None:
+        params = self._sync_query_params()
+        if params is None:
+            return  # a 400 response was already sent
+        device_id, after, limit = params
+        try:
+            body = self.service.sync_session_messages(
+                session_id, device_id, after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_sync_session_checkpoint(self, session_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.sync_session_checkpoint(
                 session_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
