@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 
 def utc_now_iso() -> str:
@@ -50,6 +50,29 @@ class Device:
     def __post_init__(self) -> None:
         if self.rotated_at is None:
             self.rotated_at = self.registered_at
+
+
+@dataclass
+class KeyEvent:
+    """One link of a device's append-only key-audit chain.
+
+    Every committed key-material change of a device (registration, identity
+    rotation, pre-key add/revoke, device revoke) appends exactly one event.
+    ``seq`` starts at 1 and advances by one per event; ``prev_hash`` is empty
+    for the first event and afterwards chains to the previous event's
+    ``hash``. ``hash`` is the lowercase hex SHA-256 of the UTF-8 canonical
+    JSON of the event without the ``hash`` field (keys sorted, compact
+    separators, Unicode written as-is). Only public key material and
+    identifiers are ever recorded.
+    """
+
+    device_id: str
+    seq: int
+    type: str
+    payload: Dict[str, Any]
+    prev_hash: str
+    hash: str
+    created_at: str = field(default_factory=utc_now_iso)
 
 
 @dataclass

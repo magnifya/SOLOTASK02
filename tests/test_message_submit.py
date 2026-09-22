@@ -411,6 +411,10 @@ class GroupDeliveryRecoveryTest(unittest.TestCase):
         for device in document["devices"]:
             if device["device_id"] == "alice":
                 device["revoked"] = True
+        # The revocation is simulated as predating the key-audit feature: a
+        # legacy version-1 file carries no key_events section, so no chain
+        # has to account for the revoked flag.
+        document.pop("key_events", None)
         store = DeviceStore()
         payload = {key: value for key, value in document.items()
                    if key != "version"}

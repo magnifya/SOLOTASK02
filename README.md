@@ -74,6 +74,7 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 - 持久化：`serve --data-file PATH`（缺省取 `$E2EE_DATA_FILE`，再缺省为纯内存）。状态文件 `version=1` JSON，缺失自动创建，损坏/非对象/版本不符拒绝启动；每次变更临时文件 + fsync + `os.replace` 原子替换。重启恢复设备（含 `identity_key` 与 `rotated_at`）、预密钥（含新增与撤销标记）、会话、消息与序号游标、会话级已用 nonce 集合，以及投递去重集合、`attempts`、acked 与设备撤销状态。群组与冻结群会话快照、群会话轮换记录（含无分叉与冻结值校验）、每设备群会话同步游标（`group_sync_cursors`，含 `cursor`/`updated_at`）以及兼容 1:1/群组会话的统一同步游标（`message_sync_cursors`，结构与校验同上）同样恢复；重启后默认同步从各设备保存游标继续，显式 `after` 仍只查询。缺少已用 nonce 集合字段的旧 version=1 文件可正常加载并由历史消息重建该集合；该字段存在但结构畸形仍视为损坏并拒绝启动。缺少 `group_sync_cursors`/`message_sync_cursors` 字段的旧 version=1 文件按空加载（各设备游标视为 0）；任一字段存在但记录畸形、字段缺失/类型错误、cursor 越界（含空会话）、键重复或关联（会话/设备/参与者）对不上时拒绝启动，且不覆盖原文件。
 - 持久化事务与故障恢复：同步默认推进、检查点前进、设备撤销等变更与落盘在同一存储锁事务内线性化；临时文件写入/fsync/`os.replace` 失败时返回 `503/field=data_file`，内存回滚到上一个已持久化状态、旧文件保留、临时文件清理，失败不推进内存或文件；与撤销并发只能得到成功（游标落盘）或 `409/field=device_id`。未启用持久化时保持既有行为，无 503。
 - 命令行 `encrypt-message` / `decrypt-message` 为纯本地 AES-256-GCM 加解密（不访问服务器）：`--session-id`、`--key`（base64 编码的 32 字节密钥）、`--plaintext`（UTF-8）→ 输出 `session_id`/`nonce`（12 字节，base64）/`ciphertext`（base64，末尾附 16 字节 GCM tag）；`decrypt-message` 额外接收 `--nonce`/`--ciphertext` → 输出 `session_id`/`plaintext`。`session_id` 的 UTF-8 字节作为 AAD 参与认证。任何失败在 stderr 打印带 `field` 的单行 JSON 并以非零码退出。
+- 设备密钥审计链：注册、身份轮换、新增预密钥、预密钥撤销、设备撤销各自在提交时向该设备的审计链追加一条事件（链按 `device_id` 隔离；幂等重放与失败不追加）。事件含 `device_id`/`seq`/`type`/`payload`/`prev_hash`/`hash`/`created_at` 七字段；`seq` 从 1 连续，首事件 `prev_hash` 为空串，之后链接前一事件的 `hash`。`payload`：`registered` 为注册体的身份公钥与有序预密钥，`identity_rotated` 为 `old_identity_key`/`new_identity_key`，`prekey_added`/`prekey_revoked` 为 `key_id`+公钥，`device_revoked` 为空对象（一条事件全撤）。`hash` 为去掉 `hash` 字段后按键排序、紧凑分隔、Unicode 原样 JSON 的 UTF-8 SHA-256 小写 hex。事件与状态变更在同一存储锁事务内提交，落盘失败 `503/field=data_file` 并随整体状态回滚。`GET /v1/devices/{device_id}/key-events`：`after` 默认 0（须 ≥0），`limit` 默认 100（1..100），非法 `400/field=对应参数`，未知设备 `404/field=device_id`，已撤销设备仍可读；返回 `seq > after` 的前 `limit` 条及 `next_after`（空页等于 `after`）与 `has_more`。命令行 `key-events DEVICE_ID [--after N] [--limit N]` 与该接口对应。事件持久化于 version=1 可选段 `key_events`，旧文件缺段按空加载；段存在时恢复校验字段/设备引用/seq 连续与 prev_hash/hash 链，并重放每条链核对身份公钥、预密钥顺序/公钥/撤销标记与设备撤销状态，矛盾拒绝启动且不改动原文件。
 - 服务端仅保存标识与公开密钥（identity key、signed pre-key、临时公钥均为公钥），不保存私钥、共享秘密或明文消息。存储线程安全；默认进程内，`serve --data-file`/`$E2EE_DATA_FILE` 时持久化到 version=1 JSON 文件并在重启后完整恢复。
 
 ## 安装依赖
@@ -270,11 +271,11 @@ python3 -m unittest discover -s tests -v
 ```
 e2ee_backend/
   crypto.py       # cryptography 公钥解析/校验（PEM、DER、原始曲线点）与 AES-256-GCM 本地加解密
-  models.py       # Device / SignedPreKey / Session / Group / GroupSession / GroupSessionRotation / GroupSyncCursor / Message / MessageSubmission / MessageDelivery 数据模型
+  models.py       # Device / SignedPreKey / KeyEvent / Session / Group / GroupSession / GroupSessionRotation / GroupSyncCursor / Message / MessageSubmission / MessageDelivery 数据模型
   storage.py      # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、群组与冻结群会话、群会话轮换（幂等重放、无分叉）、消息原子追加与分页（群组会话限冻结成员）、幂等消息提交（request_id 重放/冲突）、投递去重/确认、群会话按设备同步分页与检查点游标、整体状态快照与恢复）
   persistence.py  # version=1 JSON 状态文件：缺失创建、损坏/版本不符拒启、临时文件+fsync+硬链接备份+os.replace+父目录 fsync 原子替换，启动清理/恢复崩溃遗留快照
   service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/群组/群会话/群会话轮换/消息/投递/群同步）
   http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、群组创建/查询/成员增删、群组会话协商/查询/轮换、消息投递/幂等提交与拉取、重试/确认/状态、群会话同步与检查点）
-  cli.py          # register/show/revoke-*/rotate-identity-key/add-prekey/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
+  cli.py          # register/show/key-events/revoke-*/rotate-identity-key/add-prekey/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
 tests/            # unittest 测试
 ```

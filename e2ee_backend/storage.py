@@ -6,6 +6,8 @@ order, so repeated requests list them identically.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -20,6 +22,7 @@ from .models import (
     GroupSession,
     GroupSessionRotation,
     GroupSyncCursor,
+    KeyEvent,
     Message,
     MessageDelivery,
     MessageSubmission,
@@ -136,6 +139,45 @@ ROTATION_ACTOR_NOT_CREATOR = "actor_not_creator"
 ROTATION_REVISION_MISMATCH = "revision_mismatch"
 ROTATION_ID_CONFLICT = "rotation_id_conflict"
 ROTATION_PREDECESSOR_ROTATED = "predecessor_rotated"
+
+#: Key-audit event types (the ``type`` field of a :class:`KeyEvent`).
+KEY_EVENT_REGISTERED = "registered"
+KEY_EVENT_IDENTITY_ROTATED = "identity_rotated"
+KEY_EVENT_PREKEY_ADDED = "prekey_added"
+KEY_EVENT_PREKEY_REVOKED = "prekey_revoked"
+KEY_EVENT_DEVICE_REVOKED = "device_revoked"
+
+#: All five key-audit event types, for restore-time validation.
+KEY_EVENT_TYPES = frozenset({
+    KEY_EVENT_REGISTERED,
+    KEY_EVENT_IDENTITY_ROTATED,
+    KEY_EVENT_PREKEY_ADDED,
+    KEY_EVENT_PREKEY_REVOKED,
+    KEY_EVENT_DEVICE_REVOKED,
+})
+
+
+def key_event_hash(device_id: str, seq: int, event_type: str,
+                   payload: Dict[str, Any], prev_hash: str,
+                   created_at: str) -> str:
+    """Compute the chain hash of one key-audit event.
+
+    The hashed document is the event *without* its ``hash`` field,
+    serialized as canonical JSON — keys sorted, compact separators, Unicode
+    written as-is — encoded as UTF-8 and digested with SHA-256, rendered as
+    lowercase hex.
+    """
+    document = {
+        "device_id": device_id,
+        "seq": seq,
+        "type": event_type,
+        "payload": payload,
+        "prev_hash": prev_hash,
+        "created_at": created_at,
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class SessionCreateError(Exception):
@@ -302,6 +344,11 @@ class DeviceStore:
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
         self._group_delivery: Dict[Tuple[str, str, str], MessageDelivery] = {}
+        # Append-only key-audit chains, keyed by device_id. Each committed
+        # key-material change of a device appends exactly one event, inside
+        # the same locked transaction as the mutation itself, so the chain
+        # is persisted and rolled back together with the rest of the state.
+        self._key_events: Dict[str, List[KeyEvent]] = {}
         # Called (under the lock) after any state mutation, for persistence.
         self.on_change: Optional[Callable[[], None]] = None
 
@@ -309,6 +356,28 @@ class DeviceStore:
         """Invoke the persistence hook after a committed mutation."""
         if self.on_change is not None:
             self.on_change()
+
+    def _append_key_event(self, device_id: str, event_type: str,
+                          payload: Dict[str, Any]) -> KeyEvent:
+        """Append one event to a device's key-audit chain. Lock required.
+
+        The event's ``seq`` continues the chain (starting at 1); its
+        ``prev_hash`` is empty for the first event and the previous event's
+        ``hash`` afterwards. The caller appends only for real state
+        transitions — idempotent replays and failed operations add nothing.
+        """
+        chain = self._key_events.setdefault(device_id, [])
+        seq = len(chain) + 1
+        prev_hash = chain[-1].hash if chain else ""
+        created_at = utc_now_iso()
+        event = KeyEvent(
+            device_id=device_id, seq=seq, type=event_type, payload=payload,
+            prev_hash=prev_hash,
+            hash=key_event_hash(device_id, seq, event_type, payload,
+                                prev_hash, created_at),
+            created_at=created_at)
+        chain.append(event)
+        return event
 
     def add_device(self, device: Device) -> bool:
         """Insert a device.
@@ -322,6 +391,12 @@ class DeviceStore:
                 return False
             self._devices[key] = device
             self._device_index[device.device_id] = key
+            self._append_key_event(
+                device.device_id, KEY_EVENT_REGISTERED,
+                {"identity_key": device.identity_key,
+                 "signed_prekeys": [{"key_id": pk.key_id,
+                                     "public_key": pk.public_key}
+                                    for pk in device.prekeys]})
             self._notify_change()
             return True
 
@@ -367,9 +442,14 @@ class DeviceStore:
             device = self._devices.get(key) if key is not None else None
             if device is None:
                 return None
-            device.revoked = True
-            for prekey in device.prekeys:
-                prekey.revoked = True
+            if not device.revoked:
+                device.revoked = True
+                for prekey in device.prekeys:
+                    prekey.revoked = True
+                # One event covers the whole revocation: the empty payload
+                # marks the device and every pre-key of it revoked at once.
+                self._append_key_event(
+                    device_id, KEY_EVENT_DEVICE_REVOKED, {})
             self._notify_change()
             return device
 
@@ -388,7 +468,12 @@ class DeviceStore:
                 return None, False
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
-                    prekey.revoked = True
+                    if not prekey.revoked:
+                        prekey.revoked = True
+                        self._append_key_event(
+                            device_id, KEY_EVENT_PREKEY_REVOKED,
+                            {"key_id": prekey.key_id,
+                             "public_key": prekey.public_key})
                     self._notify_change()
                     return device, True
             return device, False
@@ -421,8 +506,13 @@ class DeviceStore:
                 raise DeviceUpdateError(DEVICE_REVOKED)
             changed = identity_key != device.identity_key
             if changed:
+                old_identity_key = device.identity_key
                 device.identity_key = identity_key
                 device.rotated_at = utc_now_iso()
+                self._append_key_event(
+                    device_id, KEY_EVENT_IDENTITY_ROTATED,
+                    {"old_identity_key": old_identity_key,
+                     "new_identity_key": identity_key})
                 self._notify_change()
             return self.identity_view(device), changed
 
@@ -455,6 +545,9 @@ class DeviceStore:
                 raise DeviceUpdateError(PREKEY_CONFLICT)
             prekey = SignedPreKey(key_id=key_id, public_key=public_key)
             device.prekeys.append(prekey)
+            self._append_key_event(
+                device_id, KEY_EVENT_PREKEY_ADDED,
+                {"key_id": key_id, "public_key": public_key})
             self._notify_change()
             return ({"device_id": device.device_id,
                      "key_id": prekey.key_id,
@@ -478,6 +571,43 @@ class DeviceStore:
                                if not pk.revoked and not pk.consumed],
                 "registered_at": device.registered_at,
             }
+
+    # -- key-audit chain ---------------------------------------------------
+
+    @staticmethod
+    def key_event_view(event: KeyEvent) -> Dict[str, Any]:
+        """Copy one key-audit event into its public seven-field view."""
+        return {
+            "device_id": event.device_id,
+            "seq": event.seq,
+            "type": event.type,
+            "payload": event.payload,
+            "prev_hash": event.prev_hash,
+            "hash": event.hash,
+            "created_at": event.created_at,
+        }
+
+    def key_events_page(self, device_id: str, after: int, limit: int
+                        ) -> Optional[Tuple[List[Dict[str, Any]], int, bool]]:
+        """Atomically read one ascending page of a device's key-audit chain.
+
+        Returns ``(event_views, next_after, has_more)``: the events with
+        ``seq > after`` (ascending, at most *limit*), the sequence to resume
+        from — the last returned ``seq``, or *after* itself when the page is
+        empty — and whether further events follow. ``None`` when the device
+        id is unknown. A revoked device's chain stays readable. The lookup
+        and the page copy run under the store lock, so a concurrent append
+        is linearized either wholly before or wholly after this read.
+        """
+        with self._lock:
+            if device_id not in self._device_index:
+                return None
+            chain = self._key_events.get(device_id, [])
+            page = [event for event in chain if event.seq > after][:limit]
+            next_after = page[-1].seq if page else after
+            has_more = any(event.seq > next_after for event in chain)
+            return ([self.key_event_view(event) for event in page],
+                    next_after, has_more)
 
     # -- pre-key claims ----------------------------------------------------
 
@@ -1924,6 +2054,10 @@ class DeviceStore:
                 "ciphertext": r.ciphertext,
                 "created_at": r.created_at,
             } for r in self._message_submissions.values()]
+            key_events = [
+                self.key_event_view(event)
+                for chain in self._key_events.values() for event in chain
+            ]
             return {"devices": devices, "sessions": sessions,
                     "prekey_claims": prekey_claims,
                     "prekey_batch_claims": prekey_batch_claims,
@@ -1937,7 +2071,149 @@ class DeviceStore:
                     "used_nonces": used_nonces,
                     "group_sync_cursors": group_sync_cursors,
                     "message_sync_cursors": message_sync_cursors,
-                    "message_submissions": message_submissions}
+                    "message_submissions": message_submissions,
+                    "key_events": key_events}
+
+    @staticmethod
+    def _replay_key_events(device: Device, chain: List[KeyEvent]) -> None:
+        """Replay one device's key-audit chain against its stored record.
+
+        Rebuilds the device's key material from an empty state by applying
+        each event in sequence — ``registered`` seeds the identity key and
+        the ordered pre-key list, ``identity_rotated`` replaces the identity
+        key (its ``old_identity_key`` must match the replayed current one),
+        ``prekey_added`` appends, ``prekey_revoked`` marks one key, and
+        ``device_revoked`` (empty payload) revokes the device and every key.
+        The replay applies the same rules the live mutations enforce: no
+        event may follow a device revocation, a revoked key is never
+        re-revoked, and a pre-key id is never added twice. The replayed
+        final state must equal *device*'s stored identity key, pre-key
+        order/public keys/revocation flags and revocation flag; any
+        contradiction raises :class:`ValueError`.
+        """
+        where = f"key_events chain of device {device.device_id}"
+        identity_key: Optional[str] = None
+        prekeys: List[Dict[str, Any]] = []
+        device_revoked = False
+        for position, event in enumerate(chain):
+            payload = event.payload
+            if device_revoked:
+                raise ValueError(
+                    f"{where} has an event after the device revocation")
+            if event.type == KEY_EVENT_REGISTERED:
+                if position != 0:
+                    raise ValueError(
+                        f"{where} must start with a registered event")
+                new_identity = payload.get("identity_key")
+                if not isinstance(new_identity, str) or not new_identity:
+                    raise ValueError(
+                        f"{where} registered payload identity_key must be a "
+                        f"non-empty string")
+                raw_prekeys = payload.get("signed_prekeys")
+                if not isinstance(raw_prekeys, list):
+                    raise ValueError(
+                        f"{where} registered payload signed_prekeys must be "
+                        f"a list")
+                seen_key_ids: Set[str] = set()
+                for pk_index, element in enumerate(raw_prekeys):
+                    if not isinstance(element, dict):
+                        raise ValueError(
+                            f"{where} registered signed_prekeys[{pk_index}] "
+                            f"must be an object")
+                    key_id = element.get("key_id")
+                    public_key = element.get("public_key")
+                    if not isinstance(key_id, str) or not key_id:
+                        raise ValueError(
+                            f"{where} registered signed_prekeys[{pk_index}]"
+                            f".key_id must be a non-empty string")
+                    if not isinstance(public_key, str) or not public_key:
+                        raise ValueError(
+                            f"{where} registered signed_prekeys[{pk_index}]"
+                            f".public_key must be a non-empty string")
+                    if key_id in seen_key_ids:
+                        raise ValueError(
+                            f"{where} registered payload repeats key_id "
+                            f"{key_id}")
+                    seen_key_ids.add(key_id)
+                    prekeys.append({"key_id": key_id,
+                                    "public_key": public_key,
+                                    "revoked": False})
+                identity_key = new_identity
+            elif event.type == KEY_EVENT_IDENTITY_ROTATED:
+                old_identity = payload.get("old_identity_key")
+                new_identity = payload.get("new_identity_key")
+                if not isinstance(old_identity, str) or not old_identity \
+                        or not isinstance(new_identity, str) \
+                        or not new_identity:
+                    raise ValueError(
+                        f"{where} identity_rotated payload keys must be "
+                        f"non-empty strings")
+                if old_identity != identity_key:
+                    raise ValueError(
+                        f"{where} identity_rotated old_identity_key does "
+                        f"not match the replayed identity key")
+                identity_key = new_identity
+            elif event.type == KEY_EVENT_PREKEY_ADDED:
+                key_id = payload.get("key_id")
+                public_key = payload.get("public_key")
+                if not isinstance(key_id, str) or not key_id \
+                        or not isinstance(public_key, str) or not public_key:
+                    raise ValueError(
+                        f"{where} prekey_added payload key_id/public_key "
+                        f"must be non-empty strings")
+                if any(pk["key_id"] == key_id for pk in prekeys):
+                    raise ValueError(
+                        f"{where} prekey_added repeats key_id {key_id}")
+                prekeys.append({"key_id": key_id, "public_key": public_key,
+                                "revoked": False})
+            elif event.type == KEY_EVENT_PREKEY_REVOKED:
+                key_id = payload.get("key_id")
+                public_key = payload.get("public_key")
+                if not isinstance(key_id, str) or not key_id \
+                        or not isinstance(public_key, str) or not public_key:
+                    raise ValueError(
+                        f"{where} prekey_revoked payload key_id/public_key "
+                        f"must be non-empty strings")
+                target = next((pk for pk in prekeys
+                               if pk["key_id"] == key_id), None)
+                if target is None:
+                    raise ValueError(
+                        f"{where} prekey_revoked names an unknown pre-key "
+                        f"{key_id}")
+                if target["public_key"] != public_key:
+                    raise ValueError(
+                        f"{where} prekey_revoked public_key does not match "
+                        f"the added pre-key {key_id}")
+                if target["revoked"]:
+                    raise ValueError(
+                        f"{where} prekey_revoked repeats the revocation of "
+                        f"{key_id}")
+                target["revoked"] = True
+            else:  # KEY_EVENT_DEVICE_REVOKED
+                if payload != {}:
+                    raise ValueError(
+                        f"{where} device_revoked payload must be empty")
+                device_revoked = True
+                for pk in prekeys:
+                    pk["revoked"] = True
+        if chain and chain[0].type != KEY_EVENT_REGISTERED:
+            raise ValueError(f"{where} must start with a registered event")
+        if identity_key != device.identity_key:
+            raise ValueError(
+                f"{where} replays to a different identity key than the "
+                f"devices section")
+        if len(prekeys) != len(device.prekeys) or any(
+                replayed["key_id"] != stored.key_id
+                or replayed["public_key"] != stored.public_key
+                or replayed["revoked"] != stored.revoked
+                for replayed, stored in zip(prekeys, device.prekeys)):
+            raise ValueError(
+                f"{where} replays to different pre-keys than the devices "
+                f"section")
+        if device_revoked != device.revoked:
+            raise ValueError(
+                f"{where} replays to a different revocation state than the "
+                f"devices section")
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         """Replace all in-memory state from a persisted (version-stripped) doc.
@@ -1966,6 +2242,7 @@ class DeviceStore:
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
         raw_message_sync_cursors = state.get("message_sync_cursors", [])
         raw_message_submissions = state.get("message_submissions", [])
+        raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
                 and isinstance(raw_prekey_batch_claims, list)
@@ -3189,6 +3466,89 @@ class DeviceStore:
             message_sync_cursors[ckey] = MessageSyncCursor(
                 cursor=cursor, updated_at=updated_at)
 
+        # Per-device key-audit chains. Older version-1 files predate the
+        # section: it is absent and treated as empty, with no chain
+        # completeness enforced. A present section is fully validated —
+        # field types, a reference to a registered device, the recomputed
+        # event hash, per-device seq 1..N consecutiveness and prev_hash
+        # linkage — and every chain is replayed from scratch: the replayed
+        # identity key, pre-key order/public keys/revocation flags and the
+        # device revocation flag must reproduce the devices section exactly.
+        # When the section is present every registered device must have a
+        # chain (this server appends ``registered`` at registration time).
+        # Any contradiction makes the document malformed: startup is refused
+        # and the file is left untouched.
+        key_events: Dict[str, List[KeyEvent]] = {}
+        if raw_key_events is not None:
+            if not isinstance(raw_key_events, list):
+                raise ValueError(
+                    "state document has a malformed top-level section")
+            events_by_device: Dict[str, List[KeyEvent]] = {}
+            for index, raw in enumerate(raw_key_events):
+                where = f"key_events[{index}]"
+                if not isinstance(raw, dict):
+                    raise ValueError(f"{where} must be an object")
+                event_device_id = raw.get("device_id")
+                event_type = raw.get("type")
+                payload = raw.get("payload")
+                prev_hash = raw.get("prev_hash")
+                event_hash = raw.get("hash")
+                created_at = raw.get("created_at")
+                seq = raw.get("seq")
+                if not isinstance(event_device_id, str) or not event_device_id:
+                    raise ValueError(
+                        f"{where}.device_id must be a non-empty string")
+                if not isinstance(seq, int) or isinstance(seq, bool) \
+                        or seq < 1:
+                    raise ValueError(
+                        f"{where}.seq must be a positive integer")
+                if event_type not in KEY_EVENT_TYPES:
+                    raise ValueError(
+                        f"{where}.type must be one of "
+                        f"{sorted(KEY_EVENT_TYPES)}")
+                if not isinstance(payload, dict):
+                    raise ValueError(f"{where}.payload must be an object")
+                if not isinstance(prev_hash, str):
+                    raise ValueError(f"{where}.prev_hash must be a string")
+                if not isinstance(event_hash, str) or not event_hash:
+                    raise ValueError(
+                        f"{where}.hash must be a non-empty string")
+                if not isinstance(created_at, str) or not created_at:
+                    raise ValueError(
+                        f"{where}.created_at must be a non-empty string")
+                if event_device_id not in device_index:
+                    raise ValueError(
+                        f"{where} references an unknown device: "
+                        f"{event_device_id}")
+                if key_event_hash(event_device_id, seq, event_type, payload,
+                                  prev_hash, created_at) != event_hash:
+                    raise ValueError(
+                        f"{where}.hash does not match the event contents")
+                events_by_device.setdefault(event_device_id, []).append(
+                    KeyEvent(device_id=event_device_id, seq=seq,
+                             type=event_type, payload=payload,
+                             prev_hash=prev_hash, hash=event_hash,
+                             created_at=created_at))
+            for chained_device in device_index:
+                if chained_device not in events_by_device:
+                    raise ValueError(
+                        f"device has no key_events chain: {chained_device}")
+            for event_device_id, chain in events_by_device.items():
+                chain.sort(key=lambda event: event.seq)
+                for position, event in enumerate(chain):
+                    if event.seq != position + 1:
+                        raise ValueError(
+                            f"key_events chain of device {event_device_id} "
+                            f"must run consecutively from seq 1")
+                    expected_prev = chain[position - 1].hash if position else ""
+                    if event.prev_hash != expected_prev:
+                        raise ValueError(
+                            f"key_events chain of device {event_device_id} "
+                            f"has a broken prev_hash link at seq {event.seq}")
+                key_events[event_device_id] = chain
+                self._replay_key_events(
+                    devices[device_index[event_device_id]], chain)
+
         with self._lock:
             self._devices = devices
             self._device_index = device_index
@@ -3213,3 +3573,4 @@ class DeviceStore:
             self._group_sync_cursors = group_sync_cursors
             self._message_sync_cursors = message_sync_cursors
             self._message_submissions = message_submissions
+            self._key_events = key_events

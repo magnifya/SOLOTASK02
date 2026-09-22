@@ -215,6 +215,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             suffix = path[len(_DEVICES_PATH) + 1:]
             # A real slash means a sub-path (…/devices/a/b); a percent-encoded
             # slash within a single segment is part of the device id.
+            if suffix.endswith("/key-events"):
+                device_id = suffix[:-len("/key-events")]
+                if not device_id or "/" in device_id:
+                    self._send_json(404, {"message": "device not found",
+                                          "field": "device_id"})
+                    return
+                self._handle_key_events(unquote(device_id))
+                return
             if not suffix or "/" in suffix:
                 self._send_json(404, {"message": "device not found",
                                       "field": "device_id"})
@@ -270,6 +278,22 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_show(self, device_id: str) -> None:
         try:
             body = self.service.get_device(device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_key_events(self, device_id: str) -> None:
+        query = parse_qs(urlsplit(self.path).query)
+        after = self._int_param(query, "after", default=0, minimum=0)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._int_param(query, "limit", default=100,
+                                minimum=1, maximum=100)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.list_key_events(device_id, after, limit)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

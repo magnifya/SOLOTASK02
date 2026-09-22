@@ -110,6 +110,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("device_id")
     p_show.set_defaults(handler=cmd_show)
 
+    p_key_events = sub.add_parser(
+        "key-events", help="list a device's key-audit event chain")
+    p_key_events.add_argument("device_id")
+    p_key_events.add_argument(
+        "--after", type=int, default=0,
+        help="start after this sequence (default: 0, the whole chain)")
+    p_key_events.add_argument("--limit", type=int, default=100)
+    p_key_events.set_defaults(handler=cmd_key_events)
+
     p_revoke_device = sub.add_parser("revoke-device", help="revoke a device")
     p_revoke_device.add_argument("--device-id", required=True)
     p_revoke_device.set_defaults(handler=cmd_revoke_device)
@@ -420,6 +429,22 @@ def cmd_show(args: argparse.Namespace) -> int:
     from urllib.parse import quote
 
     url = f"{args.base_url}/v1/devices/{quote(args.device_id, safe='')}"
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 200 else 1
+
+
+def cmd_key_events(args: argparse.Namespace) -> int:
+    """Call GET /v1/devices/{device_id}/key-events and print the JSON."""
+    from urllib.parse import quote, urlencode
+
+    query = urlencode({"after": args.after, "limit": args.limit})
+    url = (f"{args.base_url}/v1/devices/"
+           f"{quote(args.device_id, safe='')}/key-events?{query}")
     try:
         status, response = _request_json("GET", url)
     except ServerUnavailable:
