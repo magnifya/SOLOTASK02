@@ -357,6 +357,11 @@ class DeviceStore:
         self._pending_anchor_devices: Optional[List[str]] = None
         # Called (under the lock) after any state mutation, for persistence.
         self.on_change: Optional[Callable[[], None]] = None
+        # Top-level commit generation: 0 on the first (empty) durable write,
+        # then advanced exactly once per successfully persisted transaction.
+        # Kept in the store so snapshot/restore rolls it back together with
+        # every other section of a failed transaction.
+        self.commit_seq: int = 0
 
     def _notify_change(self) -> None:
         """Invoke the persistence hook after a committed mutation."""
@@ -2160,7 +2165,8 @@ class DeviceStore:
                 self.key_event_view(event)
                 for chain in self._key_events.values() for event in chain
             ]
-            document = {"devices": devices, "sessions": sessions,
+            document = {"commit_seq": self.commit_seq,
+                        "devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
                         "claim_session_bindings": claim_session_bindings,
@@ -2351,6 +2357,15 @@ class DeviceStore:
         raw_message_sync_cursors = state.get("message_sync_cursors", [])
         raw_message_submissions = state.get("message_submissions", [])
         raw_key_events = state.get("key_events")
+        # commit_seq was added after version=1: an old file without it is
+        # loaded as generation 0. When present it must be a real non-negative
+        # integer — booleans, floats, strings and negatives are malformed and
+        # make startup refuse (never silently resetting the generation).
+        raw_commit_seq = state.get("commit_seq", 0)
+        if (not isinstance(raw_commit_seq, int)
+                or isinstance(raw_commit_seq, bool) or raw_commit_seq < 0):
+            raise ValueError(
+                "commit_seq must be a non-negative integer when present")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
                 and isinstance(raw_prekey_batch_claims, list)
@@ -3689,3 +3704,4 @@ class DeviceStore:
             # nothing is pending.
             self._pending_anchor_devices = (
                 list(device_index) if raw_key_events is None else None)
+            self.commit_seq = raw_commit_seq

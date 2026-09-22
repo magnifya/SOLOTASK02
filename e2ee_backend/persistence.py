@@ -24,13 +24,26 @@ A crash between steps can leave ``.state-*.tmp`` (staged document) or
 ``.state-*.bak`` (pinned previous inode) files beside the target. At the next
 :func:`attach_persistence` these are resolved by
 :func:`recover_crash_leftovers`: a valid formal file stays authoritative and
-the leftovers are removed; with the formal file missing the newest-mtime
-leftover that parses as version=1, carries the cursor and ``key_events``
-sections (the footprint of one complete durable transaction), and passes
-every semantic restore check is atomically recovered into place; with none
-valid the leftovers are removed and an empty state is created. An
-existing-but-corrupt formal file still makes startup refuse rather than
-being silently overwritten.
+the leftovers are removed; with the formal file missing, candidates that
+parse as version=1, carry the cursor and ``key_events`` sections (the
+footprint of one complete durable transaction), and pass every semantic
+restore check are ranked by their top-level ``commit_seq`` generation first
+(the newest generation wins even when an older snapshot happens to have a
+newer mtime; a missing field reads as 0), then newest mtime; when *no*
+candidate carries ``commit_seq`` this is simply the old newest-mtime rule.
+The winner is atomically recovered into place; with none valid the leftovers
+are removed and an empty state is created. An existing-but-corrupt formal
+file still makes startup refuse rather than being silently overwritten.
+
+Each document carries a top-level ``commit_seq``: the first (empty) state is
+written with ``commit_seq = 0`` and every successfully persisted transaction
+(device, group, message, sync, delivery, revocation or audit-chain change)
+advances it exactly once, strictly consecutively. A failed durable write
+rolls the generation back together with the rest of the in-memory state, so
+a rolled-back or restarted server never reuses or skips a number. Old
+version-1 files without the field load as generation 0; a present field that
+is a boolean, negative, float or string makes startup refuse with the file
+untouched.
 """
 from __future__ import annotations
 
@@ -58,6 +71,23 @@ _TMP_SUFFIX = ".tmp"
 _BAK_SUFFIX = ".bak"
 
 
+def _is_valid_commit_seq(value: Any) -> bool:
+    """A commit generation is a real (non-boolean) non-negative integer.
+
+    JSON booleans are rejected even though they are ``int`` in Python, and so
+    are floats/strings; a missing field is handled by the caller (old files
+    default to 0) rather than here.
+    """
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0)
+
+
+def _document_commit_seq(document: Dict[str, Any]) -> int:
+    """Read a candidate document's generation, treating a missing field as 0."""
+    value = document.get("commit_seq", 0)
+    return value if _is_valid_commit_seq(value) else 0
+
+
 class StateFileError(Exception):
     """The state file is missing fields, corrupt, or has an unknown version."""
 
@@ -81,7 +111,9 @@ class JsonStateStore:
         """Load the document, or ``None`` when the file does not exist yet.
 
         Raises :class:`StateFileError` if the file cannot be decoded as JSON,
-        is not a JSON object, or carries a missing/unknown ``version``.
+        is not a JSON object, carries a missing/unknown ``version``, or has a
+        present ``commit_seq`` that is not a non-negative integer (a missing
+        ``commit_seq`` is accepted: an old version-1 file defaults to 0).
         """
         try:
             with open(self.path, "r", encoding="utf-8") as handle:
@@ -106,6 +138,14 @@ class JsonStateStore:
             raise StateFileError(
                 f"unsupported state file version: {version} "
                 f"(this server supports {STATE_VERSION})")
+        commit_seq = document.get("commit_seq")
+        if commit_seq is not None and not _is_valid_commit_seq(commit_seq):
+            # A present-but-malformed generation (boolean, negative number,
+            # float or string) makes startup refuse with the file untouched;
+            # an absent field is a pre-commit_seq version-1 file, read as 0.
+            raise StateFileError(
+                "state document 'commit_seq' must be a non-negative integer "
+                "when present")
         return document
 
     def save(self, state: Dict[str, Any]) -> None:
@@ -358,14 +398,16 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
     * An existing but corrupt/invalid formal file is left untouched: the
       normal load then refuses startup, so present state is never silently
       discarded (and its leftovers are kept for inspection).
-    * With the formal file missing, candidates are tried newest-mtime-first;
-      the first that parses as version=1, explicitly carries the
-      ``group_sync_cursors``/``message_sync_cursors``/``key_events`` sections
-      (each a list — the footprint of one complete durable transaction), *and*
-      passes full semantic verification is atomically ``os.replace``-d into
-      place (plus a parent-directory fsync) and the remaining leftovers are
-      removed. A section-less legacy/partial snapshot is never promoted, so a
-      resume cursor or the audit chain cannot be silently lost.
+    * With the formal file missing, every leftover is parsed and semantically
+      verified first; verifiable candidates are ranked by ``commit_seq``
+      (highest generation first, a missing field reading as 0), with newest
+      mtime then name as tie-breaks, so an older snapshot with a newer mtime
+      is never preferred. When all candidates predate ``commit_seq`` the
+      ranking degenerates to the previous newest-mtime rule. The winner is
+      atomically ``os.replace``-d into place (plus a parent-directory fsync)
+      and the remaining leftovers are removed. A section-less legacy/partial
+      snapshot is never promoted, so a resume cursor or the audit chain
+      cannot be silently lost.
     * When no candidate is valid, all leftovers are removed; the normal
       missing-file path in :func:`attach_persistence` then creates an empty
       state.
@@ -385,23 +427,37 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
                 _remove_quietly(path)
         return
 
-    # Formal file missing: recover the newest verifiable snapshot, newest
-    # modification time first (ties broken by name for deterministic order).
-    def mtime_key(path: str) -> Any:
-        try:
-            return (os.stat(path).st_mtime_ns, path)
-        except OSError:
-            return (-1, path)
-
-    candidates = sorted(leftovers, key=mtime_key, reverse=True)
-    recovered = None
-    for candidate in candidates:
+    # Formal file missing: verify every candidate first (a candidate that
+    # fails parsing, the section gate or the full semantic restore is
+    # skipped), then recover the best one. A snapshot's commit generation
+    # outranks file timestamps so an older snapshot can never win merely
+    # because its mtime is newer (missing commit_seq is read as 0); snapshots
+    # at the same generation fall back to newest mtime first, and equal
+    # mtimes tie-break by name for deterministic order. When no candidate
+    # carries commit_seq (all old snapshots), every generation is 0 and the
+    # ordering is the previous newest-mtime rule.
+    verified: List[Dict[str, Any]] = []
+    for candidate in leftovers:
         document = _read_version1_document(candidate)
         if (document is not None
                 and _candidate_is_section_complete(document)
                 and _document_restores(document)):
-            recovered = candidate
-            break
+            try:
+                mtime_ns = os.stat(candidate).st_mtime_ns
+            except OSError:
+                mtime_ns = -1
+            verified.append({
+                "path": candidate,
+                "commit_seq": _document_commit_seq(document),
+                "mtime_ns": mtime_ns,
+            })
+
+    recovered = None
+    if verified:
+        verified.sort(key=lambda item: (item["commit_seq"],
+                                        item["mtime_ns"], item["path"]),
+                      reverse=True)
+        recovered = verified[0]["path"]
 
     if recovered is not None:
         os.replace(recovered, state_store.path)
@@ -456,10 +512,13 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
     last_good: Dict[str, Any] = copy.deepcopy(service.store.snapshot_state())
 
     def persist() -> None:
-        # Called under the store lock at the end of a mutation. Snapshot the
-        # post-mutation state and try to durably commit it; on an I/O failure
-        # roll the in-memory store back to the last good state before
-        # surfacing the error, so the failed mutation is visible nowhere.
+        # Called under the store lock at the end of a mutation. Advance the
+        # commit generation exactly once, snapshot the post-mutation state and
+        # try to durably commit it; on an I/O failure roll the in-memory store
+        # (including commit_seq) back to the last good state before surfacing
+        # the error, so the failed mutation is visible nowhere and the next
+        # attempt reuses the same, strictly consecutive generation.
+        service.store.commit_seq += 1
         pending = service.store.snapshot_state()
         try:
             state_store.save(pending)
