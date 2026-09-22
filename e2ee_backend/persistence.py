@@ -35,8 +35,10 @@ being silently overwritten.
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
+import sys
 import tempfile
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -182,13 +184,33 @@ class JsonStateStore:
 def _fsync_directory(directory: str) -> None:
     """Flush *directory*'s metadata so a recent rename survives a crash.
 
-    Propagates :class:`OSError`; on platforms without ``O_DIRECTORY`` the
-    plain read-only open still works.
+    Directory fsync is a POSIX durability refinement that not every platform
+    or file system supports. When the capability itself is unavailable — the
+    directory cannot be opened for this purpose, or ``fsync`` reports
+    :data:`errno.EINVAL` (a file system/kernel that does not implement it),
+    with :data:`errno.EACCES` added on Windows where flushing a directory
+    handle is a privileged/unsupported operation — it is skipped silently:
+    the atomic ``os.replace`` already guarantees the file is never torn, so a
+    skipped directory flush only weakens rename-durability, never safety.
+    Every other :class:`OSError` (a genuine I/O failure) still propagates so
+    the caller can roll the transaction back and answer 503.
     """
-    flags = os.O_RDONLY
-    dir_fd = os.open(directory, flags)
+    unsupported_open = (errno.EACCES,) if sys.platform == "win32" else ()
     try:
-        os.fsync(dir_fd)
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError as error:
+        if error.errno in unsupported_open:
+            return
+        raise
+    try:
+        unsupported_fsync = {errno.EINVAL}
+        if sys.platform == "win32":  # pragma: no cover - Windows-only branch
+            unsupported_fsync.add(errno.EACCES)
+        try:
+            os.fsync(dir_fd)
+        except OSError as error:
+            if error.errno not in unsupported_fsync:
+                raise
     finally:
         os.close(dir_fd)
 
