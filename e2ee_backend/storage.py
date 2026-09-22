@@ -353,7 +353,18 @@ class DeviceStore:
         self.on_change: Optional[Callable[[], None]] = None
 
     def _notify_change(self) -> None:
-        """Invoke the persistence hook after a committed mutation."""
+        """Invoke the persistence hook after a committed mutation.
+
+        Called under the store lock at the end of every state-changing
+        operation. Before the transaction is committed (and therefore before
+        the persistence hook snapshots and durably writes the state), the
+        audit chains of every legacy device still missing one are anchored
+        here, in the same lock: the migration and the business mutation become
+        one atomic version-1 commit. Reads never reach this path, so a
+        read-only process leaves a legacy file (and its absent ``key_events``
+        section) untouched.
+        """
+        self._anchor_chainless_devices()
         if self.on_change is not None:
             self.on_change()
 
@@ -379,6 +390,100 @@ class DeviceStore:
         chain.append(event)
         return event
 
+    def _build_anchor_chain(self, device: Device) -> List[KeyEvent]:
+        """Synthesize the audit chain a legacy (pre-key-events) device lacks.
+
+        Old version=1 state files carry no ``key_events`` section, yet their
+        ``devices`` section already records every fact the chain would have
+        logged. Before the first persisting mutation touches such a device, its
+        missing chain is rebuilt deterministically from that final state:
+
+        * ``seq=1`` ``registered`` carrying the device's *current* identity
+          key and all pre-keys in their stored order (each as
+          key_id/public_key), with ``prev_hash`` empty and ``created_at``
+          pinned to the device's ``registered_at``;
+        * then one ``prekey_revoked`` per currently-revoked pre-key, in pre-key
+          order (a device revocation marks every key revoked, so for a revoked
+          device every key appears here);
+        * finally one ``device_revoked`` when the device itself is revoked.
+
+        The legacy file records no individual rotation/add/revoke timestamps,
+        so every synthetic event reuses the ``registered_at`` timestamp; hash,
+        seq and prev_hash are computed by the normal rules, making the result
+        byte-identical to a chain :meth:`_replay_key_events` accepts.
+        """
+        chain: List[KeyEvent] = []
+        device_id = device.device_id
+        timestamp = device.registered_at
+        registered_payload = {
+            "identity_key": device.identity_key,
+            "signed_prekeys": [{"key_id": prekey.key_id,
+                                "public_key": prekey.public_key}
+                               for prekey in device.prekeys],
+        }
+        seq = 1
+        prev_hash = ""
+        registered_hash = key_event_hash(
+            device_id, seq, KEY_EVENT_REGISTERED, registered_payload,
+            prev_hash, timestamp)
+        chain.append(KeyEvent(
+            device_id=device_id, seq=seq, type=KEY_EVENT_REGISTERED,
+            payload=registered_payload, prev_hash=prev_hash,
+            hash=registered_hash, created_at=timestamp))
+        for prekey in device.prekeys:
+            if not prekey.revoked:
+                continue
+            seq += 1
+            payload = {"key_id": prekey.key_id,
+                       "public_key": prekey.public_key}
+            prev_hash = chain[-1].hash
+            event_hash = key_event_hash(
+                device_id, seq, KEY_EVENT_PREKEY_REVOKED, payload,
+                prev_hash, timestamp)
+            chain.append(KeyEvent(
+                device_id=device_id, seq=seq,
+                type=KEY_EVENT_PREKEY_REVOKED, payload=payload,
+                prev_hash=prev_hash, hash=event_hash,
+                created_at=timestamp))
+        if device.revoked:
+            seq += 1
+            prev_hash = chain[-1].hash
+            event_hash = key_event_hash(
+                device_id, seq, KEY_EVENT_DEVICE_REVOKED, {},
+                prev_hash, timestamp)
+            chain.append(KeyEvent(
+                device_id=device_id, seq=seq,
+                type=KEY_EVENT_DEVICE_REVOKED, payload={},
+                prev_hash=prev_hash, hash=event_hash,
+                created_at=timestamp))
+        return chain
+
+    def _anchor_chainless_devices(self) -> None:
+        """Anchor every registered device that still lacks an audit chain.
+
+        Devices are processed in registration (insertion) order; a device that
+        already has a chain is left untouched. Called under the store lock at
+        the start of a persisting transaction — before the transaction's own
+        key event (if any) is appended and before the state is snapshotted for
+        durability — so a migrated chain always runs ``registered`` first and
+        the real mutation event appends straight after it.
+        """
+        for device in self._devices.values():
+            if device.device_id in self._key_events:
+                continue
+            # The live server revokes every pre-key together with the device;
+            # a legacy document that predates the chain section could in
+            # principle carry device.revoked with an individual key flag still
+            # clear. Normalize the invariant in the same transaction so the
+            # synthesized chain's replay equals the stored device exactly and
+            # the migrated document re-loads (an un-revoked key of an already
+            # revoked device has no observable API behaviour anyway).
+            if device.revoked:
+                for prekey in device.prekeys:
+                    prekey.revoked = True
+            self._key_events[device.device_id] = \
+                self._build_anchor_chain(device)
+
     def add_device(self, device: Device) -> bool:
         """Insert a device.
 
@@ -389,6 +494,10 @@ class DeviceStore:
         with self._lock:
             if key in self._devices or device.device_id in self._device_index:
                 return False
+            # Anchor every legacy chainless device before this registration
+            # commits, so the new device's ``registered`` event joins an
+            # already-consistent set of chains.
+            self._anchor_chainless_devices()
             self._devices[key] = device
             self._device_index[device.device_id] = key
             self._append_key_event(
@@ -443,6 +552,9 @@ class DeviceStore:
             if device is None:
                 return None
             if not device.revoked:
+                # Backfill a legacy chainless chain before the real event so
+                # the device_revoked event never lands at seq 1.
+                self._anchor_chainless_devices()
                 device.revoked = True
                 for prekey in device.prekeys:
                     prekey.revoked = True
@@ -469,6 +581,10 @@ class DeviceStore:
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
                     if not prekey.revoked:
+                        # Backfill a legacy chainless chain first, so the real
+                        # prekey_revoked event continues it rather than
+                        # starting at seq 1.
+                        self._anchor_chainless_devices()
                         prekey.revoked = True
                         self._append_key_event(
                             device_id, KEY_EVENT_PREKEY_REVOKED,
@@ -506,6 +622,10 @@ class DeviceStore:
                 raise DeviceUpdateError(DEVICE_REVOKED)
             changed = identity_key != device.identity_key
             if changed:
+                # Backfill a legacy chainless chain first; the anchor records
+                # the current (old) identity key, and this rotation event then
+                # appends after it.
+                self._anchor_chainless_devices()
                 old_identity_key = device.identity_key
                 device.identity_key = identity_key
                 device.rotated_at = utc_now_iso()
@@ -544,6 +664,9 @@ class DeviceStore:
                              "public_key": existing.public_key}, False)
                 raise DeviceUpdateError(PREKEY_CONFLICT)
             prekey = SignedPreKey(key_id=key_id, public_key=public_key)
+            # Backfill a legacy chainless chain first; the anchor lists the
+            # pre-keys that exist already, so this addition appends after it.
+            self._anchor_chainless_devices()
             device.prekeys.append(prekey)
             self._append_key_event(
                 device_id, KEY_EVENT_PREKEY_ADDED,
@@ -2058,7 +2181,7 @@ class DeviceStore:
                 self.key_event_view(event)
                 for chain in self._key_events.values() for event in chain
             ]
-            return {"devices": devices, "sessions": sessions,
+            document = {"devices": devices, "sessions": sessions,
                     "prekey_claims": prekey_claims,
                     "prekey_batch_claims": prekey_batch_claims,
                     "claim_session_bindings": claim_session_bindings,
@@ -2071,8 +2194,15 @@ class DeviceStore:
                     "used_nonces": used_nonces,
                     "group_sync_cursors": group_sync_cursors,
                     "message_sync_cursors": message_sync_cursors,
-                    "message_submissions": message_submissions,
-                    "key_events": key_events}
+                    "message_submissions": message_submissions}
+            # A legacy file that simply predates the audit chains stays
+            # chain-less in the snapshot too (the section stays absent) until
+            # a persisting mutation anchors every device and real events
+            # exist. Anchoring is all-or-nothing, so the section is present
+            # only once every registered device has a chain.
+            if key_events:
+                document["key_events"] = key_events
+            return document
 
     @staticmethod
     def _replay_key_events(device: Device, chain: List[KeyEvent]) -> None:
