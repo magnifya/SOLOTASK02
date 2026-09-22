@@ -230,6 +230,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_show_group_session.add_argument("session_id")
     p_show_group_session.set_defaults(handler=cmd_show_group_session)
 
+    p_rotate_group_session = sub.add_parser(
+        "rotate-group-session",
+        help="rotate a group session into a fresh successor session")
+    p_rotate_group_session.add_argument("session_id")
+    p_rotate_group_session.add_argument("--rotation-id", required=True)
+    p_rotate_group_session.add_argument("--actor-device-id", required=True)
+    p_rotate_group_session.add_argument(
+        "--ephemeral-key", required=True,
+        help="ephemeral public key (string), or @path to read it from a file")
+    p_rotate_group_session.add_argument("--expected-revision", required=True,
+                                        type=int)
+    p_rotate_group_session.set_defaults(handler=cmd_rotate_group_session)
+
     p_sync_group_messages = sub.add_parser(
         "sync-group-messages",
         help="sync a page of a group session's messages for a device")
@@ -657,6 +670,25 @@ def cmd_show_group_session(args: argparse.Namespace) -> int:
     stream = sys.stdout if status == 200 else sys.stderr
     print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
     return 0 if status == 200 else 1
+
+
+def cmd_rotate_group_session(args: argparse.Namespace) -> int:
+    """Call POST /v1/group-sessions/{sid}/rotate; 201 created, 200 replay."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/group-sessions/"
+           f"{quote(args.session_id, safe='')}/rotate")
+    payload = {
+        "rotation_id": args.rotation_id,
+        "actor_device_id": args.actor_device_id,
+        "ephemeral_key": _read_key_argument(args.ephemeral_key),
+        "expected_revision": args.expected_revision,
+    }
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
 
 
 def cmd_sync_group_messages(args: argparse.Namespace) -> int:

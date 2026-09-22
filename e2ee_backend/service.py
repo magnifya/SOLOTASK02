@@ -52,6 +52,13 @@ from .storage import (
     GROUP_SESSION_INITIATOR_NOT_MEMBER,
     GROUP_SESSION_INITIATOR_UNKNOWN,
     GROUP_UNKNOWN,
+    ROTATION_ACTOR_INACTIVE,
+    ROTATION_ACTOR_NOT_CREATOR,
+    ROTATION_ACTOR_UNKNOWN,
+    ROTATION_ID_CONFLICT,
+    ROTATION_PREDECESSOR_ROTATED,
+    ROTATION_REVISION_MISMATCH,
+    ROTATION_SESSION_UNKNOWN,
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
@@ -829,6 +836,118 @@ class DeviceService:
             raise ServiceError(f"session not found: {session_id}",
                                "session_id", status_code=404)
         return self.store.group_session_view(session)
+
+    # -- group-session rotation -------------------------------------------
+
+    #: Maps a storage-level rotation failure to (HTTP status, field name).
+    _ROTATION_ERROR_MAP = {
+        ROTATION_SESSION_UNKNOWN: (404, "session_id"),
+        ROTATION_ACTOR_UNKNOWN: (404, "actor_device_id"),
+        ROTATION_ACTOR_INACTIVE: (409, "actor_device_id"),
+        ROTATION_ACTOR_NOT_CREATOR: (409, "actor_device_id"),
+        ROTATION_REVISION_MISMATCH: (409, "expected_revision"),
+        ROTATION_ID_CONFLICT: (409, "rotation_id"),
+        ROTATION_PREDECESSOR_ROTATED: (409, "session_id"),
+    }
+
+    def rotate_group_session(self, session_id: str,
+                             payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate a rotation payload and atomically rotate the session.
+
+        ``rotation_id`` and ``actor_device_id`` must be non-empty strings,
+        ``ephemeral_key`` a non-empty valid public key, and
+        ``expected_revision`` a positive integer. The first rotation of a
+        predecessor returns its fresh seven-field successor snapshot (plus
+        ``rotation_id`` and ``predecessor_session_id``) with 201; the
+        successor freezes the group's members and revision at commit time and
+        the predecessor is left unchanged. Replaying the same ``rotation_id``
+        against the same predecessor returns the original response with 200;
+        the id against another predecessor is 409/rotation_id. An unknown
+        predecessor is 404/session_id, and one already superseded by another
+        rotation is 409/session_id (no fork). An unknown actor is
+        404/actor_device_id; a revoked actor or a non-creator is
+        409/actor_device_id; a revision not equal to the group's current
+        revision is 409/expected_revision. Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("rotation_id", "actor_device_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if "ephemeral_key" not in payload:
+            raise ServiceError("missing required field: ephemeral_key",
+                               "ephemeral_key")
+        if not is_nonempty_string(payload["ephemeral_key"]):
+            raise ServiceError(
+                "field must be a non-empty string: ephemeral_key",
+                "ephemeral_key")
+        if load_public_key(payload["ephemeral_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: ephemeral_key",
+                "ephemeral_key")
+        if "expected_revision" not in payload:
+            raise ServiceError(
+                "missing required field: expected_revision",
+                "expected_revision")
+        expected_revision = payload["expected_revision"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(expected_revision, int) \
+                or isinstance(expected_revision, bool):
+            raise ServiceError(
+                "field must be an integer: expected_revision",
+                "expected_revision")
+        if expected_revision <= 0:
+            raise ServiceError(
+                "field must be a positive integer: expected_revision",
+                "expected_revision")
+
+        try:
+            session, created = self.store.rotate_group_session(
+                session_id, payload["rotation_id"],
+                payload["actor_device_id"], payload["ephemeral_key"],
+                expected_revision)
+        except GroupError as error:
+            raise self._rotation_error(error, session_id, payload)
+        body = self.store.group_session_view(session)
+        body["rotation_id"] = payload["rotation_id"]
+        body["predecessor_session_id"] = session_id
+        # The committed rotation's own id/predecessor are replayed even when
+        # the request values differ in some unrelated field; on a replay the
+        # body is the stored original response, so source those from the
+        # rotation record rather than the request.
+        if not created:
+            record = self.store.get_group_session_rotation(
+                payload["rotation_id"])
+            body["rotation_id"] = record.rotation_id
+            body["predecessor_session_id"] = record.predecessor_session_id
+        return body, 201 if created else 200
+
+    @staticmethod
+    def _rotation_error(error: GroupError, session_id: str,
+                        payload: Dict[str, Any]) -> ServiceError:
+        """Translate a rotation storage failure into a ServiceError."""
+        status_code, field = DeviceService._ROTATION_ERROR_MAP[error.reason]
+        if error.reason == ROTATION_SESSION_UNKNOWN:
+            text = f"session not found: {session_id}"
+        elif error.reason == ROTATION_PREDECESSOR_ROTATED:
+            text = "session has already been rotated by another rotation_id"
+        elif error.reason == ROTATION_ACTOR_UNKNOWN:
+            text = "actor_device_id is not a registered device"
+        elif error.reason == ROTATION_ACTOR_INACTIVE:
+            text = "actor_device_id is revoked"
+        elif error.reason == ROTATION_ACTOR_NOT_CREATOR:
+            text = "actor_device_id is not the group creator"
+        elif error.reason == ROTATION_REVISION_MISMATCH:
+            text = ("expected_revision does not match the group's current "
+                    "revision")
+        else:
+            text = ("rotation_id was already used against a different "
+                    "predecessor session")
+        return ServiceError(text, field, status_code=status_code)
 
     # -- group-session sync ------------------------------------------------
 

@@ -233,6 +233,31 @@ class GroupSession:
 
 
 @dataclass
+class GroupSessionRotation:
+    """The durable record of one group-session rotation.
+
+    Rotating a predecessor group session creates a fresh successor group
+    session whose member list and revision are frozen from the group at
+    commit time; the predecessor snapshot is never altered. The record is
+    idempotent on ``rotation_id``: replaying the same id against the same
+    predecessor returns the original successor, while the id against another
+    predecessor conflicts. Each predecessor may ever have one successor, so
+    a session already superseded by a different rotation cannot fork. Only
+    identifiers and public material are retained.
+    """
+
+    rotation_id: str
+    session_id: str
+    predecessor_session_id: str
+    group_id: str
+    actor_device_id: str
+    ephemeral_key: str
+    members: List[str]
+    revision: int
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class GroupSyncCursor:
     """Per-device read cursor for syncing one group session's messages.
 
