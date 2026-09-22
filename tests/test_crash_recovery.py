@@ -210,6 +210,52 @@ class MissingFormalRecoveryTest(unittest.TestCase):
         self.assertEqual(open(self.path, "rb").read(), self.formal_bytes)
         self.assertEqual(tmp_names(self.directory), [])
 
+    def test_sectionless_legacy_leftover_is_not_recovered(self) -> None:
+        # A version=1 document that omits the key_events section would load
+        # leniently as the *formal* file (legacy migration), but a crash
+        # snapshot is only ever staged by this build's writer, which always
+        # carries the cursor sections and the audit chain. Such a leftover is
+        # not a transaction snapshot: it must be removed and an empty state
+        # created rather than recovered.
+        os.unlink(self.path)
+        document = json.loads(self.formal_bytes.decode("utf-8"))
+        del document["key_events"]
+        write_tmp(self.directory, ".state-legacy.tmp",
+                  json.dumps(document).encode("utf-8"))
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertIsNone(service.store.find_by_device_id("alice"))
+        self.assertEqual(service.store.snapshot_state()["devices"], [])
+
+    def test_leftover_missing_a_cursor_section_is_not_recovered(self) -> None:
+        os.unlink(self.path)
+        document = json.loads(self.formal_bytes.decode("utf-8"))
+        del document["message_sync_cursors"]
+        write_tmp(self.directory, ".state-no-cursor.tmp",
+                  json.dumps(document).encode("utf-8"))
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertIsNone(service.store.find_by_device_id("alice"))
+
+    def test_sectionless_newer_leftover_falls_back_to_complete_older(
+            self) -> None:
+        # Newer-but-sectionless leftover is disqualified; the older complete
+        # snapshot is recovered.
+        os.unlink(self.path)
+        incomplete = json.loads(self.formal_bytes.decode("utf-8"))
+        del incomplete["key_events"]
+        write_tmp(self.directory, ".state-complete-old.bak",
+                  self.formal_bytes, mtime_ns=1000)
+        write_tmp(self.directory, ".state-sectionless-new.tmp",
+                  json.dumps(incomplete).encode("utf-8"), mtime_ns=2000)
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.formal_bytes)
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertIsNotNone(service.store.find_by_device_id("alice"))
+
 
 class DirectoryFsyncFailureTest(unittest.TestCase):
     """A directory-fsync failure after the rename is the same transaction."""

@@ -243,6 +243,16 @@ def _read_version1_document(path: str) -> Optional[Dict[str, Any]]:
     return document
 
 
+#: Sections every crash-leftover snapshot written by this build carries.
+#: ``restore_state`` accepts a legacy version=1 document that omits them (the
+#: formal file must stay backward compatible), but a tmp/bak snapshot is only
+#: ever produced by this build's atomic writer, which always serializes the
+#: cursor sections and the key-audit chain. A leftover that lacks them is not
+#: a recoverable snapshot: it is removed and an empty state is created.
+_RECOVERY_REQUIRED_SECTIONS = (
+    "group_sync_cursors", "message_sync_cursors", "key_events")
+
+
 def _document_restores(document: Dict[str, Any]) -> bool:
     """Full semantic verification against :meth:`DeviceStore.restore_state`.
 
@@ -258,6 +268,22 @@ def _document_restores(document: Dict[str, Any]) -> bool:
     except (ValueError, TypeError):
         return False
     return True
+
+
+def _leftover_snapshot_recoverable(document: Dict[str, Any]) -> bool:
+    """Whether a leftover *document* may be recovered into the formal slot.
+
+    Beyond parsing as version=1 and passing every semantic restore check, a
+    crash snapshot must itself carry the cursor sections and the
+    ``key_events`` section (which may be empty). This build's writer never
+    stages a document without them, so a section-less leftover is not a real
+    transaction snapshot — even though the same legacy document would still
+    load leniently as the *formal* file. Missing any of them disqualifies the
+    candidate; recovery then falls through to the next candidate or to an
+    empty state.
+    """
+    return all(name in document for name in _RECOVERY_REQUIRED_SECTIONS) \
+        and _document_restores(document)
 
 
 def _leftover_tmp_paths(directory: str, target_path: str) -> List[str]:
@@ -335,7 +361,7 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
     recovered = None
     for candidate in candidates:
         document = _read_version1_document(candidate)
-        if document is not None and _document_restores(document):
+        if document is not None and _leftover_snapshot_recoverable(document):
             recovered = candidate
             break
 
