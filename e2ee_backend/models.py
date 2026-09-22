@@ -181,6 +181,27 @@ class Message:
 
 
 @dataclass
+class MessageSubmission:
+    """The durable idempotency record of one committed message submission.
+
+    Written together with the message it accepted (same locked transaction),
+    keyed by the client-chosen ``request_id`` (globally unique). The record
+    freezes the six envelope fields plus the message's ``created_at`` so a
+    replayed submission returns the first response byte-identically, even if
+    the sender device is revoked afterwards.
+    """
+
+    request_id: str
+    session_id: str
+    sender_device_id: str
+    message_id: str
+    sequence: int
+    nonce: str
+    ciphertext: str
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

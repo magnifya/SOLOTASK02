@@ -56,6 +56,7 @@ from .storage import (
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
     MESSAGE_DUPLICATE_NONCE,
+    MESSAGE_REQUEST_ID_CONFLICT,
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
     PREKEY_CONFLICT,
@@ -106,6 +107,7 @@ _MESSAGE_CREATE_ERROR_MAP = {
     MESSAGE_DUPLICATE_ID: (409, "message_id"),
     MESSAGE_BAD_SEQUENCE: (409, "sequence"),
     MESSAGE_DUPLICATE_NONCE: (409, "nonce"),
+    MESSAGE_REQUEST_ID_CONFLICT: (409, "request_id"),
 }
 
 #: Maps a storage-level session failure reason to (HTTP status, field name).
@@ -1041,23 +1043,81 @@ class DeviceService:
                 payload["nonce"],
                 payload["ciphertext"])
         except MessageCreateError as error:
-            status_code, field = _MESSAGE_CREATE_ERROR_MAP[error.reason]
-            if error.reason == MESSAGE_SESSION_UNKNOWN:
-                message_text = f"session not found: {payload['session_id']}"
-            elif error.reason == MESSAGE_SENDER_INACTIVE:
-                message_text = "sender_device_id is not an active device"
-            elif error.reason == MESSAGE_DUPLICATE_ID:
-                message_text = (f"message_id already exists in session: "
-                                f"{payload['message_id']}")
-            elif error.reason == MESSAGE_BAD_SEQUENCE:
-                message_text = (f"sequence must continue the session stream "
-                                f"(got {sequence})")
-            else:
-                message_text = (f"nonce already used in this session: "
-                                f"{payload['nonce']}")
-            raise ServiceError(message_text, field, status_code=status_code)
+            raise self._message_create_error(error, payload)
 
         return self.store.message_view(message)
+
+    @staticmethod
+    def _message_create_error(error: MessageCreateError,
+                              payload: Dict[str, Any]) -> ServiceError:
+        """Translate a storage :class:`MessageCreateError` into a ServiceError."""
+        status_code, field = _MESSAGE_CREATE_ERROR_MAP[error.reason]
+        if error.reason == MESSAGE_SESSION_UNKNOWN:
+            message_text = f"session not found: {payload['session_id']}"
+        elif error.reason == MESSAGE_SENDER_INACTIVE:
+            message_text = "sender_device_id is not an active device"
+        elif error.reason == MESSAGE_DUPLICATE_ID:
+            message_text = (f"message_id already exists in session: "
+                            f"{payload['message_id']}")
+        elif error.reason == MESSAGE_BAD_SEQUENCE:
+            message_text = (f"sequence must continue the session stream "
+                            f"(got {payload['sequence']})")
+        elif error.reason == MESSAGE_REQUEST_ID_CONFLICT:
+            message_text = (f"request_id was already used with different "
+                            f"fields: {payload['request_id']}")
+        else:
+            message_text = (f"nonce already used in this session: "
+                            f"{payload['nonce']}")
+        return ServiceError(message_text, field, status_code=status_code)
+
+    def submit_message(self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and atomically commit one idempotent message submission.
+
+        ``request_id`` must be a non-empty string; the six envelope fields
+        follow the same validation as :meth:`post_message`. A first-seen id
+        commits the message and returns ``(body, 201)``; a replay with the
+        identical envelope returns the original response with 200 (even if
+        the sender was revoked since); the same id with any changed field —
+        or reused across sessions — is a 409 naming ``request_id``. A failed
+        submission never consumes its id. Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+
+        if "request_id" not in payload:
+            raise ServiceError("missing required field: request_id",
+                               "request_id")
+        if not is_nonempty_string(payload["request_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: request_id", "request_id")
+
+        for name in _MESSAGE_STRING_FIELDS:
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        if "sequence" not in payload:
+            raise ServiceError("missing required field: sequence", "sequence")
+        sequence = payload["sequence"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            raise ServiceError("field must be an integer: sequence", "sequence")
+
+        try:
+            view, created = self.store.submit_message(
+                payload["request_id"],
+                payload["session_id"],
+                payload["sender_device_id"],
+                payload["message_id"],
+                sequence,
+                payload["nonce"],
+                payload["ciphertext"])
+        except MessageCreateError as error:
+            raise self._message_create_error(error, payload)
+        return view, 201 if created else 200
 
     def list_messages(self, session_id: str, device_id: str, after: int,
                       limit: int) -> Dict[str, Any]:

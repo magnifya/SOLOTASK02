@@ -23,6 +23,8 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 
 在群组会话之上扩展现有可靠投递（重试、确认、状态查询），使群组会话支持逐设备可靠投递，1:1 会话语义完全不变。三个既有接口（POST /v1/messages/{session_id}/retry/{message_id}、POST /v1/messages/{session_id}/acks、GET /v1/messages/{session_id}/status/{message_id}?device_id=…）现在同时接受群组会话的 session_id：群组消息的 device_id 必须是冻结 members 中的活跃非发送者设备——未知会话/消息仍返回 404/field=session_id 或 message_id，设备未知、已撤销、非冻结成员或为发送者本人均返回 409/field=device_id，字段缺失或类型错误仍 400/对应 field。投递状态以 (session_id, message_id, device_id) 为键：该设备对该消息的首次 retry 返回 201 且 attempts=1；相同 attempt_id 重放返回 200 且不重复计数，新 attempt_id 返回 200 且 attempts+1；消息被该设备 ack 后再重试仍返回 200 且 status 保持 acked。acks 仍校验体内 message_id 与整数 sequence，sequence 与消息实际序号不符返回 409/field=sequence；各设备首次确认返回 201、重复确认幂等返回 200，设备之间互不影响；status 对该设备无任何记录时返回 pending/attempts=0。群组在会话冻结后的增删不改变投递范围：被移出当前群组的冻结成员仍可重试/确认/查询，冻结后才加入的设备一律 409/field=device_id。全部校验与写入都和设备撤销共用存储同一把锁，失败不改变任何状态。version=1 状态文件新增 group_delivery 段保存逐设备的尝试去重集合、attempts、acked 与 ack_sequence；旧文件缺该段按空加载，该段存在时恢复须校验会话（必须指向已存群组会话）、消息、冻结成员设备、attempts 与 attempt_ids 数量一致及 acked/ack_sequence 与消息序号一致，任一矛盾拒绝启动且绝不覆盖原文件；落盘失败仍返回 503/field=data_file 并回滚内存。retry-message、ack-message、message-status 三个 CLI 子命令直接接受群组 session_id，输出格式与退出码不变。
 
+新增幂等消息提交，解决 201 响应丢失后的安全重试；原 POST /v1/messages 保持不变。POST /v1/messages/submit 接收 request_id 及原六个信封字段（session_id、sender_device_id、message_id、sequence、nonce、ciphertext）。request_id 须为非空字符串，其余沿用原校验；非法 400/对应 field。首次请求按既有会话、发送方、message_id、sequence、nonce 顺序校验，成功 201，返回 request_id 及原七字段，失败不占用该 id。request_id 全局唯一：同 id 且六字段完全相同的重放返回 200 及首次响应，即使发送方后来撤销；字段改变或跨会话复用返回 409/field=request_id。并发同 id 仅写一条；消息、序号、nonce 与幂等记录同锁提交，落盘失败 503/field=data_file 并全部回滚。version=1 新增可选 message_submissions，缺失按空；恢复校验 id 唯一、会话和消息引用及六字段一致，矛盾拒启且不覆盖原文件。补强 group_delivery 恢复：设备须已注册、属冻结成员且不是发送者；记录产生后设备撤销仍是合法历史，恢复后写操作继续 409/device_id。新增 CLI submit-message，参数对应七字段；成功 stdout、失败 stderr 单行 JSON 并非零退出，旧接口与旧文件兼容。
+
 新增群组会话轮换：把一个既有群组会话（前序）轮换为一个全新的冻结群组会话（后继）。POST /v1/group-sessions/{session_id}/rotate 接收 JSON：rotation_id、actor_device_id 为非空字符串，ephemeral_key 为非空且合法的公钥编码，expected_revision 为正整数；缺失、类型错误、公钥非法或非正整数返回 400/对应 field。前序不是已知群组会话返回 404/field=session_id；actor 未注册返回 404/field=actor_device_id；actor 已撤销或不是该群组的创建者返回 409/field=actor_device_id；expected_revision 不等于该群组当前 revision 返回 409/field=expected_revision。首次成功返回 201，响应为群组会话七字段（session_id/group_id/initiator_device_id/ephemeral_key/revision/members/created_at）外加 rotation_id、predecessor_session_id 两个字段；后继获得全局唯一的新 session_id，其成员表与 revision 按提交时刻的群组快照冻结（后继的 initiator_device_id 为 actor），前序快照保持不变。同一 rotation_id 重放到同一前序返回 200 及与首次完全相同的原始响应（幂等，即使此后 actor 被撤销或群组 revision 已变）；同一 rotation_id 用于其他前序返回 409/field=rotation_id；前序已被另一个 rotation_id 轮换则返回 409/field=session_id，绝不允许分叉。轮换链可继续：后继本身也可被新的 rotation_id 轮换。全部校验与写入（后继会话、轮换记录）与成员变更、设备撤销、持久化在存储同一把锁下原子共锁，任何失败都不写入；落盘失败返回 503/field=data_file 并回滚内存与文件。version=1 状态文件新增可选 group_session_rotations 段（rotation_id/predecessor_session_id/successor_session_id/group_id/actor_device_id/revision/members/created_at），旧文件缺该段按空加载；该段存在时恢复须校验：rotation_id 唯一、前序与后继均指向已存群组会话、同一前序不被多条记录引用（无分叉）、同一后继不被重复产生、group_id 与前序/后继一致、actor 为已注册的群组创建者，且冻结的 initiator/revision/members/created_at 与后继会话快照完全一致——任一矛盾拒绝启动且绝不覆盖原文件。轮换产生的后继就是普通群组会话，消息与可靠投递沿用既有冻结成员规则：group_delivery 拒绝消息发送者本人或任何未注册/已撤销/非冻结成员设备。命令行新增 rotate-group-session SESSION_ID --rotation-id … --actor-device-id … --ephemeral-key … --expected-revision N（四个参数一一对应），成功（201/200）stdout 单行 JSON，失败 stderr 单行 JSON 并非零退出，输出契约与既有命令一致。
 
 ## 当前状态
@@ -58,8 +60,9 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 - 会话创建与设备/预密钥撤销共享同一把锁、线性化执行：撤销先行则创建得 `409` 且不写，创建先行则得 `201` 且会话保留，不存在中间态。
 - 撤销与查询共享同一把锁、线性化执行：并发的 `GET` 只能看到某次撤销操作前或后的完整快照，不会观察到中间态。
 - `POST /v1/messages`：向会话投递加密消息信封。请求体含 `session_id`、`sender_device_id`、`message_id`、`sequence`、`nonce`、`ciphertext`；`sequence` 从 1 开始逐条连续。未知会话 `404/field=session_id`；发送方设备不存在或已撤销 `409/field=sender_device_id`；`message_id` 在会话内重复 `409/field=message_id`；序号不连续 `409/field=sequence`；`nonce` 已在同一会话历史消息中使用（会话级重放）`409/field=nonce`，按原始字符串逐字节比较，同一 nonce 在不同会话可各自使用；字段缺失或类型错误 `400/field=对应字段`。成功 `201`，响应为完整信封（六入参回显）加 `created_at`（UTC ISO-8601，`+00:00`）。重复 nonce、重复 message_id、错序等检查与写入在存储同一把锁下按固定优先顺序（会话→发送方→message_id→sequence→nonce）原子线性化，任一失败不写入消息、不推进序号、不改变任何投递状态。
+- `POST /v1/messages/submit`：幂等提交加密消息信封（原 `POST /v1/messages` 语义不变）。请求体为 `request_id` 加原六字段；`request_id` 非空字符串，否则 `400/field=request_id`。首次成功 `201` 返回 `request_id` 及原七字段；同 id 同六字段重放返回 `200` 及首次响应（发送方此后撤销亦如此）；同 id 任一字段改变或跨会话复用 `409/field=request_id`；失败不占用该 id。消息、序号、nonce 与幂等记录同锁提交，落盘失败 `503/field=data_file` 并全部回滚。记录存于 version=1 可选段 `message_submissions`，旧文件缺段按空加载；恢复校验 id 唯一、会话/消息引用与六字段一致，矛盾拒启且不覆盖原文件。
 - `GET /v1/messages/{session_id}`：分页拉取会话消息。查询参数 `device_id` 必填，`after` 默认 0（须 ≥0），`limit` 默认 100（1..100）；未知会话 `404/field=session_id`，`device_id` 非活跃设备 `409/field=device_id`，参数缺失/非法 `400/field=对应参数`。返回 `messages`（与 POST 响应同构的信封数组，筛 `sequence > after` 升序）与 `next_after`（空页等于 `after`，否则为末条序号）。消息读取与设备撤销共享同一把锁，不观察中间态；已存消息在发送方被撤销后仍可读取。
-- 命令行 `send-message` / `pull-messages` 与上述两个接口一一对应，同样打印单行 JSON。
+- 命令行 `send-message` / `submit-message` / `pull-messages` 与上述接口一一对应，同样打印单行 JSON（`submit-message` 的 201 与 200 均为成功）。
 - `POST /v1/messages/{session_id}/retry/{message_id}`：可靠投递重试。体含非空 `device_id`、`attempt_id`；接收方须活跃，未知会话/消息 `404`（`field=session_id`/`message_id`），设备不符、未知或已撤销 `409/field=device_id`，字段缺失或类型错误 `400`。首次尝试 `201`、`attempts=1`；相同 `attempt_id` 幂等 `200` 不计数，新 id `200` 且 `attempts+1`；acked 后重试仍 `200` 且保持 `acked`。返回 `session_id`/`message_id`/`status(pending|acked)`/`attempts`/`sequence`。
 - `POST /v1/messages/{session_id}/acks`：体含 `device_id`、`message_id`、整数 `sequence`；权限/未知同上，序号不符 `409/field=sequence`。首次 `201` 置 acked，重复 `200` 幂等；响应同五字段（无重试时 `attempts=0`）。
 - `GET /v1/messages/{session_id}/status/{message_id}?device_id=…`：`device_id` 缺失/为空/重复 `400/field=device_id`；未知 `404`，越权或接收方撤销 `409/field=device_id`；`200` 返回五字段投递状态（无记录时 `pending`/`0`）。
@@ -200,6 +203,15 @@ python3 -m e2ee_backend send-message \
 #     "sequence":1,"nonce":"…","ciphertext":"…",
 #     "created_at":"2026-09-19T10:13:01.123456+00:00"}
 
+# 幂等提交（201 首次；同 request-id 同字段重放 200 并返回首次响应）
+python3 -m e2ee_backend submit-message \
+  --request-id req-uuid-1 --session-id SESSION_ID --sender-device-id laptop \
+  --message-id msg-1 --sequence 1 \
+  --nonce BASE64_NONCE --ciphertext BASE64_CIPHERTEXT
+# => {"request_id":"req-uuid-1","session_id":"…","sender_device_id":"laptop",
+#     "message_id":"msg-1","sequence":1,"nonce":"…","ciphertext":"…",
+#     "created_at":"2026-09-19T10:13:01.123456+00:00"}
+
 # 分页拉取会话消息（--after 默认 0，--limit 默认 100）
 python3 -m e2ee_backend pull-messages SESSION_ID --device-id phone --after 0 --limit 100
 # => {"messages":[…],"next_after":1}
@@ -243,11 +255,11 @@ python3 -m unittest discover -s tests -v
 ```
 e2ee_backend/
   crypto.py       # cryptography 公钥解析/校验（PEM、DER、原始曲线点）与 AES-256-GCM 本地加解密
-  models.py       # Device / SignedPreKey / Session / Group / GroupSession / GroupSessionRotation / GroupSyncCursor / Message / MessageDelivery 数据模型
-  storage.py      # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、群组与冻结群会话、群会话轮换（幂等重放、无分叉）、消息原子追加与分页（群组会话限冻结成员）、投递去重/确认、群会话按设备同步分页与检查点游标、整体状态快照与恢复）
+  models.py       # Device / SignedPreKey / Session / Group / GroupSession / GroupSessionRotation / GroupSyncCursor / Message / MessageSubmission / MessageDelivery 数据模型
+  storage.py      # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、群组与冻结群会话、群会话轮换（幂等重放、无分叉）、消息原子追加与分页（群组会话限冻结成员）、幂等消息提交（request_id 重放/冲突）、投递去重/确认、群会话按设备同步分页与检查点游标、整体状态快照与恢复）
   persistence.py  # version=1 JSON 状态文件：缺失创建、损坏/版本不符拒启、临时文件+fsync+硬链接备份+os.replace+父目录 fsync 原子替换，启动清理/恢复崩溃遗留快照
   service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/群组/群会话/群会话轮换/消息/投递/群同步）
-  http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、群组创建/查询/成员增删、群组会话协商/查询/轮换、消息投递与拉取、重试/确认/状态、群会话同步与检查点）
-  cli.py          # register/show/revoke-*/rotate-identity-key/add-prekey/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
+  http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、群组创建/查询/成员增删、群组会话协商/查询/轮换、消息投递/幂等提交与拉取、重试/确认/状态、群会话同步与检查点）
+  cli.py          # register/show/revoke-*/rotate-identity-key/add-prekey/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
 tests/            # unittest 测试
 ```

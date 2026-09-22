@@ -15,6 +15,7 @@ _SESSIONS_PATH = "/v1/sessions"
 _SESSIONS_FROM_CLAIM_PATH = "/v1/sessions/from-claim"
 _SESSIONS_FROM_BATCH_CLAIM_PATH = "/v1/sessions/from-batch-claim"
 _MESSAGES_PATH = "/v1/messages"
+_MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 
@@ -58,6 +59,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_create_session()
         elif path == _MESSAGES_PATH:
             self._handle_post_message()
+        elif path == _MESSAGES_SUBMIT_PATH:
+            self._handle_submit_message()
         elif path == _GROUPS_PATH:
             self._handle_create_group()
         elif path == _GROUP_SESSIONS_PATH:
@@ -497,6 +500,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(201, body)
+
+    def _handle_submit_message(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.submit_message(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
 
     def _handle_list_messages(self, session_id: str) -> None:
         params = self._message_query_params()
