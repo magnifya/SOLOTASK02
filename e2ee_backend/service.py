@@ -234,6 +234,31 @@ class DeviceService:
                                "device_id", status_code=404)
         return view
 
+    def list_key_events(self, device_id: str, after: int,
+                        limit: int) -> Dict[str, Any]:
+        """Return one ascending page of a device's hash-chained key audit log.
+
+        *after* must be a non-negative integer (the first *limit* events with
+        ``seq > after`` are returned) and *limit* an integer in ``1..100``.
+        The body carries ``events`` (each with the seven audit fields),
+        ``next_after`` (equal to *after* on an empty page) and ``has_more``.
+        An unknown device id is 404/field=device_id; a revoked device is known
+        and its history stays readable.
+        """
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(after, int) or isinstance(after, bool) or after < 0:
+            raise ServiceError(
+                "field must be a non-negative integer: after", "after")
+        if (not isinstance(limit, int) or isinstance(limit, bool)
+                or limit < 1 or limit > 100):
+            raise ServiceError(
+                "field must be an integer between 1 and 100: limit", "limit")
+        page = self.store.key_events_page(device_id, after, limit)
+        if page is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return page
+
     # -- revocation --------------------------------------------------------
 
     def revoke_device(self, device_id: str) -> Dict[str, Any]:

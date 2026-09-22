@@ -6,10 +6,22 @@ order, so repeated requests list them identically.
 """
 from __future__ import annotations
 
+import copy
 import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from .key_events import (
+    EVENT_DEVICE_REVOKED,
+    EVENT_IDENTITY_ROTATED,
+    EVENT_PREKEY_ADDED,
+    EVENT_PREKEY_REVOKED,
+    EVENT_REGISTERED,
+    KEY_EVENT_TYPES,
+    build_key_event,
+    compute_event_hash,
+    key_event_to_dict,
+)
 from .models import (
     BatchClaimDevice,
     BatchClaimSessionBinding,
@@ -20,6 +32,7 @@ from .models import (
     GroupSession,
     GroupSessionRotation,
     GroupSyncCursor,
+    KeyEvent,
     Message,
     MessageDelivery,
     MessageSubmission,
@@ -302,6 +315,16 @@ class DeviceStore:
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
         self._group_delivery: Dict[Tuple[str, str, str], MessageDelivery] = {}
+        # Per-device append-only hash-chained key audit log, keyed by
+        # device_id in chain order (the chain never crosses devices).
+        self._key_events: Dict[str, List[KeyEvent]] = {}
+        # Audit logging is enabled whenever the state carries a key_events
+        # section (every fresh file writes one). A version-1 file predating
+        # the section loads without it; its history cannot be reconstructed,
+        # so auditing stays disabled for that process and snapshots keep
+        # omitting the section — a document this server writes must always
+        # satisfy its own restore checks.
+        self._audit_enabled = True
         # Called (under the lock) after any state mutation, for persistence.
         self.on_change: Optional[Callable[[], None]] = None
 
@@ -309,6 +332,27 @@ class DeviceStore:
         """Invoke the persistence hook after a committed mutation."""
         if self.on_change is not None:
             self.on_change()
+
+    def _append_key_event(self, device_id: str, event_type: str,
+                          payload: Dict[str, Any]) -> Optional[KeyEvent]:
+        """Append one audit event to a device's chain (caller holds the lock).
+
+        The chain is isolated per device: the device's first event gets
+        ``seq`` 1 and an empty ``prev_hash``; later events number consecutively
+        and chain to the prior event's hash. The change hook fires only after
+        the event is appended, so a rolled-back persistence failure leaves no
+        event behind. Returns ``None`` when audit logging is disabled (a
+        process restored from a section-less v1 file).
+        """
+        if not self._audit_enabled:
+            return None
+        chain = self._key_events.setdefault(device_id, [])
+        prev_hash = chain[-1].hash if chain else ""
+        event = build_key_event(
+            device_id=device_id, seq=len(chain) + 1, event_type=event_type,
+            payload=payload, prev_hash=prev_hash)
+        chain.append(event)
+        return event
 
     def add_device(self, device: Device) -> bool:
         """Insert a device.
@@ -322,6 +366,13 @@ class DeviceStore:
                 return False
             self._devices[key] = device
             self._device_index[device.device_id] = key
+            # The first chain entry audits exactly the registration body's
+            # ordered pre-keys (key id plus public key).
+            self._append_key_event(
+                device.device_id, EVENT_REGISTERED,
+                {"prekeys": [{"key_id": pk.key_id,
+                              "public_key": pk.public_key}
+                             for pk in device.prekeys]})
             self._notify_change()
             return True
 
@@ -347,12 +398,21 @@ class DeviceStore:
                     if not pk.revoked and not pk.consumed]
 
     def revoke_prekey(self, device: Device, key_id: str) -> bool:
-        """Mark one of the device's pre-keys revoked. Return ``False`` if absent."""
+        """Mark one of the device's pre-keys revoked. Return ``False`` if absent.
+
+        A first-time revocation appends a ``prekey_revoked`` audit event;
+        revoking an already-revoked key is idempotent and appends nothing.
+        """
         with self._lock:
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
-                    prekey.revoked = True
-                    self._notify_change()
+                    if not prekey.revoked:
+                        prekey.revoked = True
+                        self._append_key_event(
+                            device.device_id, EVENT_PREKEY_REVOKED,
+                            {"key_id": prekey.key_id,
+                             "public_key": prekey.public_key})
+                        self._notify_change()
                     return True
             return False
 
@@ -367,9 +427,16 @@ class DeviceStore:
             device = self._devices.get(key) if key is not None else None
             if device is None:
                 return None
+            already_revoked = device.revoked
             device.revoked = True
             for prekey in device.prekeys:
                 prekey.revoked = True
+            # A device revocation retires every pre-key at once; the event's
+            # empty payload is the "all revoked" record. A repeat revoke is
+            # idempotent and appends nothing.
+            if not already_revoked:
+                self._append_key_event(
+                    device.device_id, EVENT_DEVICE_REVOKED, {})
             self._notify_change()
             return device
 
@@ -379,7 +446,9 @@ class DeviceStore:
 
         Returns ``(device, key_found)``: ``device`` is ``None`` for an unknown
         device; otherwise ``key_found`` says whether *key_id* existed. Revoking
-        an already-revoked key is idempotent and reports it as found.
+        an already-revoked key is idempotent, reports it as found and appends
+        no second audit event; a first-time revocation appends one
+        ``prekey_revoked`` event naming the key id and public key.
         """
         with self._lock:
             key = self._device_index.get(device_id)
@@ -388,8 +457,13 @@ class DeviceStore:
                 return None, False
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
-                    prekey.revoked = True
-                    self._notify_change()
+                    if not prekey.revoked:
+                        prekey.revoked = True
+                        self._append_key_event(
+                            device.device_id, EVENT_PREKEY_REVOKED,
+                            {"key_id": prekey.key_id,
+                             "public_key": prekey.public_key})
+                        self._notify_change()
                     return device, True
             return device, False
 
@@ -421,8 +495,13 @@ class DeviceStore:
                 raise DeviceUpdateError(DEVICE_REVOKED)
             changed = identity_key != device.identity_key
             if changed:
+                old_identity_key = device.identity_key
                 device.identity_key = identity_key
                 device.rotated_at = utc_now_iso()
+                self._append_key_event(
+                    device.device_id, EVENT_IDENTITY_ROTATED,
+                    {"old_identity_key": old_identity_key,
+                     "new_identity_key": identity_key})
                 self._notify_change()
             return self.identity_view(device), changed
 
@@ -455,6 +534,9 @@ class DeviceStore:
                 raise DeviceUpdateError(PREKEY_CONFLICT)
             prekey = SignedPreKey(key_id=key_id, public_key=public_key)
             device.prekeys.append(prekey)
+            self._append_key_event(
+                device.device_id, EVENT_PREKEY_ADDED,
+                {"key_id": prekey.key_id, "public_key": prekey.public_key})
             self._notify_change()
             return ({"device_id": device.device_id,
                      "key_id": prekey.key_id,
@@ -478,6 +560,301 @@ class DeviceStore:
                                if not pk.revoked and not pk.consumed],
                 "registered_at": device.registered_at,
             }
+
+    # -- key audit log -----------------------------------------------------
+
+    @staticmethod
+    def key_event_view(event: KeyEvent) -> Dict[str, Any]:
+        """Copy one audit event into its seven-field public view."""
+        return key_event_to_dict(event)
+
+    def key_events_page(self, device_id: str, after: int,
+                        limit: int) -> Optional[Dict[str, Any]]:
+        """Return one ascending page of a device's key audit chain.
+
+        Returns ``None`` for an unknown device id (a revoked device is still
+        known and stays readable). The page is the first *limit* events with
+        ``seq > after``; ``next_after`` is the last returned seq or *after*
+        when the page is empty, and ``has_more`` reports events beyond it.
+        Read under the store lock, so a concurrent append cannot split a
+        page.
+        """
+        with self._lock:
+            if device_id not in self._device_index:
+                return None
+            chain = self._key_events.get(device_id, [])
+            page = [event for event in chain if event.seq > after][:limit]
+            if page:
+                next_after = page[-1].seq
+            else:
+                next_after = after
+            has_more = any(event.seq > next_after for event in chain)
+            return {
+                "events": [self.key_event_view(event) for event in page],
+                "next_after": next_after,
+                "has_more": has_more,
+            }
+
+    #: The exact seven fields every persisted audit event carries.
+    _KEY_EVENT_RECORD_FIELDS = frozenset({
+        "device_id", "seq", "type", "payload", "prev_hash", "hash",
+        "created_at"})
+
+    @staticmethod
+    def _require_nonempty_str(value: Any, where: str, name: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{where}.{name} must be a non-empty string")
+        return value
+
+    def _restore_key_events(
+            self, raw_key_events: Optional[List[Any]],
+            devices: Dict[Tuple[str, str], Device],
+            device_index: Dict[str, Tuple[str, str]]
+    ) -> Dict[str, List[KeyEvent]]:
+        """Validate and replay the optional ``key_events`` state section.
+
+        A missing section means "no audit log" and yields no chains. A present
+        section is fully verified: exact field set and types, references to
+        registered devices, per-device seq chains starting at 1 with
+        ``prev_hash`` linking, recomputed hashes, and a replay of identity,
+        pre-key order/public keys and revocations whose outcome must equal the
+        device section exactly. Any contradiction raises :class:`ValueError`,
+        so startup is refused without touching the file.
+        """
+        if raw_key_events is None:
+            return {}
+
+        per_device: Dict[str, List[KeyEvent]] = {}
+        for index, raw in enumerate(raw_key_events):
+            where = f"key_events[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if set(raw.keys()) != DeviceStore._KEY_EVENT_RECORD_FIELDS:
+                raise ValueError(
+                    f"{where} must have exactly the audit event fields")
+            device_id = self._require_nonempty_str(
+                raw["device_id"], where, "device_id")
+            seq = raw["seq"]
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+                raise ValueError(f"{where}.seq must be a positive integer")
+            event_type = self._require_nonempty_str(raw["type"], where, "type")
+            if event_type not in KEY_EVENT_TYPES:
+                raise ValueError(f"{where}.type is not a known event type: "
+                                 f"{event_type}")
+            payload = raw["payload"]
+            if not isinstance(payload, dict):
+                raise ValueError(f"{where}.payload must be an object")
+            prev_hash = raw["prev_hash"]
+            if not isinstance(prev_hash, str):
+                raise ValueError(f"{where}.prev_hash must be a string")
+            event_hash = self._require_nonempty_str(
+                raw["hash"], where, "hash")
+            self._require_nonempty_str(raw["created_at"], where, "created_at")
+            if device_id not in device_index:
+                raise ValueError(
+                    f"{where} references an unknown device: {device_id}")
+            # Recompute the hash over the six signed fields exactly as stored;
+            # a single tampered byte (or the hash itself) refuses startup.
+            if compute_event_hash(raw) != event_hash:
+                raise ValueError(f"{where} hash does not match its content")
+            per_device.setdefault(device_id, []).append(KeyEvent(
+                device_id=device_id, seq=seq, type=event_type,
+                payload=copy.deepcopy(payload), prev_hash=prev_hash,
+                hash=event_hash, created_at=raw["created_at"]))
+
+        # When the section is present the audit log is complete: every
+        # registered device must have a chain and vice versa.
+        if set(per_device.keys()) != set(device_index.keys()):
+            missing = sorted(set(device_index.keys()) - set(per_device.keys()))
+            extra = sorted(set(per_device.keys()) - set(device_index.keys()))
+            raise ValueError(
+                "key_events chains must cover exactly the registered devices "
+                f"(missing chains: {missing}, dangling chains: {extra})")
+
+        for device_id, chain in per_device.items():
+            expected_seq = 1
+            expected_prev = ""
+            for event in chain:
+                if event.seq != expected_seq:
+                    raise ValueError(
+                        f"key_events for device {device_id} are not "
+                        f"consecutive from seq 1 (got {event.seq}, expected "
+                        f"{expected_seq})")
+                if event.prev_hash != expected_prev:
+                    raise ValueError(
+                        f"key_events for device {device_id} have a broken "
+                        f"prev_hash link at seq {event.seq}")
+                expected_prev = event.hash
+                expected_seq += 1
+            device = devices[device_index[device_id]]
+            self._replay_key_event_chain(device, chain)
+        return per_device
+
+    @staticmethod
+    def _replay_key_event_chain(device: Device,
+                                chain: List[KeyEvent]) -> None:
+        """Replay one device's events and compare the outcome to the device doc.
+
+        Derives the identity key, the ordered pre-keys (id plus public key),
+        per-key revocation and the device-revoked flag purely from the chain,
+        then requires them to equal the device section exactly.
+        """
+        # insertion-ordered key_id -> (public_key, revoked)
+        prekeys: Dict[str, Tuple[str, bool]] = {}
+        # Replayed current identity. The registered payload carries pre-keys
+        # only, so the initial identity is unknown to the chain: the first
+        # rotation's old_identity_key establishes the baseline (and later
+        # rotations must chain old -> new), and the final replayed identity is
+        # checked against the device section. A device that never rotated has
+        # no identity material in the chain to compare.
+        identity: Optional[str] = None
+        device_revoked = False
+        saw_registration = False
+
+        for event in chain:
+            where = f"key event seq {event.seq} of device {device.device_id}"
+            payload = event.payload
+            if event.type == EVENT_REGISTERED:
+                if saw_registration:
+                    raise ValueError(f"{where}: duplicate registered event")
+                if set(payload.keys()) != {"prekeys"}:
+                    raise ValueError(
+                        f"{where}: registered payload must be {{'prekeys'}}")
+                raw_prekeys = payload["prekeys"]
+                if not isinstance(raw_prekeys, list):
+                    raise ValueError(
+                        f"{where}: registered prekeys must be a list")
+                for pk in raw_prekeys:
+                    if not isinstance(pk, dict) \
+                            or set(pk.keys()) != {"key_id", "public_key"}:
+                        raise ValueError(
+                            f"{where}: each prekey must be key_id/public_key")
+                    key_id = pk["key_id"]
+                    public_key = pk["public_key"]
+                    if not (isinstance(key_id, str) and key_id
+                            and isinstance(public_key, str) and public_key):
+                        raise ValueError(
+                            f"{where}: key_id/public_key must be non-empty "
+                            f"strings")
+                    if key_id in prekeys:
+                        raise ValueError(
+                            f"{where}: duplicate prekey key_id: {key_id}")
+                    prekeys[key_id] = (public_key, False)
+                saw_registration = True
+                continue
+
+            # Every non-registration event requires the registration first.
+            if not saw_registration:
+                raise ValueError(
+                    f"{where}: the device's first event must be registered")
+
+            if event.type == EVENT_IDENTITY_ROTATED:
+                if set(payload.keys()) != {"old_identity_key",
+                                           "new_identity_key"}:
+                    raise ValueError(
+                        f"{where}: identity_rotated payload must carry "
+                        f"old_identity_key/new_identity_key")
+                old_key = payload["old_identity_key"]
+                new_key = payload["new_identity_key"]
+                if not (isinstance(old_key, str) and old_key
+                        and isinstance(new_key, str) and new_key):
+                    raise ValueError(
+                        f"{where}: identity keys must be non-empty strings")
+                if new_key == old_key:
+                    raise ValueError(
+                        f"{where}: identity_rotated must change the key")
+                if identity is None:
+                    # First rotation: its old_identity_key pins the key the
+                    # device registered with (not otherwise present in the
+                    # chain); subsequent rotations must chain from this point.
+                    pass
+                elif old_key != identity:
+                    raise ValueError(
+                        f"{where}: old_identity_key does not match the "
+                        f"replayed identity")
+                if device_revoked:
+                    raise ValueError(
+                        f"{where}: identity rotated after device revocation")
+                identity = new_key
+            elif event.type in (EVENT_PREKEY_ADDED, EVENT_PREKEY_REVOKED):
+                if set(payload.keys()) != {"key_id", "public_key"}:
+                    raise ValueError(
+                        f"{where}: {event.type} payload must carry "
+                        f"key_id/public_key")
+                key_id = payload["key_id"]
+                public_key = payload["public_key"]
+                if not (isinstance(key_id, str) and key_id
+                        and isinstance(public_key, str) and public_key):
+                    raise ValueError(
+                        f"{where}: key_id/public_key must be non-empty strings")
+                if event.type == EVENT_PREKEY_ADDED:
+                    if key_id in prekeys:
+                        raise ValueError(
+                            f"{where}: added prekey key_id already exists: "
+                            f"{key_id}")
+                    if device_revoked:
+                        raise ValueError(
+                            f"{where}: prekey added after device revocation")
+                    prekeys[key_id] = (public_key, False)
+                else:
+                    record = prekeys.get(key_id)
+                    if record is None:
+                        raise ValueError(
+                            f"{where}: revoked prekey was never registered: "
+                            f"{key_id}")
+                    if record[0] != public_key:
+                        raise ValueError(
+                            f"{where}: revoked public_key does not match the "
+                            f"prekey")
+                    if record[1]:
+                        raise ValueError(
+                            f"{where}: prekey revoked twice: {key_id}")
+                    prekeys[key_id] = (public_key, True)
+            elif event.type == EVENT_DEVICE_REVOKED:
+                if payload:
+                    raise ValueError(
+                        f"{where}: device_revoked payload must be empty")
+                if device_revoked:
+                    raise ValueError(f"{where}: device revoked twice")
+                device_revoked = True
+                prekeys = {key_id: (pk, True) for key_id, (pk, _r)
+                           in prekeys.items()}
+            else:  # pragma: no cover - guarded by KEY_EVENT_TYPES
+                raise ValueError(f"{where}: unknown event type {event.type}")
+
+        # The chain must start with a registration (every live device does).
+        if not saw_registration:
+            raise ValueError(
+                f"key_events for device {device.device_id} have no "
+                f"registered event")
+
+        # Replay outcome vs. the device section: identity (only when the chain
+        # contains at least one rotation), pre-key order and public material,
+        # per-key revocation, and device revocation.
+        if identity is not None and identity != device.identity_key:
+            raise ValueError(
+                f"key_events replay identity does not match device "
+                f"{device.device_id}")
+        replayed_ids = list(prekeys.keys())
+        stored_ids = [pk.key_id for pk in device.prekeys]
+        if replayed_ids != stored_ids:
+            raise ValueError(
+                f"key_events replay prekey order does not match device "
+                f"{device.device_id}: {replayed_ids} != {stored_ids}")
+        for key_id, (public_key, revoked) in prekeys.items():
+            stored = next(pk for pk in device.prekeys if pk.key_id == key_id)
+            if stored.public_key != public_key:
+                raise ValueError(
+                    f"key_events replay public_key does not match device "
+                    f"{device.device_id} prekey {key_id}")
+            if stored.revoked != revoked:
+                raise ValueError(
+                    f"key_events replay revocation does not match device "
+                    f"{device.device_id} prekey {key_id}")
+        if device.revoked != device_revoked:
+            raise ValueError(
+                f"key_events replay device revocation does not match device "
+                f"{device.device_id}")
 
     # -- pre-key claims ----------------------------------------------------
 
@@ -1924,7 +2301,7 @@ class DeviceStore:
                 "ciphertext": r.ciphertext,
                 "created_at": r.created_at,
             } for r in self._message_submissions.values()]
-            return {"devices": devices, "sessions": sessions,
+            document: Dict[str, Any] = {"devices": devices, "sessions": sessions,
                     "prekey_claims": prekey_claims,
                     "prekey_batch_claims": prekey_batch_claims,
                     "claim_session_bindings": claim_session_bindings,
@@ -1938,6 +2315,15 @@ class DeviceStore:
                     "group_sync_cursors": group_sync_cursors,
                     "message_sync_cursors": message_sync_cursors,
                     "message_submissions": message_submissions}
+            # The audit section is omitted for a process restored from a
+            # section-less v1 file (audit disabled); otherwise the per-device
+            # chains are serialized in chain order, devices concatenated.
+            if self._audit_enabled:
+                document["key_events"] = [
+                    self.key_event_view(event)
+                    for chain in self._key_events.values()
+                    for event in chain]
+            return document
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         """Replace all in-memory state from a persisted (version-stripped) doc.
@@ -1966,6 +2352,7 @@ class DeviceStore:
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
         raw_message_sync_cursors = state.get("message_sync_cursors", [])
         raw_message_submissions = state.get("message_submissions", [])
+        raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
                 and isinstance(raw_prekey_batch_claims, list)
@@ -1979,7 +2366,9 @@ class DeviceStore:
                 and isinstance(raw_group_delivery, list)
                 and isinstance(raw_group_sync_cursors, list)
                 and isinstance(raw_message_sync_cursors, list)
-                and isinstance(raw_message_submissions, list)):
+                and isinstance(raw_message_submissions, list)
+                and (raw_key_events is None
+                     or isinstance(raw_key_events, list))):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -3189,7 +3578,18 @@ class DeviceStore:
             message_sync_cursors[ckey] = MessageSyncCursor(
                 cursor=cursor, updated_at=updated_at)
 
+        # Optional per-device hash-chained key audit log. A missing section
+        # loads as no chains (v1 files written before audit logging stay
+        # valid). A present section is fully verified — field set, device
+        # references, consecutive seq / prev_hash links, recomputed hashes —
+        # and replayed against the device section (identity, pre-key order,
+        # public keys and revocations must all agree); any contradiction
+        # refuses startup and leaves the file untouched.
+        key_events = self._restore_key_events(
+            raw_key_events, devices, device_index)
+
         with self._lock:
+            self._audit_enabled = raw_key_events is not None
             self._devices = devices
             self._device_index = device_index
             self._sessions = sessions
@@ -3213,3 +3613,4 @@ class DeviceStore:
             self._group_sync_cursors = group_sync_cursors
             self._message_sync_cursors = message_sync_cursors
             self._message_submissions = message_submissions
+            self._key_events = key_events

@@ -213,6 +213,16 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_show_group_session(unquote(suffix))
         elif path.startswith(_DEVICES_PATH + "/"):
             suffix = path[len(_DEVICES_PATH) + 1:]
+            if suffix.endswith("/key-events"):
+                device_id = suffix[:-len("/key-events")]
+                # A raw slash beyond the fixed suffix means a sub-path; a
+                # percent-encoded slash within the segment is part of the id.
+                if not device_id or "/" in device_id:
+                    self._send_json(404, {"message": "device not found",
+                                          "field": "device_id"})
+                    return
+                self._handle_key_events(unquote(device_id))
+                return
             # A real slash means a sub-path (…/devices/a/b); a percent-encoded
             # slash within a single segment is part of the device id.
             if not suffix or "/" in suffix:
@@ -274,6 +284,32 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(200, body)
+
+    def _handle_key_events(self, device_id: str) -> None:
+        params = self._key_events_query_params()
+        if params is None:
+            return  # a 400 response was already sent
+        after, limit = params
+        try:
+            body = self.service.list_key_events(device_id, after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _key_events_query_params(self) -> Optional[Tuple[int, int]]:
+        """Validate ``after`` (default 0, >= 0) and ``limit`` (default 100,
+        1..100) for the key-events route. Returns ``(after, limit)``, or
+        ``None`` after sending the 400 response itself."""
+        query = parse_qs(urlsplit(self.path).query)
+        after = self._int_param(query, "after", default=0, minimum=0)
+        if after is None:
+            return None
+        limit = self._int_param(query, "limit", default=100,
+                                minimum=1, maximum=100)
+        if limit is None:
+            return None
+        return after, limit
 
     def _handle_revoke_device(self, device_id: str) -> None:
         try:

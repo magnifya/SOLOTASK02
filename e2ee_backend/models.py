@@ -34,6 +34,27 @@ class SignedPreKey:
 
 
 @dataclass
+class KeyEvent:
+    """One append-only, hash-chained entry of a device's key audit log.
+
+    Events are isolated per device: each device's ``seq`` starts at 1 and is
+    consecutive; the first event's ``prev_hash`` is the empty string and each
+    later event carries the previous event's ``hash``. The ``hash`` is the
+    SHA-256 (lowercase hex) of the compact, sorted-key UTF-8 JSON of every
+    field but ``hash``. ``payload`` shape depends on ``type``; it is kept
+    verbatim so the log is replayable.
+    """
+
+    device_id: str
+    seq: int
+    type: str
+    payload: Dict[str, object] = field(default_factory=dict)
+    prev_hash: str = ""
+    hash: str = ""
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class Device:
     """A registered device belonging to a user."""
 
