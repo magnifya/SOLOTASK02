@@ -35,8 +35,10 @@ being silently overwritten.
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
+import sys
 import tempfile
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -179,18 +181,53 @@ class JsonStateStore:
                 pass
 
 
-def _fsync_directory(directory: str) -> None:
+def _directory_fsync_unsupported(error: OSError) -> bool:
+    """Classify *error* as "this platform/filesystem cannot fsync a directory".
+
+    Some POSIX network or special filesystems reject ``fsync`` on a
+    directory fd with ``EINVAL`` (others use ``ENOTSUP``/``EOPNOTSUPP``);
+    on Windows a directory cannot be opened for this at all and the CRT
+    fails with ``EACCES`` (older runtimes raise ``EISDIR``). None of these
+    means the data write itself failed — the file fsync and the atomic
+    rename already landed — so the directory flush is safely skipped
+    instead of failing (and rolling back) the whole transaction. Genuine
+    I/O errors (``EIO``, ``EBADF``, permission problems elsewhere, ...)
+    still propagate.
+    """
+    unsupported = {errno.EINVAL, errno.ENOTSUP,
+                   getattr(errno, "EOPNOTSUPP", None)}
+    if error.errno in unsupported:
+        return True
+    if sys.platform == "win32" and error.errno in (errno.EACCES, errno.EISDIR):
+        return True
+    return False
+
+
+def _fsync_directory(directory: str) -> bool:
     """Flush *directory*'s metadata so a recent rename survives a crash.
 
-    Propagates :class:`OSError`; on platforms without ``O_DIRECTORY`` the
-    plain read-only open still works.
+    Returns ``True`` when the flush ran. When the platform or underlying
+    filesystem cannot fsync directories, the capability is safely skipped
+    (returns ``False``) without reporting a failure; every other
+    :class:`OSError` propagates to the caller. On platforms without
+    ``O_DIRECTORY`` the plain read-only open still works.
     """
     flags = os.O_RDONLY
-    dir_fd = os.open(directory, flags)
+    try:
+        dir_fd = os.open(directory, flags)
+    except OSError as error:
+        if _directory_fsync_unsupported(error):
+            return False
+        raise
     try:
         os.fsync(dir_fd)
+    except OSError as error:
+        if _directory_fsync_unsupported(error):
+            return False
+        raise
     finally:
         os.close(dir_fd)
+    return True
 
 
 def _hardlink_backup(directory: str, target: str) -> Optional[str]:

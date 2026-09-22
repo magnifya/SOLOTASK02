@@ -7,22 +7,32 @@ may hold the lock at a time; a second process fails to start instead of
 running recovery or atomic-replace transactions against a file another
 process is writing.
 
-The lock is a BSD-style advisory :func:`fcntl.flock` on a regular lock file
-that is *created but never truncated*. ``flock`` locks are owned by the open
-file description and are released by the kernel as soon as the process exits
-normally or is killed (even by ``SIGKILL``), so a successor can start and
-recover the state without any stale-lock cleanup.
+Two platform backends share one API:
+
+* POSIX: a BSD-style advisory :func:`fcntl.flock` on a regular lock file.
+* Windows: a non-blocking byte-range lock
+  (:func:`msvcrt.locking` ``LK_NBLCK`` on one byte) on the same kind of file.
+
+In both cases the lock is *created but never truncated* and is tied to the
+process: closing the descriptor or terminating the process releases it, even
+on ``SIGKILL`` (POSIX) or ``TerminateProcess`` (Windows, where the lock is
+owned by the file object and dropped at process teardown). A successor can
+therefore start and recover the state without any stale-lock cleanup.
 """
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
+import sys
 from types import TracebackType
 from typing import Optional, Type
 
 #: Suffix appended to the state file name for its same-directory lock file.
 _LOCK_SUFFIX = ".lock"
+
+#: Number of bytes covered by the Windows byte-range lock (at least one byte
+#: starting at offset 0).
+_WINDOWS_LOCK_BYTES = 1
 
 
 class StateFileLocked(Exception):
@@ -40,6 +50,70 @@ def lock_path_for(state_path: str) -> str:
     """
     absolute = os.path.abspath(state_path)
     return absolute + _LOCK_SUFFIX
+
+
+def _windows_lock_fd(fd: int) -> None:
+    """Take a non-blocking exclusive Windows byte-range lock on *fd*.
+
+    Locks one byte at offset 0 of the file via :func:`msvcrt.locking`
+    (``LK_NBLCK``). Raises :class:`StateFileLocked` (empty message) when
+    another live process already holds that byte range; any other
+    :class:`OSError` propagates to the caller.
+    """
+    import msvcrt
+
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, _WINDOWS_LOCK_BYTES)
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EDEADLK):
+            raise StateFileLocked() from None
+        raise
+
+
+def _windows_unlock_fd(fd: int) -> None:
+    """Release the byte-range lock taken by :func:`_windows_lock_fd`."""
+    import msvcrt
+
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, _WINDOWS_LOCK_BYTES)
+    except OSError:
+        pass
+
+
+def _posix_lock_fd(fd: int) -> None:
+    """Take a non-blocking advisory ``flock`` (``LOCK_EX | LOCK_NB``).
+
+    Raises :class:`StateFileLocked` (empty message) when another live
+    process already holds the lock; any other :class:`OSError` propagates.
+    """
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            raise StateFileLocked() from None
+        raise
+
+
+def _posix_unlock_fd(fd: int) -> None:
+    """Release the advisory ``flock`` (best effort)."""
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+if sys.platform == "win32":  # pragma: posix cover - exercised on Windows CI
+    _lock_fd = _windows_lock_fd
+    _unlock_fd = _windows_unlock_fd
+else:
+    _lock_fd = _posix_lock_fd
+    _unlock_fd = _posix_unlock_fd
 
 
 class StateFileLock:
@@ -61,11 +135,11 @@ class StateFileLock:
         """Take the exclusive lock or raise :class:`StateFileLocked`.
 
         Opens (creating if needed, never truncating) the sibling lock file
-        and takes a non-blocking exclusive ``flock``. If another live process
-        already holds it, the descriptor is closed and
-        :class:`StateFileLocked` is raised without touching the formal state
-        file. Any other :class:`OSError` (missing/unwritable directory)
-        propagates to the caller.
+        and takes a non-blocking exclusive lock through the platform
+        backend. If another live process already holds it, the descriptor is
+        closed and :class:`StateFileLocked` is raised without touching the
+        formal state file. Any other :class:`OSError` (missing/unwritable
+        directory) propagates to the caller.
         """
         directory = os.path.dirname(self.lock_path)
         os.makedirs(directory, exist_ok=True)
@@ -73,13 +147,14 @@ class StateFileLock:
         # holder and its bytes must be left alone.
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
+            _lock_fd(fd)
+        except StateFileLocked:
             os.close(fd)
-            if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                raise StateFileLocked(
-                    f"state file is locked by another process: {self.path}") \
-                    from None
+            raise StateFileLocked(
+                f"state file is locked by another process: {self.path}") \
+                from None
+        except BaseException:
+            os.close(fd)
             raise
         self._fd = fd
 
@@ -89,10 +164,7 @@ class StateFileLock:
         if fd is None:
             return
         self._fd = None
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
+        _unlock_fd(fd)
         try:
             os.close(fd)
         except OSError:
@@ -100,7 +172,7 @@ class StateFileLock:
 
     def __enter__(self) -> "StateFileLock":
         # Idempotent: acquire_state_file_lock() returns an already-acquired
-        # lock, so re-entering it as a context manager must not flock a second
+        # lock, so re-entering it as a context manager must not lock a second
         # descriptor (which would dead-lock against the first).
         if self._fd is None:
             self.acquire()
