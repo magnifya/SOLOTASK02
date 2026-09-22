@@ -1,12 +1,22 @@
 """End-to-end subprocess tests for the group CLI subcommands."""
+import base64
 import json
 import subprocess
 import sys
 import threading
 import unittest
 
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives import serialization
+
 from e2ee_backend.http_app import create_server
 from e2ee_backend.models import Device
+
+
+def _valid_key() -> str:
+    raw = x25519.X25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return base64.b64encode(raw).decode()
 
 
 class GroupCLITest(unittest.TestCase):
@@ -149,6 +159,71 @@ class GroupCLITest(unittest.TestCase):
 
     def test_show_group_session_unknown(self) -> None:
         result = self._run("show-group-session", "missing")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self._json(result.stderr)["field"], "session_id")
+
+    def test_rotate_group_session_create_and_replay(self) -> None:
+        self._run("group-create", "--group-id", "g1",
+                  "--creator-device-id", "creator",
+                  "--member-device-id", "alice")
+        session = self._json(self._run(
+            "create-group-session", "--group-id", "g1",
+            "--initiator-device-id", "creator",
+            "--ephemeral-key", "ephemeral-key").stdout)
+        first = self._run("rotate-group-session", session["session_id"],
+                          "--rotation-id", "rot-1",
+                          "--actor-device-id", "creator",
+                          "--ephemeral-key", _valid_key(),
+                          "--expected-revision", "1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        body = self._json(first.stdout)
+        self.assertEqual(set(body), {
+            "session_id", "group_id", "initiator_device_id",
+            "ephemeral_key", "revision", "members", "created_at",
+            "rotation_id", "predecessor_session_id"})
+        self.assertEqual(body["rotation_id"], "rot-1")
+        self.assertEqual(body["predecessor_session_id"],
+                         session["session_id"])
+        self.assertEqual(body["members"], ["creator", "alice"])
+
+        # Replaying the same rotation id returns 200 (still exit 0) with the
+        # original response.
+        replay = self._run("rotate-group-session", session["session_id"],
+                           "--rotation-id", "rot-1",
+                           "--actor-device-id", "creator",
+                           "--ephemeral-key", _valid_key(),
+                           "--expected-revision", "1")
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(self._json(replay.stdout), body)
+
+    def test_rotate_group_session_fork_conflict_stderr(self) -> None:
+        self._run("group-create", "--group-id", "g1",
+                  "--creator-device-id", "creator",
+                  "--member-device-id", "alice")
+        session = self._json(self._run(
+            "create-group-session", "--group-id", "g1",
+            "--initiator-device-id", "creator",
+            "--ephemeral-key", "ephemeral-key").stdout)
+        self.assertEqual(self._run(
+            "rotate-group-session", session["session_id"],
+            "--rotation-id", "rot-1", "--actor-device-id", "creator",
+            "--ephemeral-key", _valid_key(), "--expected-revision",
+            "1").returncode, 0)
+        result = self._run(
+            "rotate-group-session", session["session_id"],
+            "--rotation-id", "rot-2", "--actor-device-id", "creator",
+            "--ephemeral-key", _valid_key(), "--expected-revision",
+            "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(result.stdout.strip())
+        self.assertEqual(self._json(result.stderr)["field"], "session_id")
+
+    def test_rotate_group_session_unknown_predecessor(self) -> None:
+        result = self._run(
+            "rotate-group-session", "missing",
+            "--rotation-id", "rot-1", "--actor-device-id", "creator",
+            "--ephemeral-key", _valid_key(), "--expected-revision",
+            "1")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self._json(result.stderr)["field"], "session_id")
 

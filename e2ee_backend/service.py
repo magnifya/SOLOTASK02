@@ -59,6 +59,13 @@ from .storage import (
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
     PREKEY_CONFLICT,
+    ROTATION_ACTOR_NOT_CREATOR,
+    ROTATION_ACTOR_REVOKED,
+    ROTATION_ACTOR_UNKNOWN,
+    ROTATION_PREDECESSOR_ROTATED,
+    ROTATION_REVISION_MISMATCH,
+    ROTATION_ID_CONFLICT,
+    ROTATION_SESSION_UNKNOWN,
     SESSION_INITIATOR_REVOKED,
     SESSION_INITIATOR_UNKNOWN,
     SESSION_PREKEY_CONSUMED,
@@ -77,6 +84,7 @@ from .storage import (
     ClaimSessionError,
     DeliveryError,
     GroupError,
+    GroupSessionRotationError,
     GroupSyncError,
     MessageCreateError,
     MessageListError,
@@ -829,6 +837,89 @@ class DeviceService:
             raise ServiceError(f"session not found: {session_id}",
                                "session_id", status_code=404)
         return self.store.group_session_view(session)
+
+    #: Maps a rotation failure reason to (HTTP status, field name).
+    _ROTATION_ERROR_MAP = {
+        ROTATION_SESSION_UNKNOWN: (404, "session_id"),
+        ROTATION_ACTOR_UNKNOWN: (404, "actor_device_id"),
+        ROTATION_ACTOR_REVOKED: (409, "actor_device_id"),
+        ROTATION_ACTOR_NOT_CREATOR: (409, "actor_device_id"),
+        ROTATION_REVISION_MISMATCH: (409, "expected_revision"),
+        ROTATION_ID_CONFLICT: (409, "rotation_id"),
+        ROTATION_PREDECESSOR_ROTATED: (409, "session_id"),
+    }
+
+    def rotate_group_session(self, predecessor_session_id: str,
+                             payload: object
+                             ) -> Tuple[Dict[str, Any], int]:
+        """Validate a rotation payload and atomically rotate the predecessor.
+
+        ``rotation_id`` and ``actor_device_id`` must be non-empty strings,
+        ``ephemeral_key`` a non-empty valid public key and
+        ``expected_revision`` a positive integer; the first rotation returns
+        201, an idempotent replay (same id on the same predecessor) 200 with
+        the original response.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("rotation_id", "actor_device_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if "ephemeral_key" not in payload:
+            raise ServiceError(
+                "missing required field: ephemeral_key", "ephemeral_key")
+        if not is_nonempty_string(payload["ephemeral_key"]):
+            raise ServiceError(
+                "field must be a non-empty string: ephemeral_key",
+                "ephemeral_key")
+        if load_public_key(payload["ephemeral_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: ephemeral_key",
+                "ephemeral_key")
+        if "expected_revision" not in payload:
+            raise ServiceError(
+                "missing required field: expected_revision",
+                "expected_revision")
+        expected_revision = payload["expected_revision"]
+        if not isinstance(expected_revision, int) \
+                or isinstance(expected_revision, bool) \
+                or expected_revision <= 0:
+            raise ServiceError(
+                "field must be a positive integer: expected_revision",
+                "expected_revision")
+
+        try:
+            successor, rotation, created = self.store.rotate_group_session(
+                predecessor_session_id, payload["rotation_id"],
+                payload["actor_device_id"], payload["ephemeral_key"],
+                expected_revision)
+        except GroupSessionRotationError as error:
+            status_code, field = self._ROTATION_ERROR_MAP[error.reason]
+            if error.reason == ROTATION_SESSION_UNKNOWN:
+                message = f"session not found: {predecessor_session_id}"
+            elif error.reason == ROTATION_ACTOR_UNKNOWN:
+                message = ("actor_device_id is not a registered device: "
+                           f"{payload['actor_device_id']}")
+            elif error.reason == ROTATION_REVISION_MISMATCH:
+                message = (
+                    "expected_revision does not match the group's current "
+                    "revision")
+            elif error.reason == ROTATION_ID_CONFLICT:
+                message = (
+                    "rotation_id has already rotated another session: "
+                    f"{payload['rotation_id']}")
+            elif error.reason == ROTATION_PREDECESSOR_ROTATED:
+                message = "session has already been rotated"
+            else:
+                message = (
+                    "actor_device_id is revoked or is not the group creator")
+            raise ServiceError(message, field, status_code=status_code)
+        return self.store.rotation_view(successor, rotation), \
+            201 if created else 200
 
     # -- group-session sync ------------------------------------------------
 
