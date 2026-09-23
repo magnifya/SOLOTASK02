@@ -9,8 +9,11 @@ as generation 0; a present-but-invalid field (bool, negative number, float,
 string) makes startup refuse with field=data_file without touching the file.
 
 When the formal file is missing, crash-leftover snapshots rank by commit
-generation first (highest ``commit_seq`` wins even with an older mtime), then
-by mtime; when every candidate lacks the field the legacy mtime rule stands.
+generation first (highest ``commit_seq`` wins even with an older mtime); when
+two or more verifiable candidates tie at that highest generation the choice is
+ambiguous and startup refuses (nothing is promoted or removed) rather than
+ever breaking the tie by name or mtime. Only when every candidate lacks
+the field does the legacy newest-mtime rule stand.
 """
 import json
 import os
@@ -273,17 +276,51 @@ class MissingFormalGenerationRankingTest(unittest.TestCase):
         self.assertEqual(
             service.store._group_sync_cursors[(self.sid, "alice")].cursor, 2)
 
-    def test_equal_generation_prefers_newer_mtime(self) -> None:
+    def test_equal_generation_tie_is_refused_not_mtime_picked(self) -> None:
+        from e2ee_backend.persistence import StateFileError
         self._remove_formal()
-        older = self._doc_at(7)
-        newer = self._doc_at(7)
-        self._leftover(".state-eq-old.tmp", older, 1000)
-        newer_path = self._leftover(".state-eq-new.tmp", newer, 9000)
-        newer_ino = os.stat(newer_path).st_ino
-        self._recover()
-        # os.replace promotes the newer-mtime file in place (same inode).
-        self.assertEqual(os.stat(self.path).st_ino, newer_ino)
+        # Two verifiable candidates at the same generation; one has a strictly
+        # newer mtime and the other the earlier-sorting name. Neither may win.
+        older_path = self._leftover(
+            ".state-000-eq-old.tmp", self._doc_at(7), 1000)
+        newer_path = self._leftover(
+            ".state-eq-new.tmp", self._doc_at(7), 9000)
+        older_bytes = open(older_path, "rb").read()
+        newer_bytes = open(newer_path, "rb").read()
+        # Recovery aborts: startup refuses, the formal path stays missing and both
+        # candidates are preserved byte-for-byte for inspection/resolution.
+        with self.assertRaises(StateFileError):
+            self._recover()
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(open(older_path, "rb").read(), older_bytes)
+        self.assertEqual(open(newer_path, "rb").read(), newer_bytes)
+        self.assertEqual(
+            tmp_names(self.directory),
+            [".state-000-eq-old.tmp", ".state-eq-new.tmp"])
+        # Resolving the ambiguity (removing one twin) lets the unique survivor
+        # promote normally; the retained generation then continues consecutively.
+        os.unlink(newer_path)
+        service, state_store = self._recover()
         self.assertEqual(_read_doc(self.path)["commit_seq"], 7)
+        self.assertEqual(state_store.commit_seq, 8)
+        self.assertEqual(tmp_names(self.directory), [])
+        service.store.add_device(Device("u", "next", "ik"))
+        self.assertEqual(_read_doc(self.path)["commit_seq"], 8)
+
+    def test_equal_generation_tie_behind_unique_higher_one_still_recovers(
+            self) -> None:
+        # A tied pair at a lower generation must not block promotion of a unique,
+        # strictly-higher verifiable candidate.
+        self._remove_formal()
+        self._leftover(".state-tie-a.tmp", self._doc_at(2), 1000)
+        self._leftover(".state-tie-b.tmp", self._doc_at(2), 9000)
+        winner = self._leftover(
+            ".state-win.tmp", self._doc_at(3), 5000)
+        winner_ino = os.stat(winner).st_ino
+        self._recover()
+        self.assertEqual(os.stat(self.path).st_ino, winner_ino)
+        self.assertEqual(_read_doc(self.path)["commit_seq"], 3)
+        self.assertEqual(tmp_names(self.directory), [])
 
     def test_fieldless_candidates_keep_legacy_mtime_rule(self) -> None:
         self._remove_formal()

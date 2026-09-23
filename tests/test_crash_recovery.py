@@ -86,6 +86,13 @@ def quarantine_names(directory: str) -> List[str]:
                   and name.endswith(".quarantine"))
 
 
+def block_names(directory: str) -> List[str]:
+    """Names of durable blocking-state markers."""
+    return sorted(name for name in os.listdir(directory)
+                  if name.startswith(".state-")
+                  and name.endswith(".block"))
+
+
 class ValidFormalWinsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.mkdtemp()
@@ -485,6 +492,274 @@ class RollbackRenameFailureTest(unittest.TestCase):
         self.assertTrue(service.store.find_by_device_id("alice").revoked)
 
 
+class BlockingStateTest(unittest.TestCase):
+    """The undecidable failure that cannot even vacate the formal path.
+
+    When the post-replace fsync fails, the rollback rename fails,
+    and the un-committed new snapshot can be neither quarantined nor
+    deleted, the store cannot guarantee a missing formal path with a unique
+    backup. It must then enter the *blocking* state: leave a durable
+    ``.block`` marker, never serve the residual formal file as
+    authoritative, and answer 503/field=data_file for every later write
+    in this process and after a restart — until the path is vacated and a
+    unique verifiable backup can be promoted.
+    """
+
+    def setUp(self) -> None:
+        import e2ee_backend.persistence as persistence_mod
+        self.persistence_mod = persistence_mod
+        self._real_fsync = persistence_mod.os.fsync
+        self._real_replace = persistence_mod.os.replace
+        self._real_unlink = persistence_mod.os.unlink
+        self.directory = tempfile.mkdtemp()
+        self.path = os.path.join(self.directory, "state.json")
+        self.service = DeviceService()
+        self.state_store = attach_persistence(self.service, self.path)
+        for device_id in ("creator", "alice", "bob"):
+            self.service.store.add_device(Device("u", device_id, "ik"))
+        with open(self.path, "rb") as handle:
+            self.good_bytes = handle.read()
+        self.good_ino = os.stat(self.path).st_ino
+        self.good_seq = json.loads(self.good_bytes.decode("utf-8"))[
+            "commit_seq"]
+
+    def tearDown(self) -> None:
+        self._restore_io()
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def _restore_io(self) -> None:
+        self.persistence_mod.os.fsync = self._real_fsync
+        self.persistence_mod.os.replace = self._real_replace
+        self.persistence_mod.os.unlink = self._real_unlink
+
+    def _induce_blocked(self, device_id: str = "alice") -> None:
+        """Force the formal path to keep the un-committed residual file."""
+        from e2ee_backend.persistence import PersistenceUnavailable
+        real_fsync = self._real_fsync
+        real_replace = self._real_replace
+        real_unlink = self._real_unlink
+        target = os.path.abspath(self.path)
+
+        def fail_on_directory_fd(fd: int) -> None:  # noqa: ANN001
+            if os.fstat(fd).st_mode & 0o170000 == 0o040000:
+                raise OSError("simulated post-replace fsync failure")
+            real_fsync(fd)
+
+        def replace_patch(src: str, dst: str) -> None:
+            s = os.path.abspath(src)
+            d = os.path.abspath(dst)
+            rollback = s.endswith(".bak") and d == target
+            quarantine = s == target and d.endswith(".quarantine")
+            if rollback or quarantine:
+                raise OSError("simulated blocked rollback/quarantine rename")
+            return real_replace(src, dst)
+
+        def unlink_patch(path: str) -> None:
+            if os.path.abspath(path) == target:
+                raise OSError("simulated blocked formal unlink")
+            return real_unlink(path)
+
+        self.persistence_mod.os.fsync = fail_on_directory_fd
+        self.persistence_mod.os.replace = replace_patch
+        self.persistence_mod.os.unlink = unlink_patch
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device(device_id)
+        finally:
+            self._restore_io()
+
+    def test_blocked_residual_is_never_authoritative_and_writes_503(
+            self) -> None:
+        from e2ee_backend.persistence import PersistenceUnavailable
+        self._induce_blocked("alice")
+        # The formal path survives, holding the un-committed snapshot...
+        self.assertTrue(os.path.exists(self.path))
+        residual = json.loads(open(self.path, encoding="utf-8").read())
+        self.assertTrue(any(
+            d["device_id"] == "alice" and d.get("revoked")
+            for d in residual["devices"]))
+        self.assertNotEqual(open(self.path, "rb").read(),
+                            self.good_bytes)
+        # ...but memory rolled back, so the residual is not authoritative...
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        # ...a durable marker and a pinned committed backup are present...
+        self.assertEqual(len(block_names(self.directory)), 1)
+        baks = bak_names(self.directory)
+        self.assertEqual(len(baks), 1)
+        self.assertEqual(
+            open(os.path.join(self.directory, baks[0]), "rb").read(),
+            self.good_bytes)
+        # ...and the store is blocked (not merely degraded).
+        self.assertTrue(self.state_store.blocked)
+        self.assertFalse(self.state_store.degraded)
+
+        # Every later write is 503 and moves nothing: the residual formal
+        # bytes/inode are untouched and never become authoritative.
+        before = open(self.path, "rb").read()
+        before_ino = os.stat(self.path).st_ino
+        for _ in range(2):
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("bob")
+        self.assertEqual(open(self.path, "rb").read(), before)
+        self.assertEqual(os.stat(self.path).st_ino, before_ino)
+        self.assertTrue(self.state_store.blocked)
+        self.assertEqual(len(block_names(self.directory)), 1)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("bob").revoked)
+
+    def test_block_heals_once_path_vacated_unique_backup_promoted(
+            self) -> None:
+        from e2ee_backend.persistence import PersistenceUnavailable
+        self._induce_blocked("alice")
+        residual_ino = os.stat(self.path).st_ino
+        # A write while still blocked is refused and leaves the residual in place.
+        with self.assertRaises(PersistenceUnavailable):
+            self.service.revoke_device("bob")
+        self.assertEqual(os.stat(self.path).st_ino, residual_ino)
+        # Operator resolves the on-disk state by vacating the un-decidable
+        # residual; the unique pinned committed backup remains.
+        os.unlink(self.path)
+        # The next write heals inside the lock (promotes the unique pin
+        # via hard link, clears marker/backup) and then commits the
+        # current request once; the 503ed request is not replayed.
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(block_names(self.directory), [])
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(self._formal()["commit_seq"], self.good_seq + 1)
+        self.assertTrue(
+            self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        self.assertFalse(self.state_store.blocked)
+        restarted = DeviceService()
+        attach_persistence(restarted, self.path)
+        self.assertTrue(restarted.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            restarted.store.find_by_device_id("alice").revoked)
+
+    def test_restart_refuses_while_block_marker_and_residual_present(self) -> None:
+        from e2ee_backend.persistence import StateFileError
+        self._induce_blocked("alice")
+        marker = os.path.join(self.directory,
+                               block_names(self.directory)[0])
+        residual_before = open(self.path, "rb").read()
+        # A restart keeps refusing: the residual formal is never accepted.
+        with self.assertRaises(StateFileError):
+            attach_persistence(DeviceService(), self.path)
+        self.assertEqual(open(self.path, "rb").read(), residual_before)
+        self.assertTrue(os.path.exists(marker))
+        self.assertEqual(len(bak_names(self.directory)), 1)
+
+    def test_restart_unblocks_when_formal_matches_unique_backup(self) -> None:
+        # A valid formal file always takes precedence, even across a restart
+        # with a .block marker present: restore the committed bytes onto the
+        # formal path; it semantically equals the unique pin, so startup
+        # accepts it, sweeps marker/pin and serves normally.
+        from e2ee_backend.persistence import StateFileError
+        self._induce_blocked("alice")
+        with open(self.path, "wb") as handle:
+            handle.write(self.good_bytes)
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        self.assertEqual(block_names(self.directory), [])
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertFalse(
+            service.store.find_by_device_id("alice").revoked)
+        service.revoke_device("alice")
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq + 1)
+
+    def test_restart_unblocks_from_unique_backup_after_path_vacated(self) -> None:
+        from e2ee_backend.persistence import StateFileError
+        self._induce_blocked("alice")
+        # Merely deleting the residual is not enough while the marker sees a
+        # formal file present elsewhere; here the operator vacates it and the
+        # unique committed backup is recoverable on restart.
+        os.unlink(self.path)
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        self.assertEqual(block_names(self.directory), [])
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertFalse(
+            service.store.find_by_device_id("alice").revoked)
+        service.revoke_device("alice")
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq + 1)
+
+    def test_restart_blocked_with_two_backups_still_refuses(self) -> None:
+        from e2ee_backend.persistence import StateFileError
+        self._induce_blocked("alice")
+        os.unlink(self.path)
+        # Two verifiable backups of the committed state make promotion
+        # ambiguous; the block must stay and startup must keep refusing.
+        twin = os.path.join(self.directory, ".state-twin.bak")
+        with open(twin, "wb") as handle:
+            handle.write(self.good_bytes)
+        with self.assertRaises(StateFileError):
+            attach_persistence(DeviceService(), self.path)
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(len(block_names(self.directory)), 1)
+        self.assertEqual(len(bak_names(self.directory)), 2)
+
+    def test_restart_blocked_committed_formal_wins_with_two_backups(self) -> None:
+        # A valid formal always takes precedence even with two backups present:
+        # restore the committed bytes onto the formal path; it matches the
+        # backups' generation and payload, so startup accepts it and sweeps
+        # marker and both backups, despite the ambiguous-backup situation.
+        self._induce_blocked("alice")
+        with open(os.path.join(self.directory, ".state-twin.bak"), "wb") as h:
+            h.write(self.good_bytes)
+        with open(self.path, "wb") as handle:
+            handle.write(self.good_bytes)
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        self.assertEqual(block_names(self.directory), [])
+        self.assertEqual(bak_names(self.directory), [])
+        self.assertFalse(
+            service.store.find_by_device_id("alice").revoked)
+        service.revoke_device("alice")
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq + 1)
+
+    def test_committed_formal_wins_even_while_blocked(self) -> None:
+        # A valid formal file always takes precedence. While blocked, restore the
+        # last committed bytes onto the formal path (an operator resolving the
+        # incident): the un-committed residual (next generation) is gone,
+        # so the next write must accept the committed formal, clear marker and
+        # backup, unblock and commit the current request once.
+        self._induce_blocked("alice")
+        with open(self.path, "wb") as handle:
+            handle.write(self.good_bytes)
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(block_names(self.directory), [])
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(self._formal()["commit_seq"], self.good_seq + 1)
+        self.assertTrue(
+            self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        self.assertFalse(self.state_store.blocked)
+        self.assertFalse(self.state_store.degraded)
+
+    def _formal(self) -> Dict[str, Any]:
+        with open(self.path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+
 class SameProcessSelfHealTest(unittest.TestCase):
     """Same-process self-heal after an undecidable write failure.
 
@@ -710,6 +985,70 @@ class SameProcessSelfHealTest(unittest.TestCase):
         self.assertTrue(os.path.exists(self.path))
         self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
         self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+
+    def test_two_verifiable_candidates_are_refused_without_name_or_mtime_pick(
+            self) -> None:
+        from e2ee_backend.persistence import PersistenceUnavailable
+        backup = self._induce_degraded("alice", with_quarantine=True)
+        # A second verifiable candidate: byte-identical to the pinned backup,
+        # but under a .tmp name that sorts first and with a strictly newer
+        # mtime. Neither heuristic may choose it, and the two pins together
+        # are ambiguous: heal must refuse promotion outright.
+        extra = write_tmp(self.directory, ".state-000-extra.tmp",
+                          self.good_bytes)
+        os.utime(extra, ns=(10**18, 10**18))
+        seq_before = self.state_store.commit_seq
+        before_names = tmp_names(self.directory)
+        self.assertEqual(len(before_names), 2)
+        with self.assertRaises(PersistenceUnavailable):
+            self.service.revoke_device("bob")
+        # Nothing moved: formal stays missing, both candidates and the
+        # quarantine remain, memory rolled back, no generation consumed.
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(tmp_names(self.directory), before_names)
+        self.assertEqual(len(quarantine_names(self.directory)), 1)
+        self.assertTrue(self.state_store.degraded)
+        self.assertEqual(self.state_store.commit_seq, seq_before)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("bob").revoked)
+        # The heal stays retryable: removing the extra candidate leaves the
+        # unique pin, which the next write promotes and commits once.
+        os.unlink(extra)
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(quarantine_names(self.directory), [])
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+
+    def test_two_distinct_verifiable_candidates_are_refused(self) -> None:
+        # Two candidates that both verify at the previous generation must be
+        # refused even though they are not byte-identical: picking either
+        # would silently commit an arbitrary one.
+        from e2ee_backend.persistence import PersistenceUnavailable
+        backup = self._induce_degraded("alice")
+        doc = json.loads(self.good_bytes.decode("utf-8"))
+        # Semantically the same committed snapshot (same round-trip), with a
+        # byte-only difference, as a second .bak pin could carry after a
+        # crash; it restores and equals the baseline.
+        other = dict(doc)
+        other_bytes = json.dumps(other, separators=(", ", ": ")).encode(
+            "utf-8")
+        self.assertNotEqual(other_bytes, self.good_bytes)
+        extra = write_tmp(self.directory, ".state-twin.bak", other_bytes)
+        with self.assertRaises(PersistenceUnavailable):
+            self.service.revoke_device("bob")
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(len(bak_names(self.directory)), 2)
+        self.assertTrue(self.state_store.degraded)
+        os.unlink(extra)
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
 
     def test_current_write_failure_after_heal_advances_nothing_then_commits(
             self) -> None:

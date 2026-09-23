@@ -44,6 +44,18 @@ no leftover or generation moves, and the next write retries the heal. A
 valid formal file always takes precedence over every backup. Restart
 recovery remains the fallback that promotes the pinned backup.
 
+When even the decidable fallback cannot be achieved — the un-committed new
+snapshot can be neither renamed aside nor deleted, so the formal path cannot be
+proven missing — the store enters the *blocking state* (a sibling
+``.state-*.block`` marker persists it across restarts). It never serves
+that residual formal file as authoritative: every subsequent write is
+503/field=data_file, in this process and after a restart, until the path is
+vacated with exactly one verifiable backup (heal/restart then promote it and
+clear the marker), or a file provably equal to the committed state is restored
+onto the formal path (a valid formal always wins). Two or more
+verifiable backups make promotion ambiguous and are likewise refused rather than picked by
+name or mtime.
+
 A crash between steps can leave ``.state-*.tmp`` (staged document) or
 ``.state-*.bak`` (pinned previous inode) files beside the target. At the next
 :func:`attach_persistence` these are resolved by
@@ -94,6 +106,15 @@ _BAK_SUFFIX = ".bak"
 #: transaction it staged was already reported failed and rolled back in
 #: memory, so it must never be resurrected at the next startup.
 _QUARANTINE_SUFFIX = ".quarantine"
+#: Suffix of the durable marker left when a failed transaction could not be made
+#: decidable: the formal path could not be vacated, so a possibly-un-committed
+#: residual formal file sits beside a ``.bak`` of the last committed
+#: inode. While such a marker exists the store is in the *blocking state*:
+#: writes are refused (503/field=data_file) and the residual formal file is
+#: never treated as authoritative, until an operator removes the marker (after resolving
+#: the on-disk state) — or until heal finds the formal path missing with
+#: exactly one verifiable backup, at which point it clears the marker itself.
+_BLOCK_SUFFIX = ".block"
 
 #: Top-level commit-generation field. Every successful durable transaction
 #: writes a document whose ``commit_seq`` is exactly one higher than the
@@ -154,6 +175,18 @@ class JsonStateStore:
         #: promote the backup keeps the store degraded and the write fails
         #: with 503/field=data_file, retryable by the next write.
         self.degraded = False
+        #: Set instead of :attr:`degraded` when the failed transaction cannot even be
+        #: made *decidable*: the formal path could not be vacated, so a
+        #: possibly-un-committed residual file still occupies it while the last
+        #: committed inode survives only as a ``.bak``. This is the
+        #: *blocking state*. :meth:`heal` refuses to serve that residual
+        #: formal as authoritative and :meth:`save` refuses every write (the HTTP
+        #: layer answers 503/field=data_file), until the on-disk state is
+        #: provably decidable again (formal missing and exactly one verifiable backup),
+        #: or an operator resolves it. A sibling ``.state-*.block`` marker
+        #: makes the state survive a restart, which keeps refusing while the residual
+        #: formal file is present or no unique backup can be promoted.
+        self.blocked = False
 
     def load(self) -> Optional[Dict[str, Any]]:
         """Load the document, or ``None`` when the file does not exist yet.
@@ -224,15 +257,18 @@ class JsonStateStore:
         """
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
-        if self.degraded:
-            # The formal path is missing and the last committed inode is
-            # pinned only as a .bak. A save here could not be rolled back
-            # (there is no target to back up), so the persistence hook must
-            # run self.heal() first and only reach this point once the formal
-            # path is restored. Refuse any save that bypassed the heal.
+        if self.degraded or self.blocked:
+            # The formal path is not safely authoritative: degraded means it is
+            # missing with the last committed inode pinned only as a .bak (a
+            # save here could not be rolled back — there is no target to
+            # back up); blocked means an un-decidable residual may occupy it.
+            # Either way the persistence hook must run self.heal() first and
+            # only reach this point once the formal path is restored. Refuse
+            # any save that bypassed the heal.
+            state = "blocked" if self.blocked else "degraded"
             raise OSError(
-                f"state store for {self.path} is degraded; heal() must "
-                f"promote the pinned backup before another save")
+                f"state store for {self.path} is {state}; heal() must "
+                f"resolve the on-disk state before another save")
         document = {"version": STATE_VERSION, **state}
         # Stamp the commit generation this save is committing. The counter
         # advances only after the replace and directory fsync succeed, so a
@@ -281,7 +317,17 @@ class JsonStateStore:
                     # Keep the backup: it is now the only copy of the last
                     # committed inode, so it must not be cleaned up below.
                     backup_path = None
-                    self.degraded = True
+                    if os.path.exists(self.path):
+                        # The new snapshot could not be taken off the formal
+                        # path: its presence is un-decidable (it is not
+                        # the committed inode, yet occupies the authoritative name).
+                        # Enter the blocking state rather than ever serve it as
+                        # authoritative: persist a marker so a restart keeps
+                        # refusing until the path is missing with a unique backup.
+                        _write_block_marker(directory)
+                        self.blocked = True
+                    else:
+                        self.degraded = True
                 else:
                     backup_path = None
                     try:
@@ -334,33 +380,55 @@ class JsonStateStore:
         request — the earlier request that got 503 is never replayed.
 
         Raises :class:`OSError` (mapped to 503/field=data_file by the caller)
-        when no verifiable backup exists, backups disagree, or the promotion
-        cannot be made durable; in every such case the formal path stays
-        missing, no leftover and no generation moves, :attr:`degraded` stays
-        set, and the next write retries this heal. A formal file that
-        reappeared valid and matching always takes precedence over backups.
+        when no verifiable backup exists, two or more verifiable candidates
+        exist (promotion is refused outright — choosing by name or mtime is
+        forbidden), or the promotion cannot be made durable; in every such
+        case the formal path stays missing, no leftover and no generation
+        moves, :attr:`degraded` (or :attr:`blocked`) stays set, and the next
+        write retries this heal. A formal file that reappeared valid and matching
+        always takes precedence over every backup — but only in the *degraded*
+        state. In the *blocking* state a residual formal file is never served as
+        authoritative: heal refuses while it occupies the path, and only leaves the
+        blocking state once the path is missing with exactly one verifiable backup to
+        promote (the durable ``.block`` marker is cleared at that point).
         """
-        if not self.degraded:
+        if not (self.degraded or self.blocked):
             return
         directory = os.path.dirname(os.path.abspath(self.path))
         leftovers = _leftover_tmp_paths(directory, self.path)
         quarantined = _quarantined_paths(directory, self.path)
 
         if os.path.exists(self.path):
-            # The formal path can only reappear out-of-band while degraded. A
-            # valid one that matches the committed state always wins: keep it,
-            # sweep every leftover and resume normal saves. Anything else is
-            # left untouched — exactly the refusal a restart would give.
+            # The formal path can only reappear (or, while blocked, never
+            # have been vacated) out of band. A *valid formal always
+            # takes precedence* — and that also resolves the blocked state
+            # safely: the blocked residual is the un-committed new snapshot,
+            # stamped with the NEXT generation (commit_seq == self.commit_seq), so
+            # it can never match the committed baseline; only a file exactly
+            # equal to the last committed state (generation one below, restores
+            # and equals baseline) wins. When it does, keep it, sweep
+            # every leftover/marker and resume normal saves. Anything else is
+            # left untouched and refused.
             formal = _read_version1_document(self.path)
-            if (formal is not None
-                    and (COMMIT_SEQ_KEY not in formal
-                         or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
-                    and _commit_seq_of(formal) == self.commit_seq - 1
-                    and _document_restores(formal)
-                    and _document_payload_equals(formal, baseline)):
-                _sweep_leftovers(directory, leftovers + quarantined)
+            formal_is_committed = (
+                formal is not None
+                and (COMMIT_SEQ_KEY not in formal
+                     or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
+                and _commit_seq_of(formal) == self.commit_seq - 1
+                and _document_restores(formal)
+                and _document_payload_equals(formal, baseline))
+            if formal_is_committed:
+                _sweep_leftovers(
+                    directory,
+                    leftovers + quarantined
+                    + _block_marker_paths(directory, self.path))
                 self.degraded = False
+                self.blocked = False
                 return
+            if self.blocked:
+                raise OSError(
+                    f"cannot self-heal {self.path}: the store is blocked by "
+                    f"an un-resolved, un-committed file on the formal path")
             raise OSError(
                 f"cannot self-heal {self.path}: the formal file reappeared "
                 f"in an unexpected state")
@@ -406,11 +474,18 @@ class JsonStateStore:
             raise OSError(
                 f"cannot self-heal {self.path}: no verifiable pinned backup "
                 f"of the last committed state")
-        # Every eligible pin is the same generation and equals the committed
-        # state, so choosing among them cannot diverge state; prefer a .bak
-        # pin over a byte-identical staged .tmp, then the stable name order.
-        eligible.sort(key=lambda path: (
-            not path.endswith(_BAK_SUFFIX), path))
+        # Two or more verifiable candidates are ambiguous even when their
+        # bytes are identical: the choice between pin names must never be made
+        # by name or mtime (both are forgeable and neither encodes which pin
+        # the crashed transaction actually committed). Refuse promotion and
+        # leave everything — formal path, leftovers, memory and generation —
+        # exactly as found, so an operator or a restart resolves the ambiguity;
+        # the next write retries the heal.
+        if len(eligible) > 1:
+            raise OSError(
+                f"cannot self-heal {self.path}: {len(eligible)} verifiable "
+                f"pinned backups of the last committed state; refusing to "
+                f"choose between candidates")
         chosen = eligible[0]
 
         # Promote with a hard link, never a rename: the backup keeps pinning
@@ -438,6 +513,12 @@ class JsonStateStore:
         # always wins the leftover scan at every later startup.
         _sweep_leftovers(directory, leftovers + quarantined)
         self.degraded = False
+        if self.blocked:
+            # The path was vacated out-of-band and the unique verifiable
+            # backup is now durably authoritative: the undecidable condition
+            # is gone, so drop the durable block marker and resume service.
+            _clear_block_markers(directory, self.path)
+            self.blocked = False
 
 
 def _directory_fsync_unsupported(error: OSError) -> bool:
@@ -680,6 +761,32 @@ def _document_payload_equals(document: Dict[str, Any],
     return restored == baseline
 
 
+def _documents_payload_equal(left: Dict[str, Any],
+                      right: Dict[str, Any]) -> bool:
+    """Semantically compare two version-1 state documents' business payloads.
+
+    Envelope fields (``version``, ``commit_seq``) are ignored, so two
+    copies of the same committed generation compare equal regardless of byte
+    formatting, while a newer un-committed snapshot round-trips to a
+    different snapshot. Returns ``False`` if either document fails to restore.
+    """
+    def _snapshot(document: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        payload = {key: value for key, value in document.items()
+                   if key not in ("version", COMMIT_SEQ_KEY)}
+        try:
+            store = DeviceStore()
+            store.restore_state(payload)
+            return store.snapshot_state()
+        except (ValueError, TypeError):
+            return None
+
+    snap_left = _snapshot(left)
+    snap_right = _snapshot(right)
+    if snap_left is None or snap_right is None:
+        return False
+    return snap_left == snap_right
+
+
 def _sweep_leftovers(directory: str, paths: List[str]) -> None:
     """Best-effort remove crash/transaction leftovers and flush the directory.
 
@@ -745,6 +852,55 @@ def _quarantined_paths(directory: str, target_path: str) -> List[str]:
     return quarantined
 
 
+def _block_marker_paths(directory: str, target_path: str) -> List[str]:
+    """List blocking-state markers left beside *target_path*."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    markers: List[str] = []
+    for name in names:
+        if name.startswith(_TMP_PREFIX) and name.endswith(_BLOCK_SUFFIX):
+            full = os.path.join(directory, name)
+            if os.path.abspath(full) != os.path.abspath(target_path):
+                markers.append(full)
+    return markers
+
+
+def _write_block_marker(directory: str) -> Optional[str]:
+    """Persist a blocking-state marker in *directory* (best effort).
+
+    The marker makes the "formal path may hold an un-committed residual"
+    state survive a process restart, which then keeps refusing writes instead of
+    treating that residual file as authoritative. Returns the marker path, or
+    ``None`` if it could not be created (the in-process
+    :attr:`JsonStateStore.blocked` flag still holds for the life of
+    the process).
+    """
+    fd, marker = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
+                                      suffix=_BLOCK_SUFFIX)
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    os.close(fd)
+    try:
+        _fsync_directory(directory)
+    except OSError:
+        pass
+    return marker
+
+
+def _clear_block_markers(directory: str, target_path: str) -> None:
+    """Remove every blocking-state marker and flush the directory (best effort)."""
+    for marker in _block_marker_paths(directory, target_path):
+        _remove_quietly(marker)
+    try:
+        _fsync_directory(directory)
+    except OSError:
+        pass
+
+
 def _remove_quietly(path: str) -> None:
     try:
         os.unlink(path)
@@ -752,63 +908,19 @@ def _remove_quietly(path: str) -> None:
         pass
 
 
-def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
-    """Resolve temporary snapshots a crashed process left beside the file.
+def _verified_recovery_candidates(
+        leftovers: List[str]) -> Tuple[List[Tuple[str, int, int]], bool]:
+    """Parse and fully verify crash-leftover *leftovers*.
 
-    * A valid formal file wins outright: it is never overwritten, and every
-      leftover is removed.
-    * An existing but corrupt/invalid formal file is left untouched: the
-      normal load then refuses startup, so present state is never silently
-      discarded (and its leftovers are kept for inspection).
-    * With the formal file missing, only candidates that parse as
-      version=1, explicitly carry the
-      ``group_sync_cursors``/``message_sync_cursors``/``key_events``
-      sections (each a list — the footprint of one complete durable
-      transaction), *and* pass full semantic verification are considered.
-      They rank by commit generation first — the highest ``commit_seq``
-      wins, so an older-mtime snapshot from a later generation is never
-      lost to a newer-mtime stale one — with modification time newest-first
-      among equal generations (a missing field counts as generation 0).
-      When every candidate predates commit generations (none carries the
-      field), selection stays the legacy newest-mtime rule. The chosen
-      snapshot is atomically ``os.replace``-d into place (plus a
-      parent-directory fsync) and the remaining leftovers are removed. A
-      section-less legacy/partial snapshot is never promoted, so a resume
-      cursor or the audit chain cannot be silently lost.
-    * When no candidate is valid, all leftovers are removed; the normal
-      missing-file path in :func:`attach_persistence` then creates an empty
-      state.
+    Returns ``(verified, any_with_seq)`` where each verified entry is
+    ``(path, commit_seq, mtime_ns)`` and *any_with_seq* says
+    whether at least one candidate carried an explicit ``commit_seq`` field.
+
+    A candidate survives only when it parses as version=1, explicitly
+    carries the complete-transaction sections, carries no malformed generation field,
+    and passes the full semantic restore check. A missing field ranks at
+    generation 0 (the legacy case).
     """
-    directory = os.path.dirname(os.path.abspath(state_store.path))
-    leftovers = _leftover_tmp_paths(directory, state_store.path)
-    quarantined = _quarantined_paths(directory, state_store.path)
-    if not leftovers and not quarantined:
-        return
-
-    if os.path.exists(state_store.path):
-        # The formal file exists. A valid one stays authoritative and the
-        # leftovers (including demoted snapshots parked in quarantine) are
-        # stale; an invalid one (including a present but malformed
-        # commit_seq) makes the normal load refuse startup, so neither the
-        # file nor the leftovers are touched here.
-        formal = _read_version1_document(state_store.path)
-        formal_valid = (
-            formal is not None
-            and (COMMIT_SEQ_KEY not in formal
-                 or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
-            and _document_restores(formal))
-        if formal_valid:
-            for path in leftovers + quarantined:
-                _remove_quietly(path)
-        return
-
-    # Formal file missing. Verify every leftover first (unverifiable ones are
-    # skipped), then rank the survivors by commit generation, not mtime: the
-    # highest commit_seq wins even when a stale older-generation snapshot has
-    # a newer mtime, and equal generations order newest-mtime-first. A
-    # leftover without the field is a pre-generation snapshot at seq 0; when
-    # every candidate is such a snapshot the ranking collapses to the legacy
-    # pure-mtime rule. Ties in mtime break by name, deterministically.
     verified: List[Tuple[str, int, int]] = []
     any_with_seq = False
     for candidate in leftovers:
@@ -832,19 +944,169 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
         except OSError:
             mtime_ns = -1
         verified.append((candidate, _commit_seq_of(document), mtime_ns))
+    return verified, any_with_seq
+
+
+def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
+    """Resolve temporary snapshots a crashed process left beside the file.
+
+    * A valid formal file wins outright: it is never overwritten, and every
+      leftover is removed.
+    * An existing but corrupt/invalid formal file is left untouched: the
+      normal load then refuses startup, so present state is never silently
+      discarded (and its leftovers are kept for inspection).
+    * With the formal file missing, only candidates that parse as
+      version=1, explicitly carry the
+      ``group_sync_cursors``/``message_sync_cursors``/``key_events``
+      sections (each a list — the footprint of one complete durable
+      transaction), *and* pass full semantic verification are considered.
+      They rank by commit generation first — the highest ``commit_seq``
+      wins, so an older-mtime snapshot from a later generation is never
+      lost to a newer-mtime stale one. When two or more *verifiable*
+      candidates tie at that highest generation the choice is ambiguous and recovery
+      refuses outright: nothing is promoted or removed, the formal path stays
+      missing, and :func:`attach_persistence` raises
+      :class:`StateFileError` (the blocking state) rather than ever
+      breaking the tie by name or mtime. When every candidate
+      predates commit generations (none carries the field), selection stays the
+      legacy newest-mtime rule. The chosen snapshot is atomically
+      ``os.replace``-d into place (plus a parent-directory fsync) and
+      the remaining leftovers are removed. A section-less legacy/partial
+      snapshot is never promoted, so a resume cursor or the audit chain
+      cannot be silently lost.
+    * When no candidate is valid, all leftovers are removed; the normal
+      missing-file path in :func:`attach_persistence` then creates an empty
+      state.
+    """
+    directory = os.path.dirname(os.path.abspath(state_store.path))
+    leftovers = _leftover_tmp_paths(directory, state_store.path)
+    quarantined = _quarantined_paths(directory, state_store.path)
+    markers = _block_marker_paths(directory, state_store.path)
+    if not leftovers and not quarantined and not markers:
+        return
+
+    if markers:
+        # A previous process ended in the blocking state: it could not vacate a
+        # possibly-un-committed file from the formal path. A restart must
+        # never serve that residual file as authoritative:
+        #  * formal present and provably the committed state (it semantically
+        #    equals the unique verifiable generation-bearing backup) -> a valid
+        #    formal takes precedence: keep it, sweep leftovers/markers;
+        #  * formal present in any other state (the un-committed
+        #    residual, or no unique matching backup) -> refuse startup,
+        #    touch nothing;
+        #  * formal missing -> recover only when exactly ONE verifiable,
+        #    generation-bearing candidate survives (never mtime/name picked);
+        #    promote it, sweep the transaction leftovers and clear the marker;
+        #  * zero or several verifiable candidates -> refuse and keep
+        #    everything in place for an operator.
+        verified, any_with_seq = _verified_recovery_candidates(leftovers)
+        top: List[Tuple[str, int, int]] = []
+        if verified and any_with_seq:
+            top_seq = max(item[1] for item in verified)
+            top = [item for item in verified
+                     if item[1] == top_seq]
+        unique_pin = top[0][0] if len(top) == 1 else None
+
+        if os.path.exists(state_store.path):
+            formal = _read_version1_document(state_store.path)
+            # A valid formal always takes precedence. There is no in-memory
+            # baseline at restart, so "committed" is proven relative to
+            # the verified backups: the formal is the committed state iff it
+            # restores, carries a valid generation, and semantically
+            # equals at least one verified backup at that SAME generation.
+            # The un-committed residual is stamped one generation higher than the
+            # pinned commit, so it can never match and stays refused —
+            # even when two or more backups exist.
+            formal_is_committed = (
+                formal is not None
+                and (COMMIT_SEQ_KEY not in formal
+                     or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
+                and _document_restores(formal)
+                and any(
+                    _commit_seq_of(formal) == _commit_seq_of(pin_doc)
+                    and _documents_payload_equal(formal, pin_doc)
+                    for pin_doc in (
+                        _read_version1_document(path)
+                        for path, _, _ in verified)
+                    if pin_doc is not None))
+            if formal_is_committed:
+                for path in leftovers + quarantined + markers:
+                    _remove_quietly(path)
+                _fsync_directory(directory)
+                return
+            raise OSError(
+                f"state store for {state_store.path} is blocked: an "
+                f"un-resolved, un-committed file occupies the formal path")
+        if unique_pin is None:
+            raise OSError(
+                f"state store for {state_store.path} is blocked: the formal "
+                f"path is missing with no unique verifiable backup")
+        recovered = unique_pin
+        os.replace(recovered, state_store.path)
+        _fsync_directory(directory)
+        leftovers = [path for path in leftovers if path != recovered]
+        for path in leftovers + quarantined + markers:
+            _remove_quietly(path)
+        _fsync_directory(directory)
+        return
+
+    if os.path.exists(state_store.path):
+        # The formal file exists. A valid one stays authoritative and the
+        # leftovers (including demoted snapshots parked in quarantine) are
+        # stale; an invalid one (including a present but malformed
+        # commit_seq) makes the normal load refuse startup, so neither the
+        # file nor the leftovers are touched here.
+        formal = _read_version1_document(state_store.path)
+        formal_valid = (
+            formal is not None
+            and (COMMIT_SEQ_KEY not in formal
+                 or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
+            and _document_restores(formal))
+        if formal_valid:
+            for path in leftovers + quarantined:
+                _remove_quietly(path)
+        return
+
+    # Formal file missing. Verify every leftover first (unverifiable ones are
+    # skipped), then rank the survivors by commit generation, not mtime: the
+    # highest commit_seq wins even when a stale older-generation snapshot has a newer
+    # mtime. A tie of two or more verifiable candidates at that highest
+    # generation is ambiguous and aborts recovery (nothing moved, startup refuses). A
+    # leftover without the field is a pre-generation snapshot at seq 0; only
+    # when every candidate is such a snapshot does the ranking collapse to the
+    # legacy pure-mtime rule (ties broken by name, deterministically).
+    verified, any_with_seq = _verified_recovery_candidates(leftovers)
 
     recovered = None
     if verified:
         if any_with_seq:
             # Generation-first ordering; missing field ranks at 0, so a
-            # present-generation snapshot always beats a field-less legacy
-            # one regardless of mtime.
+            # present-generation snapshot always beats a field-less legacy one
+            # regardless of mtime.
             verified.sort(key=lambda item: (item[1], item[2], item[0]))
+            top_seq = verified[-1][1]
+            top = [item for item in verified if item[1] == top_seq]
+            # Two or more *verifiable* candidates at the same top generation are
+            # ambiguous: the generation does not name which one the crashed transaction
+            # committed, and neither mtime nor file name may break the tie (both
+            # are forgeable and neither encodes commit identity). Refuse to promote or
+            # delete anything: keep the formal path missing and every leftover in
+            # place so attach_persistence refuses to start (the blocking state the
+            # spec demands) until an operator resolves the duplicates. Field-less
+            # legacy files never reach here: any_with_seq was False for them.
+            if len(top) >= 2:
+                raise OSError(
+                    f"ambiguous state recovery for {state_store.path}: "
+                    f"{len(top)} verifiable candidates at commit_seq "
+                    f"{top_seq}; refusing to choose between them by name or "
+                    f"mtime")
+            recovered = top[0][0]
         else:
             # Every candidate predates commit generations: keep the legacy
             # newest-mtime rule.
             verified.sort(key=lambda item: (item[2], item[0]))
-        recovered = verified[-1][0]
+            recovered = verified[-1][0]
 
     if recovered is not None:
         os.replace(recovered, state_store.path)
@@ -914,16 +1176,22 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
         # roll the in-memory store back to the last good state before
         # surfacing the error, so the failed mutation is visible nowhere.
         pending = service.store.snapshot_state()
-        if state_store.degraded:
-            # A previous transaction ended undecidable on disk: the formal
-            # path is missing and the last committed inode survives only as
-            # a pinned .bak. Before this (the next) write may commit, verify
-            # and atomically promote that backup inside the same storage
-            # lock, cleaning the failed transaction's leftovers. Memory was
-            # rolled back to last_good after the 503 and, like every later
-            # failed attempt, restored to it again, so the only difference
-            # between pending and last_good is *this* current request — the
-            # earlier 503 request is never replayed.
+        if state_store.degraded or state_store.blocked:
+            # A previous transaction ended undecidable on disk. Degraded: the
+            # formal path is missing and the last committed inode survives
+            # only as a pinned .bak. Blocked: an un-decidable residual
+            # may occupy the path (a durable .block marker records it).
+            # Before this (the next) write may commit, run heal inside
+            # the same storage lock: in the degraded case it verifies and
+            # atomically promotes the unique backup, cleaning the failed
+            # transaction's leftovers; in the blocked case it refuses while a
+            # residual file occupies the path (503) and only
+            # resolves once the path is missing with exactly one
+            # verifiable backup. Memory was rolled back to last_good after
+            # the 503 and, like every later failed attempt, restored
+            # to it again, so the only difference between pending and last_good
+            # is *this* current request — the earlier 503 request is
+            # never replayed.
             try:
                 state_store.heal(copy.deepcopy(last_good))
             except OSError:
