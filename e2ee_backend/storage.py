@@ -517,28 +517,38 @@ class DeviceStore:
                     if not pk.revoked and not pk.consumed]
 
     def revoke_prekey(self, device: Device, key_id: str) -> bool:
-        """Mark one of the device's pre-keys revoked. Return ``False`` if absent."""
+        """Mark one of the device's pre-keys revoked. Return ``False`` if absent.
+
+        Revoking an already-revoked key changes no state and performs no
+        persistence transaction (no anchor migration, no audit event, no
+        commit), so an idempotent repeat leaves the durable file untouched.
+        """
         with self._lock:
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
-                    prekey.revoked = True
-                    self._notify_change()
+                    if not prekey.revoked:
+                        prekey.revoked = True
+                        self._notify_change()
                     return True
             return False
 
     def revoke_device(self, device_id: str) -> Optional[Device]:
         """Mark the device (and its pre-keys) revoked.
 
-        Idempotent: a previously revoked device stays revoked. Returns the
-        device or ``None`` when the id is unknown.
+        Idempotent: a previously revoked device stays revoked and a repeat
+        performs no persistence transaction (no anchor migration, no audit
+        event, no commit) — the durable file's bytes and inode are untouched.
+        Returns the device or ``None`` when the id is unknown.
         """
         with self._lock:
             key = self._device_index.get(device_id)
             device = self._devices.get(key) if key is not None else None
             if device is None:
                 return None
-            self._migrate_pending_anchors()
             if not device.revoked:
+                # Anchor any legacy chainless devices in this same transaction
+                # before the real revocation event.
+                self._migrate_pending_anchors()
                 device.revoked = True
                 for prekey in device.prekeys:
                     prekey.revoked = True
@@ -546,7 +556,7 @@ class DeviceStore:
                 # marks the device and every pre-key of it revoked at once.
                 self._append_key_event(
                     device_id, KEY_EVENT_DEVICE_REVOKED, {})
-            self._notify_change()
+                self._notify_change()
             return device
 
     def revoke_prekey_by_id(self, device_id: str,
@@ -564,17 +574,17 @@ class DeviceStore:
                 return None, False
             for prekey in device.prekeys:
                 if prekey.key_id == key_id:
-                    # Anchor legacy chains before the real revocation event;
-                    # an unknown key (below) fails before this point and
-                    # neither migrates nor persists anything.
-                    self._migrate_pending_anchors()
                     if not prekey.revoked:
+                        # Anchor legacy chains before the real revocation
+                        # event; an idempotent repeat (and an unknown key
+                        # below) neither migrates nor persists anything.
+                        self._migrate_pending_anchors()
                         prekey.revoked = True
                         self._append_key_event(
                             device_id, KEY_EVENT_PREKEY_REVOKED,
                             {"key_id": prekey.key_id,
                              "public_key": prekey.public_key})
-                    self._notify_change()
+                        self._notify_change()
                     return device, True
             return device, False
 
@@ -1950,9 +1960,14 @@ class DeviceStore:
             if created:
                 state = MessageDelivery()
                 bucket[key] = state
-            if attempt_id not in state.attempt_ids:
-                state.attempt_ids.add(attempt_id)
-                state.attempts += 1
+            if attempt_id in state.attempt_ids:
+                # Idempotent replay of a committed attempt: no state changes,
+                # no legacy anchor migration and no persistence transaction —
+                # return the original five fields (200) without touching the
+                # durable file (bytes, inode and commit_seq all unchanged).
+                return self._delivery_view(session_id, message, state), False
+            state.attempt_ids.add(attempt_id)
+            state.attempts += 1
             view = self._delivery_view(session_id, message, state)
             self._notify_change()
             return view, created
@@ -1978,7 +1993,13 @@ class DeviceStore:
                 bucket = self._delivery
                 key = (session_id, message_id)
             state = bucket.get(key)
-            first_ack = state is None or not state.acked
+            if state is not None and state.acked:
+                # Idempotent repeat acknowledgement by this device: no state
+                # changes, no legacy anchor migration and no persistence
+                # transaction — return the original five fields (200) without
+                # touching the durable file (bytes, inode, commit_seq).
+                return self._delivery_view(session_id, message, state), False
+            first_ack = True
             if state is None:
                 state = MessageDelivery()
                 bucket[key] = state
