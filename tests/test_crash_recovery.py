@@ -314,7 +314,7 @@ class DirectoryFsyncFailureTest(unittest.TestCase):
         self.assertTrue(
             self.service.store.find_by_device_id("alice").revoked)
 
-    def test_same_process_retry_is_refused_while_degraded(self) -> None:
+    def test_same_process_next_write_self_heals_and_commits_once(self) -> None:
         import e2ee_backend.persistence as persistence_mod
         from e2ee_backend.persistence import PersistenceUnavailable
 
@@ -334,16 +334,28 @@ class DirectoryFsyncFailureTest(unittest.TestCase):
 
         baks_before = bak_names(self.directory)
         self.assertEqual(len(baks_before), 1)
-        # Even with storage healthy again, the degraded process refuses the
-        # write (a 503 at the HTTP boundary) rather than risk an un-backed
-        # replace over the missing formal path; nothing on disk changes.
-        with self.assertRaises(PersistenceUnavailable):
-            self.service.revoke_device("alice")
-        self.assertFalse(os.path.exists(self.path))
-        self.assertEqual(bak_names(self.directory), baks_before)
+        # With storage healthy again, the NEXT persistable write heals itself
+        # inside the storage lock: it promotes the pinned .bak (last
+        # committed inode) back onto the formal path, cleans the failed
+        # transaction's leftovers, and only then commits THIS later request.
+        # It is not a replay of the request that already got a 503: here the
+        # later request revokes bob, while alice stays unrevoked.
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(bak_names(self.directory), [])
         self.assertEqual(quarantine_names(self.directory), [])
+        self.assertEqual(tmp_names(self.directory), [])
+        # Exactly one consecutive generation was added by the healed commit.
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq + 1)
+        # The 503 request (revoke alice) was not replayed; the current
+        # request (revoke bob) is what committed.
         self.assertFalse(
             self.service.store.find_by_device_id("alice").revoked)
+        self.assertTrue(
+            self.service.store.find_by_device_id("bob").revoked)
 
     def test_restart_recovers_pinned_backup_and_retry_commits_once(
             self) -> None:
