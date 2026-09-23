@@ -686,6 +686,76 @@ class SameProcessSelfHealTest(unittest.TestCase):
             self.service.store.find_by_device_id("alice").revoked)
         self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
 
+    def test_two_verifiable_backups_are_refused_not_chosen_by_name_or_mtime(
+            self) -> None:
+        from e2ee_backend.persistence import PersistenceUnavailable
+        backup = self._induce_degraded("alice", with_quarantine=True)
+        # A second, independently verifiable pin of the same committed state:
+        # it parses, restores, carries the previous generation and equals the
+        # committed baseline. Give it a newer mtime and a later-sorting name
+        # so neither a name rule nor an mtime rule would pick the original
+        # pin; the heal must refuse instead of choosing either way.
+        duplicate = write_tmp(
+            self.directory, ".state-zzz-duplicate.bak", self.good_bytes,
+            mtime_ns=os.stat(backup).st_mtime_ns + 1_000_000_000)
+        with self.assertRaises(PersistenceUnavailable):
+            self.service.revoke_device("bob")
+        # Nothing moved: the formal path stays missing, both pins and the
+        # quarantine survive byte-for-byte, memory and the generation stay at
+        # the last commit, and the store stays degraded.
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(bak_names(self.directory),
+                         sorted([os.path.basename(backup),
+                                 os.path.basename(duplicate)]))
+        self.assertEqual(open(backup, "rb").read(), self.good_bytes)
+        self.assertEqual(open(duplicate, "rb").read(), self.good_bytes)
+        self.assertEqual(len(quarantine_names(self.directory)), 1)
+        self.assertTrue(self.state_store.degraded)
+        self.assertEqual(self.state_store.commit_seq, self.good_seq + 1)
+        self.assertFalse(
+            self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        # Resolving the ambiguity (removing the extra pin) lets the next
+        # write heal the remaining unique pin and commit the current request.
+        os.unlink(duplicate)
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(quarantine_names(self.directory), [])
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
+        self.assertTrue(
+            self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+
+    def test_verifiable_bak_and_verifiable_tmp_are_ambiguous_and_refused(
+            self) -> None:
+        from e2ee_backend.persistence import PersistenceUnavailable
+        backup = self._induce_degraded("alice")
+        # A staged .tmp that happens to carry the committed payload (same
+        # generation, full restore, baseline equality) is also a verifiable
+        # candidate: the heal may not prefer the .bak by suffix any more than
+        # by name or mtime — two candidates mean refusal.
+        staged = write_tmp(self.directory, ".state-also-good.tmp",
+                           self.good_bytes)
+        with self.assertRaises(PersistenceUnavailable):
+            self.service.revoke_device("bob")
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(len(bak_names(self.directory)), 1)
+        self.assertTrue(os.path.exists(staged))
+        self.assertTrue(self.state_store.degraded)
+        # Once only the .bak is verifiable it is promoted by hard link and
+        # the current request commits one generation (the promotion itself
+        # consumes none).
+        os.unlink(staged)
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
+        self.assertTrue(
+            self.service.store.find_by_device_id("bob").revoked)
+
     def test_promotion_failure_moves_nothing_and_next_write_heals(self) -> None:
         from e2ee_backend.persistence import PersistenceUnavailable
         self._induce_degraded("alice")

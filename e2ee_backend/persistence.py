@@ -334,11 +334,13 @@ class JsonStateStore:
         request — the earlier request that got 503 is never replayed.
 
         Raises :class:`OSError` (mapped to 503/field=data_file by the caller)
-        when no verifiable backup exists, backups disagree, or the promotion
-        cannot be made durable; in every such case the formal path stays
-        missing, no leftover and no generation moves, :attr:`degraded` stays
-        set, and the next write retries this heal. A formal file that
-        reappeared valid and matching always takes precedence over backups.
+        when no verifiable backup exists, two or more verifiable candidates
+        are present (the pin is ambiguous — promotion is refused, never chosen
+        by name or mtime), or the promotion cannot be made durable; in every
+        such case the formal path stays missing, no leftover and no
+        generation moves, :attr:`degraded` stays set, and the next write
+        retries this heal. A formal file that reappeared valid and matching
+        always takes precedence over backups.
         """
         if not self.degraded:
             return
@@ -406,11 +408,19 @@ class JsonStateStore:
             raise OSError(
                 f"cannot self-heal {self.path}: no verifiable pinned backup "
                 f"of the last committed state")
-        # Every eligible pin is the same generation and equals the committed
-        # state, so choosing among them cannot diverge state; prefer a .bak
-        # pin over a byte-identical staged .tmp, then the stable name order.
-        eligible.sort(key=lambda path: (
-            not path.endswith(_BAK_SUFFIX), path))
+        # Two or more verifiable candidates are an ambiguous pin, even when
+        # they are byte-identical (or hard links to one inode): the invariant
+        # the undecidable-failure handling promises is that the committed
+        # inode survives under exactly *one* ``.bak``, so a choice between
+        # names can never be made by name order, suffix or mtime. Refuse the
+        # promotion outright: the formal path stays missing, every leftover,
+        # the in-memory state and the generation stay untouched, degraded
+        # stays set, and the next write retries the heal.
+        if len(eligible) > 1:
+            raise OSError(
+                f"cannot self-heal {self.path}: "
+                f"{len(eligible)} verifiable backup candidates are present; "
+                f"refusing to choose between them")
         chosen = eligible[0]
 
         # Promote with a hard link, never a rename: the backup keeps pinning
