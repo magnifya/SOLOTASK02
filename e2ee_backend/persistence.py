@@ -152,6 +152,18 @@ class PersistenceUnavailable(Exception):
     """
 
 
+class IntegrityCheckError(Exception):
+    """A read-only integrity probe could not verify the state file.
+
+    The file is missing/unreadable, cannot be parsed as a version-1 JSON
+    object, carries an invalid ``commit_seq``, fails the full semantic
+    restore, or its canonical snapshot differs from the in-memory state.
+    Nothing is read into the live store and no file, inode, cursor or
+    generation is touched; the HTTP layer reports this as
+    503/field=data_file.
+    """
+
+
 class JsonStateStore:
     """Versioned JSON document loaded from and atomically saved to one file."""
 
@@ -519,6 +531,82 @@ class JsonStateStore:
             # is gone, so drop the durable block marker and resume service.
             _clear_block_markers(directory, self.path)
             self.blocked = False
+
+    def integrity_report(self, store: "DeviceStore") -> Dict[str, Any]:
+        """Read-only integrity probe backing ``GET /v1/persistence/integrity``.
+
+        The state file is read while *store*'s own lock is held (the same
+        lock under which every mutation rewrites the file and appends audit
+        events), so the bytes read are one complete committed document. The
+        document must parse as JSON, be an object stamped ``version=1``, and
+        carry either no ``commit_seq`` (a legacy file, generation 0) or a
+        non-negative integer one. *store* then restores the payload into a
+        fresh store and compares its canonical snapshot against the live
+        in-memory snapshot — the same startup semantic validation
+        (cross-entity references, sequence continuity, nonce sets, per-device
+        cursor ranges, ``updated_at`` and the key-event audit chain) plus an
+        exact state comparison.
+
+        On success returns ``{"commit_seq", "state_hash", "consistent":
+        True}`` in that key order, where ``state_hash`` is the lowercase
+        SHA-256 hex of the canonical compact JSON snapshot (17 ordered
+        sections, ``ensure_ascii=False`` UTF-8). Any failure — unreadable or
+        missing file (including the degraded/blocked states where the formal
+        path is absent), parse/version/generation error, semantic error, or a
+        file/memory divergence — raises :class:`IntegrityCheckError`. The
+        probe never writes: memory, file bytes/inode, cursors and the commit
+        generation are all untouched.
+        """
+        def read_document() -> Tuple[Dict[str, Any], int]:
+            try:
+                with open(self.path, "rb") as handle:
+                    raw = handle.read()
+            except OSError as error:
+                raise IntegrityCheckError(
+                    f"cannot read state file {self.path}: {error}") from None
+            try:
+                document = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise IntegrityCheckError(
+                    f"state file is not valid JSON: {self.path} ({error})") \
+                    from None
+            if not isinstance(document, dict):
+                raise IntegrityCheckError(
+                    "state document must be a JSON object")
+            version = document.get("version")
+            if not isinstance(version, int) or isinstance(version, bool):
+                raise IntegrityCheckError(
+                    "state document is missing a numeric 'version'")
+            if version != STATE_VERSION:
+                raise IntegrityCheckError(
+                    f"unsupported state file version: {version} "
+                    f"(this server supports {STATE_VERSION})")
+            commit_seq = document.get(COMMIT_SEQ_KEY, 0)
+            if not _valid_commit_seq(commit_seq):
+                raise IntegrityCheckError(
+                    f"state document '{COMMIT_SEQ_KEY}' must be a "
+                    f"non-negative integer")
+            payload = {key: value for key, value in document.items()
+                       if key not in ("version", COMMIT_SEQ_KEY)}
+            return payload, commit_seq
+
+        def expected_generation() -> int:
+            # Read inside the store lock: a writer both rewrites the file
+            # and advances this counter while holding that same lock, so the
+            # file's generation and the expected last-committed generation
+            # can never be sampled from different linearization points.
+            return self.commit_seq - 1
+
+        try:
+            commit_seq, state_hash = store.integrity_evaluate(
+                read_document, expected_generation)
+        except IntegrityCheckError:
+            raise
+        except (ValueError, TypeError) as error:
+            raise IntegrityCheckError(str(error)) from None
+        return {"commit_seq": commit_seq,
+                "state_hash": state_hash,
+                "consistent": True}
 
 
 def _directory_fsync_unsupported(error: OSError) -> bool:
@@ -1209,4 +1297,8 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
         last_good.update(copy.deepcopy(pending))
 
     service.store.on_change = persist
+    # Expose the durable store for the read-only integrity probe
+    # (GET /v1/persistence/integrity); its absence is exactly how the
+    # service distinguishes the in-memory mode (409/field=data_file).
+    service.integrity_state_store = state_store
     return state_store

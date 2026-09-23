@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import is_nonempty_string, load_public_key
 from .models import Device, SignedPreKey
+from .persistence import IntegrityCheckError
 from .storage import (
     BATCH_CLAIM_NO_ACTIVE_DEVICE,
     BATCH_CLAIM_NO_PREKEY,
@@ -160,6 +161,10 @@ class DeviceService:
 
     def __init__(self, store: Optional[DeviceStore] = None) -> None:
         self.store = store if store is not None else DeviceStore()
+        #: Set by :func:`e2ee_backend.persistence.attach_persistence` to the
+        #: durable state store; ``None`` marks the purely in-memory mode, in
+        #: which the integrity probe answers 409/field=data_file.
+        self.integrity_state_store: Optional[Any] = None
 
     # -- registration ------------------------------------------------------
 
@@ -1345,3 +1350,30 @@ class DeviceService:
                 session_id, message_id, device_id)
         except DeliveryError as error:
             raise self._delivery_error(error, session_id, message_id)
+
+    # -- persistence integrity --------------------------------------------
+
+    def persistence_integrity(self) -> Dict[str, Any]:
+        """Read-only probe of the durable state file (no parameters/body).
+
+        Only available when persistence is enabled (``--data-file`` or
+        ``$E2EE_DATA_FILE``); the purely in-memory mode answers
+        409/field=data_file. With a file, the document is read under the
+        store lock and must parse as version=1, carry a non-negative
+        ``commit_seq``, pass the full startup semantic validation, and match
+        the in-memory snapshot exactly; success returns
+        ``{"commit_seq", "state_hash", "consistent": true}`` (that key
+        order). Any parse/version/semantic failure or generation/snapshot
+        mismatch raises :class:`ServiceError` as 503/field=data_file without
+        changing memory, the file/inode, cursors or the generation.
+        """
+        if self.integrity_state_store is None:
+            raise ServiceError(
+                "persistence is not enabled; start the server with a data "
+                "file to inspect state integrity",
+                "data_file", status_code=409)
+        try:
+            return self.integrity_state_store.integrity_report(self.store)
+        except IntegrityCheckError as error:
+            raise ServiceError(str(error), "data_file",
+                               status_code=503) from None

@@ -6,6 +6,7 @@ order, so repeated requests list them identically.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import threading
@@ -287,6 +288,70 @@ class GroupSessionRotationError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+#: Business-state sections covered by a persistence-integrity snapshot, in
+#: the fixed key order used both for the state hash and when comparing the
+#: on-disk document against the in-memory snapshot. Sections a legacy
+#: version-1 file omits are filled with their empty defaults here, so the
+#: hash/identity of an old document matches the store that loaded it.
+INTEGRITY_SECTION_KEYS = (
+    "devices",
+    "sessions",
+    "groups",
+    "group_sessions",
+    "messages",
+    "delivery",
+    "prekey_claims",
+    "prekey_batch_claims",
+    "claim_session_bindings",
+    "batch_claim_session_bindings",
+    "group_session_rotations",
+    "group_delivery",
+    "used_nonces",
+    "group_sync_cursors",
+    "message_sync_cursors",
+    "message_submissions",
+    "key_events",
+)
+
+#: Empty default for every canonical section; ``messages`` and
+#: ``used_nonces`` are keyed mappings, the rest are lists. Callers get fresh
+#: containers per use.
+_INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
+    name: (dict() if name in ("messages", "used_nonces") else list())
+    for name in INTEGRITY_SECTION_KEYS
+}
+
+
+def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
+    """Project a store snapshot/document payload onto the 17 canonical
+    sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
+    their empty defaults. Unknown envelope keys (``version``,
+    ``commit_seq``) are dropped and key order is normalised, so two
+    semantically equal states always serialise identically regardless of the
+    order of the source mapping.
+    """
+    canonical: Dict[str, Any] = {}
+    for name in INTEGRITY_SECTION_KEYS:
+        if name in snapshot:
+            canonical[name] = snapshot[name]
+        else:
+            canonical[name] = copy.deepcopy(_INTEGRITY_SECTION_DEFAULTS[name])
+    return canonical
+
+
+def integrity_state_hash(canonical_snapshot: Dict[str, Any]) -> str:
+    """SHA-256 (lowercase hex) of the canonical snapshot as compact UTF-8 JSON.
+
+    Serialisation matches the durable writer: key order as built
+    (``sort_keys`` off — the canonical mapping already fixes the section
+    order), no whitespace, ``ensure_ascii=False`` so non-ASCII strings are
+    hashed as their literal UTF-8 bytes rather than ``\\uXXXX`` escapes.
+    """
+    payload = json.dumps(canonical_snapshot, separators=(",", ":"),
+                         ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class DeviceStore:
@@ -3714,3 +3779,58 @@ class DeviceStore:
             # nothing is pending.
             self._pending_anchor_devices = (
                 list(device_index) if raw_key_events is None else None)
+
+    def integrity_evaluate(
+            self,
+            read_payload: Callable[[], Tuple[Dict[str, Any], int]],
+            expected_commit_seq: Callable[[], int],
+            ) -> Tuple[int, str]:
+        """Verify the durable document against the live state under the lock.
+
+        Runs *read_payload* — which reads, parses and envelope-checks the
+        ``version=1`` state file and returns ``(payload, commit_seq)`` with
+        ``version``/``commit_seq`` stripped (a legacy file without the field
+        reads as generation 0) — while holding the same store lock every
+        mutation and key-event append uses, so neither the in-memory state
+        nor the file (rewritten only under this lock) can advance between
+        reading the file and comparing it. *expected_commit_seq* is also
+        evaluated under this lock and must equal the on-disk generation; the
+        payload is then restored into a fresh store and its canonical
+        snapshot is compared, section by section, with the live store's
+        canonical snapshot. The returned hash is the SHA-256 of the on-disk
+        state's canonical compact JSON.
+
+        Raises :class:`ValueError`/`:class:`TypeError` for any semantic
+        validation failure, a generation mismatch, or any divergence between
+        the file and memory; nothing is mutated in that case (the restored
+        copy is discarded).
+        """
+        with self._lock:
+            payload, commit_seq = read_payload()
+            if not isinstance(commit_seq, int) or isinstance(
+                    commit_seq, bool) or commit_seq < 0:
+                raise ValueError(
+                    "state document 'commit_seq' must be a non-negative "
+                    "integer")
+            expected = expected_commit_seq()
+            if commit_seq != expected:
+                raise ValueError(
+                    "state file commit_seq "
+                    f"{commit_seq} does not match the last committed "
+                    f"generation {expected}")
+            if not isinstance(payload, dict):
+                raise ValueError("state document must be a JSON object")
+            unknown_sections = set(payload) - set(INTEGRITY_SECTION_KEYS)
+            if unknown_sections:
+                raise ValueError(
+                    "state document has unknown sections: "
+                    f"{sorted(unknown_sections)}")
+            live = canonical_integrity_snapshot(self.snapshot_state())
+            restored_store = DeviceStore()
+            restored_store.restore_state(copy.deepcopy(payload))
+            on_disk = canonical_integrity_snapshot(
+                restored_store.snapshot_state())
+            if on_disk != live:
+                raise ValueError(
+                    "state file is inconsistent with the in-memory snapshot")
+            return commit_seq, integrity_state_hash(on_disk)
