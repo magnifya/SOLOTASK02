@@ -223,13 +223,21 @@ class DirectoryFsyncFallbackTest(unittest.TestCase):
         with self.assertRaises(PersistenceUnavailable):
             # Any mutating service call runs one save() transaction.
             self.service.store.add_device(Device("u", "d1", "ik"))
-        # The post-replace directory fsync failing is a real error: the
-        # backup inode was renamed back, no tmp/bak left behind.
-        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
-        self.assertEqual(os.stat(self.path).st_ino, self.good_ino)
-        leftovers = [name for name in os.listdir(self.directory)
-                     if name.endswith(".tmp") or name.endswith(".bak")]
-        self.assertEqual(leftovers, [])
+        # The post-replace directory fsync failing is a real error, and with
+        # the directory fsync still broken the rollback's own follow-up fsync
+        # cannot land either: that failed rollback step must leave a
+        # decidable state — the formal path missing, the old inode pinned in
+        # exactly one .bak — rather than an un-committed snapshot in place.
+        self.assertFalse(os.path.exists(self.path))
+        baks = [name for name in os.listdir(self.directory)
+                if name.endswith(".bak")]
+        self.assertEqual(len(baks), 1)
+        backup = os.path.join(self.directory, baks[0])
+        self.assertEqual(open(backup, "rb").read(), self.good_bytes)
+        self.assertEqual(os.stat(backup).st_ino, self.good_ino)
+        tmps = [name for name in os.listdir(self.directory)
+                if name.endswith(".tmp")]
+        self.assertEqual(tmps, [])
 
     def test_windows_style_directory_open_eacces_skipped(self) -> None:
         # On win32 opening a directory for the metadata flush surfaces as

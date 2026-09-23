@@ -73,6 +73,19 @@ def tmp_names(directory: str) -> List[str]:
                   and (name.endswith(".tmp") or name.endswith(".bak")))
 
 
+def bak_names(directory: str) -> List[str]:
+    """Names of pinned-inode backups only."""
+    return sorted(name for name in os.listdir(directory)
+                  if name.startswith(".state-") and name.endswith(".bak"))
+
+
+def quarantine_names(directory: str) -> List[str]:
+    """Names of new snapshots demoted off the formal path."""
+    return sorted(name for name in os.listdir(directory)
+                  if name.startswith(".state-")
+                  and name.endswith(".quarantine"))
+
+
 class ValidFormalWinsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.mkdtemp()
@@ -221,20 +234,25 @@ class DirectoryFsyncFailureTest(unittest.TestCase):
         with open(self.path, "rb") as handle:
             self.good_bytes = handle.read()
         self.good_ino = os.stat(self.path).st_ino
+        self.good_seq = json.loads(self.good_bytes.decode("utf-8"))[
+            "commit_seq"]
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)
 
     def test_directory_fsync_failure_rolls_back_and_reports_503_field(
             self) -> None:
+        # The directory fsync stays broken, so the rollback rename can land
+        # but the second directory fsync (flushing the rollback) fails too.
+        # That is a failed rollback step: the store must keep the old inode
+        # pinned in a .bak and vacate the formal path, rather than leave the
+        # un-committed new snapshot authoritative.
         import e2ee_backend.persistence as persistence_mod
         from e2ee_backend.persistence import PersistenceUnavailable
 
         real_fsync = persistence_mod.os.fsync
 
         def fail_on_directory_fd(fd: int) -> None:  # noqa: ANN001
-            # Fail the directory fsync only: the temp-file fsync happens while
-            # a regular file descriptor is open.
             if os.fstat(fd).st_mode & 0o170000 == 0o040000:
                 raise OSError("simulated directory fsync failure")
             real_fsync(fd)
@@ -245,14 +263,204 @@ class DirectoryFsyncFailureTest(unittest.TestCase):
                 self.service.revoke_device("alice")
         finally:
             persistence_mod.os.fsync = real_fsync
-        # Memory rolled back; the old document's bytes AND inode are restored
-        # (the post-replace directory-fsync failure rolled the rename back),
-        # and no temporary/backup file remains.
+        # Memory rolled back to the last committed state.
         self.assertFalse(
             self.service.store.find_by_device_id("alice").revoked)
+        # The failed transaction is decidable: the formal path is missing,
+        # the old inode survives in exactly one .bak, and no new snapshot is
+        # parked where recovery could promote it.
+        self.assertFalse(os.path.exists(self.path))
+        baks = bak_names(self.directory)
+        self.assertEqual(len(baks), 1)
+        with open(os.path.join(self.directory, baks[0]), "rb") as handle:
+            self.assertEqual(handle.read(), self.good_bytes)
+        self.assertEqual(
+            os.stat(os.path.join(self.directory, baks[0])).st_ino,
+            self.good_ino)
+        self.assertEqual(quarantine_names(self.directory), [])
+
+    def test_transient_directory_fsync_failure_rolls_back_in_place(self) -> None:
+        import e2ee_backend.persistence as persistence_mod
+        from e2ee_backend.persistence import PersistenceUnavailable
+
+        real_fsync = persistence_mod.os.fsync
+        calls = {"n": 0}
+
+        def fail_first_directory_fsync(fd: int) -> None:  # noqa: ANN001
+            if os.fstat(fd).st_mode & 0o170000 == 0o040000:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise OSError("transient directory fsync failure")
+            real_fsync(fd)
+
+        persistence_mod.os.fsync = fail_first_directory_fsync
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+        finally:
+            persistence_mod.os.fsync = real_fsync
+        # The rollback rename and its follow-up fsync both landed: the old
+        # inode is back in place and nothing is left behind.
         self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
         self.assertEqual(os.stat(self.path).st_ino, self.good_ino)
         self.assertEqual(tmp_names(self.directory), [])
+        # The store is not degraded: an immediate same-process retry commits
+        # normally, advancing exactly one generation.
+        self.service.revoke_device("alice")
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq + 1)
+        self.assertTrue(
+            self.service.store.find_by_device_id("alice").revoked)
+
+    def test_same_process_retry_is_refused_while_degraded(self) -> None:
+        import e2ee_backend.persistence as persistence_mod
+        from e2ee_backend.persistence import PersistenceUnavailable
+
+        real_fsync = persistence_mod.os.fsync
+
+        def fail_on_directory_fd(fd: int) -> None:  # noqa: ANN001
+            if os.fstat(fd).st_mode & 0o170000 == 0o040000:
+                raise OSError("simulated directory fsync failure")
+            real_fsync(fd)
+
+        persistence_mod.os.fsync = fail_on_directory_fd
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+        finally:
+            persistence_mod.os.fsync = real_fsync
+
+        baks_before = bak_names(self.directory)
+        self.assertEqual(len(baks_before), 1)
+        # Even with storage healthy again, the degraded process refuses the
+        # write (a 503 at the HTTP boundary) rather than risk an un-backed
+        # replace over the missing formal path; nothing on disk changes.
+        with self.assertRaises(PersistenceUnavailable):
+            self.service.revoke_device("alice")
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(bak_names(self.directory), baks_before)
+        self.assertEqual(quarantine_names(self.directory), [])
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+
+    def test_restart_recovers_pinned_backup_and_retry_commits_once(
+            self) -> None:
+        import e2ee_backend.persistence as persistence_mod
+        from e2ee_backend.persistence import PersistenceUnavailable
+
+        real_fsync = persistence_mod.os.fsync
+
+        def fail_on_directory_fd(fd: int) -> None:  # noqa: ANN001
+            if os.fstat(fd).st_mode & 0o170000 == 0o040000:
+                raise OSError("simulated directory fsync failure")
+            real_fsync(fd)
+
+        persistence_mod.os.fsync = fail_on_directory_fd
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+            # A retry while the failure persists still consumes no generation.
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+        finally:
+            persistence_mod.os.fsync = real_fsync
+
+        # Restart with storage healthy again: the pinned old inode is the
+        # highest/only candidate and is recovered into the formal path.
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        self.assertEqual(os.stat(self.path).st_ino, self.good_ino)
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq)
+        self.assertFalse(service.store.find_by_device_id("alice").revoked)
+
+        # The recovered retry commits exactly one consecutive new generation.
+        service.revoke_device("alice")
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq + 1)
+        self.assertTrue(service.store.find_by_device_id("alice").revoked)
+        self.assertEqual(tmp_names(self.directory), [])
+
+
+class RollbackRenameFailureTest(unittest.TestCase):
+    """The rollback rename itself failing must stay decidable."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.mkdtemp()
+        self.service, self.path, self.sid, _bytes = build_fixture(
+            self.directory)
+        with open(self.path, "rb") as handle:
+            self.good_bytes = handle.read()
+        self.good_ino = os.stat(self.path).st_ino
+        self.good_seq = json.loads(self.good_bytes.decode("utf-8"))[
+            "commit_seq"]
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def test_rename_failure_keeps_backup_and_vacates_new_snapshot(self) -> None:
+        import e2ee_backend.persistence as persistence_mod
+        from e2ee_backend.persistence import PersistenceUnavailable
+
+        real_fsync = persistence_mod.os.fsync
+        real_replace = persistence_mod.os.replace
+        target = os.path.abspath(self.path)
+
+        def fail_on_directory_fd(fd: int) -> None:  # noqa: ANN001
+            if os.fstat(fd).st_mode & 0o170000 == 0o040000:
+                raise OSError("simulated post-replace fsync failure")
+            real_fsync(fd)
+
+        def fail_backup_rename(src: str, dst: str) -> None:
+            # Fail only the rollback rename (pinned .bak back over the
+            # target); the initial tmp->target replace and the later rename
+            # parking the new snapshot must go through.
+            if os.path.abspath(dst) == target and src.endswith(".bak"):
+                raise OSError("simulated rollback rename failure")
+            return real_replace(src, dst)
+
+        persistence_mod.os.fsync = fail_on_directory_fd
+        persistence_mod.os.replace = fail_backup_rename
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+        finally:
+            persistence_mod.os.fsync = real_fsync
+            persistence_mod.os.replace = real_replace
+
+        # The old inode is pinned in the .bak; the formal path no longer
+        # holds the un-committed new snapshot (it is quarantined or gone).
+        self.assertFalse(os.path.exists(self.path))
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        baks = bak_names(self.directory)
+        self.assertEqual(len(baks), 1)
+        backup_path = os.path.join(self.directory, baks[0])
+        self.assertEqual(open(backup_path, "rb").read(), self.good_bytes)
+        self.assertEqual(os.stat(backup_path).st_ino, self.good_ino)
+
+        # Restart restores the pinned inode; the quarantined new snapshot is
+        # removed, never promoted, and the retry is one fresh generation.
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        self.assertEqual(os.stat(self.path).st_ino, self.good_ino)
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(quarantine_names(self.directory), [])
+        service.revoke_device("alice")
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq + 1)
+        self.assertTrue(service.store.find_by_device_id("alice").revoked)
 
 
 class NoValidSnapshotFallbackTest(unittest.TestCase):

@@ -13,12 +13,22 @@ hook fires while the store lock is held (the mutation is visible but not yet
 committed to callers). When the durable write succeeds it becomes the new
 last-known-good state. When writing the temporary file, ``fsync`` or the
 atomic replace fails (an :class:`OSError`), the previous last-known-good state
-is restored into memory under the same lock, the old state file's bytes *and
-inode* are restored from the backup when the replace had landed, temporary
-files are cleaned up by :meth:`JsonStateStore.save`, and
+is restored into memory under the same lock and
 :class:`PersistenceUnavailable` is raised so the HTTP layer answers
-503/field=data_file. The failed mutation therefore never advances either
+503/field=data_file; the failed mutation therefore never advances either
 memory or the file.
+
+After the replace has landed, a failed directory fsync first rolls the rename
+back: the pinned old inode is renamed over the target and a second directory
+fsync flushes the rollback. When that rollback itself cannot be completed
+durably — the rollback rename fails, or the second fsync fails — the failure
+stays *decidable*: the old inode is kept under a ``.state-*.bak`` backup and
+the new snapshot is taken off the formal path (parked under a
+``.state-*.quarantine`` name the recovery scan never promotes, or deleted), so
+the formal path is missing. The store is then marked degraded and refuses
+further writes in that process (each still answered 503/field=data_file);
+restart recovery promotes the pinned backup. This guarantees an
+un-committed snapshot can never become authoritative.
 
 A crash between steps can leave ``.state-*.tmp`` (staged document) or
 ``.state-*.bak`` (pinned previous inode) files beside the target. At the next
@@ -64,6 +74,12 @@ _TMP_PREFIX = ".state-"
 _TMP_SUFFIX = ".tmp"
 #: Suffix of the pre-replace hard-link backup pinning the previous inode.
 _BAK_SUFFIX = ".bak"
+#: Suffix of a new snapshot taken off the formal path when the rollback
+#: itself cannot be completed durably. Such a file is deliberately *not* a
+#: crash-recovery candidate (the scan only promotes ``.tmp``/``.bak``): the
+#: transaction it staged was already reported failed and rolled back in
+#: memory, so it must never be resurrected at the next startup.
+_QUARANTINE_SUFFIX = ".quarantine"
 
 #: Top-level commit-generation field. Every successful durable transaction
 #: writes a document whose ``commit_seq`` is exactly one higher than the
@@ -113,6 +129,17 @@ class JsonStateStore:
         #: only once a save has completed durably, so a failed transaction
         #: never consumes a generation.
         self.commit_seq = 0
+        #: Set once a transaction ends in the undecidable-on-disk state where
+        #: the formal path is missing and the last committed inode survives
+        #: only as a ``.bak`` (a failed rollback rename, or a rollback rename
+        #: whose follow-up fsync failed). A later write in the same process
+        #: could not pin that backup again (the formal file is gone), so
+        #: failing again would strand an un-committed snapshot at the formal
+        #: path, which a restart would wrongly treat as authoritative. The
+        #: store therefore refuses further writes with an :class:`OSError`
+        #: (mapped to 503/field=data_file) until a fresh process recovers the
+        #: pinned backup via :func:`recover_crash_leftovers`.
+        self.degraded = False
 
     def load(self) -> Optional[Dict[str, Any]]:
         """Load the document, or ``None`` when the file does not exist yet.
@@ -165,13 +192,33 @@ class JsonStateStore:
         Before the replace a hard link to the current target is taken in the
         same directory. If the replace itself succeeds but the following
         directory fsync fails, that link is renamed back over the target,
-        restoring the previous document's exact bytes *and inode*; every other
-        failure simply removes the temporary files, leaving the target
-        untouched. Any failure propagates the underlying :class:`OSError` to
-        the caller, with no temporary or backup file left behind.
+        restoring the previous document's exact bytes *and inode*, and the
+        rollback is flushed with a second directory fsync; every other
+        pre-replace failure simply removes the temporary file, leaving the
+        target untouched.
+
+        When the rollback itself cannot be completed durably — the rollback
+        rename fails, or the second directory fsync fails — the store falls
+        back to a *decidable* crash state instead of risking an un-committed
+        snapshot at the formal path: the last committed inode is kept under a
+        ``.bak`` backup and the new snapshot is taken off the formal path
+        (renamed aside to a ``.quarantine`` name the recovery scan never
+        promotes, or deleted), so the formal path is missing and the next
+        startup restores that backup. Any failure propagates the underlying
+        :class:`OSError` to the caller.
         """
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
+        if self.degraded:
+            # A previous failure left the formal path missing with the last
+            # committed inode pinned only as a .bak; another replace here
+            # could not be rolled back (there is no target to back up) and a
+            # crash could promote the un-committed snapshot. Refuse until a
+            # restart recovers the backup. The caller maps this OSError to
+            # PersistenceUnavailable/503 exactly like a write failure.
+            raise OSError(
+                f"state store for {self.path} is degraded after an "
+                f"un-rollbackable write failure; restart required to recover")
         document = {"version": STATE_VERSION, **state}
         # Stamp the commit generation this save is committing. The counter
         # advances only after the replace and directory fsync succeed, so a
@@ -205,22 +252,38 @@ class JsonStateStore:
             tmp_handle.close()
             _remove_quietly(tmp_path)
             if replaced and backup_path is not None:
-                # The replacement landed; rename the pinned old inode back over
-                # the target atomically (this also drops the new inode), then
-                # flush the rollback. If even this rename fails, leave the
-                # backup on disk as a crash leftover rather than deleting the
-                # last good copy; startup recovery finds it.
+                # The replacement landed but the following directory fsync
+                # failed. Restore the pinned old inode atomically first (the
+                # rename itself also drops the new inode)...
                 try:
                     os.replace(backup_path, self.path)
+                except OSError:
+                    # ...the rollback rename itself failed. The formal path
+                    # still holds the un-committed new inode, which must never
+                    # become authoritative: move it off the path (the old
+                    # inode stays pinned in the .bak), so the next startup
+                    # sees a missing formal file and recovers that backup.
+                    _vacate_new_snapshot(directory, self.path)
+                    # Keep the backup: it is now the only copy of the last
+                    # committed inode, so it must not be cleaned up below.
+                    backup_path = None
+                    self.degraded = True
+                else:
                     backup_path = None
                     try:
                         _fsync_directory(directory)
                     except OSError:
-                        pass
-                except OSError:
-                    # The rollback rename failed; leave the backup on disk as a
-                    # crash leftover rather than deleting the last good copy.
-                    backup_path = None
+                        # The rollback rename restored the old inode but its
+                        # durability could not be flushed: this step failed
+                        # too, so the transaction is still failed, never
+                        # committed. Re-pin the restored inode as a .bak and
+                        # vacate the formal path again, leaving exactly the
+                        # "formal missing + old-inode .bak" state startup
+                        # recovery resolves. When the path could not be
+                        # vacated the old inode is still authoritative at it
+                        # (the safe outcome), so the store is not degraded.
+                        if _repin_old_inode(directory, self.path):
+                            self.degraded = True
             if backup_path is not None:
                 _remove_quietly(backup_path)
             raise
@@ -311,6 +374,80 @@ def _hardlink_backup(directory: str, target: str) -> Optional[str]:
     return backup
 
 
+def _quarantine_path(directory: str) -> str:
+    """Reserve a unique same-directory name for a demoted new snapshot."""
+    fd, quarantine = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
+                                      suffix=_QUARANTINE_SUFFIX)
+    os.close(fd)
+    # The empty placeholder only reserves the unique name; free it for the
+    # rename that moves the new snapshot aside.
+    os.unlink(quarantine)
+    return quarantine
+
+
+def _vacate_new_snapshot(directory: str, target: str) -> None:
+    """Take the un-committed new snapshot off the formal path.
+
+    Used when a post-replace failure cannot be rolled back durably: the new
+    inode must never become authoritative, so it is renamed aside to a
+    ``.quarantine`` name (which the crash-leftover scan never promotes), and
+    if even that rename is impossible it is deleted. Either way the formal
+    path is missing afterwards; a pinned ``.bak`` of the last committed
+    inode is the recovery candidate the next startup promotes. Best effort
+    only — a failure here is swallowed because the caller still reports the
+    transaction as failed and the old inode stays pinned elsewhere.
+    """
+    try:
+        quarantine = _quarantine_path(directory)
+        try:
+            os.replace(target, quarantine)
+        except OSError:
+            _remove_quietly(quarantine)
+            raise
+    except OSError:
+        _remove_quietly(target)
+
+
+def _repin_old_inode(directory: str, target: str) -> bool:
+    """Re-pin the restored old inode as a ``.bak`` and vacate *target*.
+
+    The rollback rename restored the last committed inode at *target*, but
+    flushing that rollback failed, so it cannot be treated as durable. Pin
+    the inode under a fresh backup name, then drop *target* (a second hard
+    link to the same inode, so the unlink loses nothing), recreating the
+    same "formal missing + old-inode .bak" triage a plain rollback failure
+    leaves. Returns ``True`` when the formal path was vacated. If the inode
+    cannot be pinned a second time it simply stays on the formal path — the
+    last good state — and the function returns ``False`` so the caller does
+    not mark the store degraded while a good file is authoritative.
+    """
+    try:
+        fd, backup = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
+                                      suffix=_BAK_SUFFIX)
+        os.close(fd)
+        os.unlink(backup)
+        os.link(target, backup)
+    except OSError:
+        _remove_quietly(backup)
+        # A second hard link cannot be made; instead rename the restored
+        # target itself to the backup name — one atomic rename both keeps
+        # the old inode (under the .bak) and vacates the formal path.
+        try:
+            fd, backup = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
+                                          suffix=_BAK_SUFFIX)
+            os.close(fd)
+            os.unlink(backup)
+            os.replace(target, backup)
+        except OSError:
+            _remove_quietly(backup)
+            return False
+    else:
+        # target and backup now name the same restored inode; dropping
+        # target leaves the inode pinned exactly once, under the backup name.
+        _remove_quietly(target)
+    return not os.path.exists(target)
+
+
 def _read_version1_document(path: str) -> Optional[Dict[str, Any]]:
     """Parse *path* as a version-1 state document, or ``None`` if absent.
 
@@ -398,6 +535,28 @@ def _leftover_tmp_paths(directory: str, target_path: str) -> List[str]:
     return leftovers
 
 
+def _quarantined_paths(directory: str, target_path: str) -> List[str]:
+    """List demoted new snapshots parked under a ``.quarantine`` name.
+
+    These are never recovery candidates: a quarantined snapshot staged a
+    transaction that was reported failed and rolled back in memory, so it is
+    only garbage to remove once a valid formal state is authoritative (or a
+    candidate has been recovered). A corrupt formal file keeps them on disk
+    for inspection, like every other leftover.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    quarantined: List[str] = []
+    for name in names:
+        if name.startswith(_TMP_PREFIX) and name.endswith(_QUARANTINE_SUFFIX):
+            full = os.path.join(directory, name)
+            if os.path.abspath(full) != os.path.abspath(target_path):
+                quarantined.append(full)
+    return quarantined
+
+
 def _remove_quietly(path: str) -> None:
     try:
         os.unlink(path)
@@ -434,14 +593,16 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
     """
     directory = os.path.dirname(os.path.abspath(state_store.path))
     leftovers = _leftover_tmp_paths(directory, state_store.path)
-    if not leftovers:
+    quarantined = _quarantined_paths(directory, state_store.path)
+    if not leftovers and not quarantined:
         return
 
     if os.path.exists(state_store.path):
         # The formal file exists. A valid one stays authoritative and the
-        # leftovers are stale; an invalid one (including a present but
-        # malformed commit_seq) makes the normal load refuse startup, so
-        # neither the file nor the leftovers are touched here.
+        # leftovers (including demoted snapshots parked in quarantine) are
+        # stale; an invalid one (including a present but malformed
+        # commit_seq) makes the normal load refuse startup, so neither the
+        # file nor the leftovers are touched here.
         formal = _read_version1_document(state_store.path)
         formal_valid = (
             formal is not None
@@ -449,7 +610,7 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
                  or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
             and _document_restores(formal))
         if formal_valid:
-            for path in leftovers:
+            for path in leftovers + quarantined:
                 _remove_quietly(path)
         return
 
@@ -502,6 +663,11 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
         _fsync_directory(directory)
         leftovers = [path for path in leftovers if path != recovered]
     for path in leftovers:
+        _remove_quietly(path)
+    # A demoted snapshot is never a recovery candidate (its transaction was
+    # reported failed and rolled back); once the formal path has been
+    # resolved above, any quarantine file is pure garbage.
+    for path in quarantined:
         _remove_quietly(path)
 
 
