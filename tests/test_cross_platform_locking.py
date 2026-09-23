@@ -216,20 +216,38 @@ class DirectoryFsyncFallbackTest(unittest.TestCase):
         with open(self.path, encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["version"], 1)
 
-    def test_directory_fsync_eio_after_replace_rolls_back(self) -> None:
+    def test_directory_fsync_eio_after_replace_preserves_backup(self) -> None:
         from e2ee_backend.models import Device
 
         os.fsync = self._directory_only_failure(errno.EIO)  # type: ignore
         with self.assertRaises(PersistenceUnavailable):
             # Any mutating service call runs one save() transaction.
             self.service.store.add_device(Device("u", "d1", "ik"))
-        # The post-replace directory fsync failing is a real error: the
-        # backup inode was renamed back, no tmp/bak left behind.
-        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
-        self.assertEqual(os.stat(self.path).st_ino, self.good_ino)
+        # The post-replace directory fsync failing with a genuine I/O error
+        # aborts the transaction; the rollback rename lands but its own
+        # directory flush fails the same way. The old inode is therefore
+        # preserved as a .bak and the formal path is vacated so an
+        # uncommitted snapshot can never be authoritative.
+        self.assertFalse(os.path.exists(self.path))
         leftovers = [name for name in os.listdir(self.directory)
                      if name.endswith(".tmp") or name.endswith(".bak")]
-        self.assertEqual(leftovers, [])
+        self.assertEqual(len(leftovers), 1)
+        self.assertTrue(leftovers[0].endswith(".bak"))
+        with open(os.path.join(self.directory, leftovers[0]), "rb") as h:
+            self.assertEqual(h.read(), self.good_bytes)
+        # The failed registration was rolled back in memory.
+        self.assertIsNone(self.service.store.find_by_device_id("d1"))
+        # Startup recovery promotes the preserved backup; the retry then
+        # commits the device.
+        os.fsync = self._real_fsync  # type: ignore[assignment]
+        restarted = DeviceService()
+        attach_persistence(restarted, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        restarted.store.add_device(Device("u", "d1", "ik"))
+        self.assertIsNotNone(restarted.store.find_by_device_id("d1"))
+        self.assertEqual(
+            [n for n in os.listdir(self.directory)
+             if n.endswith(".tmp") or n.endswith(".bak")], [])
 
     def test_windows_style_directory_open_eacces_skipped(self) -> None:
         # On win32 opening a directory for the metadata flush surfaces as

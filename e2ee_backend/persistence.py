@@ -20,9 +20,10 @@ files are cleaned up by :meth:`JsonStateStore.save`, and
 503/field=data_file. The failed mutation therefore never advances either
 memory or the file.
 
-A crash between steps can leave ``.state-*.tmp`` (staged document) or
-``.state-*.bak`` (pinned previous inode) files beside the target. At the next
-:func:`attach_persistence` these are resolved by
+A crash between steps can leave ``.state-*.tmp`` (staged document),
+``.state-*.bak`` (pinned previous inode), or ``.state-*.bad`` (a snapshot
+isolated after a post-replace rollback could not be completed) files beside
+the target. At the next :func:`attach_persistence` these are resolved by
 :func:`recover_crash_leftovers`: a valid formal file stays authoritative and
 the leftovers are removed; with the formal file missing the highest
 ``commit_seq`` leftover that parses as version=1, carries the cursor and
@@ -64,6 +65,11 @@ _TMP_PREFIX = ".state-"
 _TMP_SUFFIX = ".tmp"
 #: Suffix of the pre-replace hard-link backup pinning the previous inode.
 _BAK_SUFFIX = ".bak"
+#: Suffix of a snapshot isolated after a failed post-replace rollback: the
+#: transaction was definitively aborted (503), so such a file is cleaned up
+#: and is *never* a recovery candidate, even when it carries a newer
+#: ``commit_seq`` than the preserved ``.bak`` of the last committed inode.
+_QUARANTINE_SUFFIX = ".bad"
 
 #: Top-level commit-generation field. Every successful durable transaction
 #: writes a document whose ``commit_seq`` is exactly one higher than the
@@ -165,10 +171,23 @@ class JsonStateStore:
         Before the replace a hard link to the current target is taken in the
         same directory. If the replace itself succeeds but the following
         directory fsync fails, that link is renamed back over the target,
-        restoring the previous document's exact bytes *and inode*; every other
-        failure simply removes the temporary files, leaving the target
-        untouched. Any failure propagates the underlying :class:`OSError` to
-        the caller, with no temporary or backup file left behind.
+        restoring the previous document's exact bytes *and inode*, then the
+        rollback is flushed with another directory fsync; every other failure
+        simply removes the temporary files, leaving the target untouched.
+
+        If that rollback rename itself fails, or the following rollback
+        directory fsync fails, the old inode is *preserved* as the ``.bak``
+        backup and the new (already replaced) snapshot is isolated under a
+        ``.bad`` quarantine name and unlinked, leaving the formal target
+        absent. The preserved ``.bak`` is the single last-known-good inode;
+        on the next startup the missing formal file is recovered from it by
+        :func:`recover_crash_leftovers`, and the quarantined snapshot (a
+        failed transaction that may carry a newer ``commit_seq``) is never
+        chosen. On the very first save there is no old inode to preserve, so
+        the new snapshot is merely isolated the same way. Any failure
+        propagates the underlying :class:`OSError` to the caller (it surfaces
+        as 503/field=data_file with memory rolled back), regardless of
+        whether the best-effort quarantine housekeeping succeeded.
         """
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
@@ -204,24 +223,18 @@ class JsonStateStore:
         except BaseException:
             tmp_handle.close()
             _remove_quietly(tmp_path)
-            if replaced and backup_path is not None:
-                # The replacement landed; rename the pinned old inode back over
-                # the target atomically (this also drops the new inode), then
-                # flush the rollback. If even this rename fails, leave the
-                # backup on disk as a crash leftover rather than deleting the
-                # last good copy; startup recovery finds it.
-                try:
-                    os.replace(backup_path, self.path)
-                    backup_path = None
-                    try:
-                        _fsync_directory(directory)
-                    except OSError:
-                        pass
-                except OSError:
-                    # The rollback rename failed; leave the backup on disk as a
-                    # crash leftover rather than deleting the last good copy.
-                    backup_path = None
-            if backup_path is not None:
+            if replaced:
+                # The replacement landed and the transaction then failed
+                # (only the post-replace directory fsync can fail at this
+                # point). Best-effort restore the pinned old inode; if that
+                # cannot be made durable the new snapshot is quarantined so
+                # the formal path never ends up holding an uncommitted
+                # document (see the helper for the exact on-disk outcome).
+                _abort_replaced_transaction(
+                    directory, self.path, backup_path)
+            elif backup_path is not None:
+                # The replace never ran, so the target still holds the old
+                # inode and the precautionary backup is redundant.
                 _remove_quietly(backup_path)
             raise
         # Commit is durable; drop the pinned old inode (best effort — a
@@ -234,6 +247,103 @@ class JsonStateStore:
                 pass
         # The generation advances exactly once per durable commit.
         self.commit_seq = seq + 1
+
+
+def _quarantine_path(directory: str) -> str:
+    """Return a fresh, unused same-directory ``.state-*.bad`` path."""
+    fd, path = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
+                                suffix=_QUARANTINE_SUFFIX)
+    os.close(fd)
+    # mkstemp created an empty file under that unique name; free the name so
+    # the snapshot can be renamed onto it.
+    os.unlink(path)
+    return path
+
+
+def _isolate_new_snapshot(directory: str, target: str) -> None:
+    """Best-effort move the uncommitted snapshot at *target* off the path.
+
+    Renames *target* to a unique ``.bad`` quarantine name and unlinks it, so
+    the formal path is absent and the failed snapshot can never be taken for
+    a committed generation by startup recovery. If the quarantine rename
+    fails, a direct unlink of *target* is tried instead — either way the
+    formal path is vacated when the directory is writable at all. If only the
+    final unlink fails the snapshot remains isolated under ``.bad``, which
+    startup recovery removes without ever selecting; only a completely
+    unwritable directory leaves it in place (the transaction's I/O is already
+    failing in that case). The directory flush afterwards is best effort.
+    """
+    try:
+        quarantine = _quarantine_path(directory)
+    except OSError:
+        quarantine = None
+    if quarantine is not None:
+        try:
+            os.replace(target, quarantine)
+        except OSError:
+            quarantine = None
+    if quarantine is not None:
+        _remove_quietly(quarantine)
+    else:
+        _remove_quietly(target)
+    try:
+        _fsync_directory(directory)
+    except OSError:
+        pass
+
+
+def _abort_replaced_transaction(directory: str, target: str,
+                                backup_path: Optional[str]) -> None:
+    """Best-effort undo once the replacement has already landed.
+
+    Called from :meth:`JsonStateStore.save`'s exception path after
+    ``os.replace`` succeeded: *target* holds the new, uncommitted document
+    and *backup_path* (unless this was the first save) is the hard-linked
+    previous inode. The preferred outcome is a clean rollback — rename the
+    backup back over the target and flush the directory — which restores the
+    previous document's bytes and inode exactly.
+
+    If the rollback rename fails, or the flush of it fails, the old inode is
+    preserved as a ``.bak`` and the new snapshot is isolated/dropped so the
+    formal path is missing; startup recovery then promotes the single
+    last-known-good backup and never considers the quarantined generation.
+    With no backup (first save, no previous document existed) the new
+    snapshot is merely isolated, leaving the formal path absent. Everything
+    here is best effort and must not mask the transaction's original
+    :class:`OSError`, which the caller re-raises.
+    """
+    if backup_path is None:
+        # No previous inode to preserve: just vacate the formal path.
+        _isolate_new_snapshot(directory, target)
+        return
+    try:
+        os.replace(backup_path, target)
+    except OSError:
+        # The old inode cannot be put back. Keep its .bak exactly where it is
+        # and move the uncommitted snapshot off the formal path.
+        _isolate_new_snapshot(directory, target)
+        return
+    # The old inode is back on the formal path. Make the rollback rename
+    # durable. A platform/filesystem that cannot fsync directories returns
+    # False and the rollback still stands; only a raised I/O error leaves the
+    # rename of uncertain durability.
+    try:
+        _fsync_directory(directory)
+    except OSError:
+        # Re-pin the restored inode as a .bak, then vacate the formal path so
+        # a crash can never reveal the (possibly still directory-linked)
+        # uncommitted snapshot: startup sees the formal file missing plus one
+        # good backup and recovers deterministically.
+        try:
+            fresh_backup = _hardlink_backup(directory, target)
+        except OSError:
+            fresh_backup = None
+        if fresh_backup is not None:
+            _remove_quietly(target)
+            try:
+                _fsync_directory(directory)
+            except OSError:
+                pass
 
 
 def _directory_fsync_unsupported(error: OSError) -> bool:
@@ -377,9 +487,10 @@ def _leftover_tmp_paths(directory: str, target_path: str) -> List[str]:
     """List crash-leftover snapshots in *directory*.
 
     These carry the same ``.state-`` prefix :meth:`JsonStateStore.save` uses,
-    with either the ``.tmp`` suffix of a staged new document or the ``.bak``
-    suffix of a pre-replace hard-link backup (the previous committed inode).
-    The formal target itself is never considered.
+    with the ``.tmp`` suffix of a staged new document, the ``.bak`` suffix of
+    a pre-replace hard-link backup (the previous committed inode), or the
+    ``.bad`` suffix of a snapshot isolated after a failed post-replace
+    rollback. The formal target itself is never considered.
     """
     try:
         names = os.listdir(directory)
@@ -389,7 +500,8 @@ def _leftover_tmp_paths(directory: str, target_path: str) -> List[str]:
     for name in names:
         if not name.startswith(_TMP_PREFIX):
             continue
-        if not (name.endswith(_TMP_SUFFIX) or name.endswith(_BAK_SUFFIX)):
+        if not (name.endswith(_TMP_SUFFIX) or name.endswith(_BAK_SUFFIX)
+                or name.endswith(_QUARANTINE_SUFFIX)):
             continue
         full = os.path.join(directory, name)
         if os.path.abspath(full) == os.path.abspath(target_path):
@@ -418,16 +530,20 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
       ``group_sync_cursors``/``message_sync_cursors``/``key_events``
       sections (each a list — the footprint of one complete durable
       transaction), *and* pass full semantic verification are considered.
-      They rank by commit generation first — the highest ``commit_seq``
-      wins, so an older-mtime snapshot from a later generation is never
-      lost to a newer-mtime stale one — with modification time newest-first
-      among equal generations (a missing field counts as generation 0).
-      When every candidate predates commit generations (none carries the
-      field), selection stays the legacy newest-mtime rule. The chosen
-      snapshot is atomically ``os.replace``-d into place (plus a
-      parent-directory fsync) and the remaining leftovers are removed. A
-      section-less legacy/partial snapshot is never promoted, so a resume
-      cursor or the audit chain cannot be silently lost.
+      A ``.bad`` file is never a candidate: it is a snapshot of a transaction
+      that was definitively aborted (the post-replace rollback could not be
+      made durable and a 503 was already returned), even though it may carry
+      a newer ``commit_seq``; it is only removed. Candidates rank by commit
+      generation first — the highest ``commit_seq`` wins, so an older-mtime
+      snapshot from a later generation is never lost to a newer-mtime stale
+      one — with modification time newest-first among equal generations (a
+      missing field counts as generation 0). When every candidate predates
+      commit generations (none carries the field), selection stays the
+      legacy newest-mtime rule. The chosen snapshot is atomically
+      ``os.replace``-d into place (plus a parent-directory fsync) and the
+      remaining leftovers — including every ``.bad`` quarantine file — are
+      removed. A section-less legacy/partial snapshot is never promoted, so a
+      resume cursor or the audit chain cannot be silently lost.
     * When no candidate is valid, all leftovers are removed; the normal
       missing-file path in :func:`attach_persistence` then creates an empty
       state.
@@ -439,9 +555,10 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
 
     if os.path.exists(state_store.path):
         # The formal file exists. A valid one stays authoritative and the
-        # leftovers are stale; an invalid one (including a present but
-        # malformed commit_seq) makes the normal load refuse startup, so
-        # neither the file nor the leftovers are touched here.
+        # leftovers (staged snapshots, old backups, quarantine files) are
+        # stale and removed; an invalid one (including a present but malformed
+        # commit_seq) makes the normal load refuse startup, so neither the
+        # file nor the leftovers are touched here.
         formal = _read_version1_document(state_store.path)
         formal_valid = (
             formal is not None
@@ -460,9 +577,14 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
     # leftover without the field is a pre-generation snapshot at seq 0; when
     # every candidate is such a snapshot the ranking collapses to the legacy
     # pure-mtime rule. Ties in mtime break by name, deterministically.
+    # A .bad quarantine file is a definitively-aborted transaction (503 was
+    # already returned and memory rolled back), so it never enters the
+    # ranking however new its generation looks; it is swept with the rest.
     verified: List[Tuple[str, int, int]] = []
     any_with_seq = False
     for candidate in leftovers:
+        if candidate.endswith(_QUARANTINE_SUFFIX):
+            continue
         document = _read_version1_document(candidate)
         if document is None or not _candidate_is_section_complete(document):
             continue

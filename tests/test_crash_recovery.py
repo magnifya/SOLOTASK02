@@ -210,6 +210,31 @@ class MissingFormalRecoveryTest(unittest.TestCase):
         self.assertEqual(open(self.path, "rb").read(), self.formal_bytes)
         self.assertEqual(tmp_names(self.directory), [])
 
+    def test_quarantined_bad_snapshot_never_outranks_good_backup(self) -> None:
+        # Formal missing. A .bak holds the last committed document; a .bad
+        # quarantine file holds a *failed* transaction stamped one generation
+        # newer (and newer mtime). Recovery must promote the .bak and delete
+        # the .bad — the aborted snapshot is never authoritative.
+        os.unlink(self.path)
+        good_doc = json.loads(self.formal_bytes.decode("utf-8"))
+        bad_doc = dict(good_doc)
+        bad_doc["commit_seq"] = good_doc["commit_seq"] + 1
+        write_tmp(self.directory, ".state-failed.bad",
+                  json.dumps(bad_doc).encode("utf-8"), mtime_ns=10**18)
+        write_tmp(self.directory, ".state-good.bak", self.formal_bytes,
+                  mtime_ns=1000)
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.formal_bytes)
+        self.assertEqual(sorted(os.listdir(self.directory)),
+                         [os.path.basename(self.path)])
+        # Resumed generations continue from the committed document, never from
+        # the quarantined one.
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            good_doc["commit_seq"])
+
 
 class DirectoryFsyncFailureTest(unittest.TestCase):
     """A directory-fsync failure after the rename is the same transaction."""
@@ -221,11 +246,48 @@ class DirectoryFsyncFailureTest(unittest.TestCase):
         with open(self.path, "rb") as handle:
             self.good_bytes = handle.read()
         self.good_ino = os.stat(self.path).st_ino
+        self.good_seq = json.loads(self.good_bytes.decode("utf-8"))[
+            "commit_seq"]
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)
 
-    def test_directory_fsync_failure_rolls_back_and_reports_503_field(
+    def _all_state_names(self) -> List[str]:
+        """Every ``.state-*`` leftover of any suffix."""
+        return sorted(name for name in os.listdir(self.directory)
+                      if name.startswith(".state-"))
+
+    def test_directory_fsync_once_rolls_back_cleanly(self) -> None:
+        # The directory fsync fails on the commit but succeeds when flushing
+        # the rollback: the old inode is renamed back into place, and nothing
+        # is quarantined.
+        import e2ee_backend.persistence as persistence_mod
+        from e2ee_backend.persistence import PersistenceUnavailable
+
+        real_fsync = persistence_mod.os.fsync
+        failed_once = False
+
+        def fail_first_directory_fsync(fd: int) -> None:  # noqa: ANN001
+            nonlocal failed_once
+            if os.fstat(fd).st_mode & 0o170000 == 0o040000:
+                if not failed_once:
+                    failed_once = True
+                    raise OSError("simulated directory fsync failure")
+            real_fsync(fd)
+
+        persistence_mod.os.fsync = fail_first_directory_fsync
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+        finally:
+            persistence_mod.os.fsync = real_fsync
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        self.assertEqual(os.stat(self.path).st_ino, self.good_ino)
+        self.assertEqual(self._all_state_names(), [])
+
+    def test_persistent_fsync_failure_preserves_bak_and_vacates_formal(
             self) -> None:
         import e2ee_backend.persistence as persistence_mod
         from e2ee_backend.persistence import PersistenceUnavailable
@@ -233,8 +295,8 @@ class DirectoryFsyncFailureTest(unittest.TestCase):
         real_fsync = persistence_mod.os.fsync
 
         def fail_on_directory_fd(fd: int) -> None:  # noqa: ANN001
-            # Fail the directory fsync only: the temp-file fsync happens while
-            # a regular file descriptor is open.
+            # Fail every directory fsync: neither the commit nor the rollback
+            # flush can be made durable.
             if os.fstat(fd).st_mode & 0o170000 == 0o040000:
                 raise OSError("simulated directory fsync failure")
             real_fsync(fd)
@@ -245,14 +307,142 @@ class DirectoryFsyncFailureTest(unittest.TestCase):
                 self.service.revoke_device("alice")
         finally:
             persistence_mod.os.fsync = real_fsync
-        # Memory rolled back; the old document's bytes AND inode are restored
-        # (the post-replace directory-fsync failure rolled the rename back),
-        # and no temporary/backup file remains.
+        # Memory rolled back to the last committed state.
         self.assertFalse(
             self.service.store.find_by_device_id("alice").revoked)
+        # The formal path is absent: an uncommitted snapshot can never remain
+        # authoritative. The old inode survives as exactly one .bak ...
+        self.assertFalse(os.path.exists(self.path))
+        leftovers = self._all_state_names()
+        self.assertEqual(len(leftovers), 1)
+        self.assertTrue(leftovers[0].endswith(".bak"))
+        backup = os.path.join(self.directory, leftovers[0])
+        self.assertEqual(open(backup, "rb").read(), self.good_bytes)
+        self.assertEqual(os.stat(backup).st_ino, self.good_ino)
+        # ... and no quarantine snapshot (.bad) is left behind.
+        self.assertFalse(any(name.endswith(".bad")
+                             for name in leftovers))
+
+        # Restart: the missing formal file is recovered from the preserved
+        # backup (the failed newer-generation snapshot is gone), and the
+        # retried revocation commits exactly one continuous new generation.
+        restarted = DeviceService()
+        attach_persistence(restarted, self.path)
         self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
         self.assertEqual(os.stat(self.path).st_ino, self.good_ino)
-        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(self._all_state_names(), [])
+        restarted.revoke_device("alice")
+        self.assertTrue(
+            restarted.store.find_by_device_id("alice").revoked)
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["commit_seq"],
+                             self.good_seq + 1)
+
+    def test_rollback_rename_failure_preserves_bak_and_vacates_formal(
+            self) -> None:
+        import e2ee_backend.persistence as persistence_mod
+        from e2ee_backend.persistence import PersistenceUnavailable
+
+        real_fsync = persistence_mod.os.fsync
+        real_replace = persistence_mod.os.replace
+        calls = {"replace": 0}
+
+        def fail_on_directory_fd(fd: int) -> None:  # noqa: ANN001
+            # The post-replace directory fsync cannot be made durable, so the
+            # transaction aborts and the rollback rename is attempted.
+            if os.fstat(fd).st_mode & 0o170000 == 0o040000:
+                raise OSError("simulated directory fsync failure")
+            real_fsync(fd)
+
+        def fail_only_rollback_rename(src, dst):  # noqa: ANN001
+            # 1st os.replace = the commit (allow); 2nd = the rollback rename
+            # of the .bak back over the target (fail). Any later rename
+            # (quarantine) succeeds.
+            calls["replace"] += 1
+            if calls["replace"] == 2:
+                raise OSError("simulated rollback rename failure")
+            return real_replace(src, dst)
+
+        persistence_mod.os.fsync = fail_on_directory_fd
+        persistence_mod.os.replace = fail_only_rollback_rename
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+        finally:
+            persistence_mod.os.replace = real_replace
+            persistence_mod.os.fsync = real_fsync
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        # Formal path vacated; the original .bak (old inode) is preserved and
+        # the failed snapshot was isolated and dropped, not promoted.
+        self.assertFalse(os.path.exists(self.path))
+        leftovers = self._all_state_names()
+        self.assertEqual(len(leftovers), 1)
+        self.assertTrue(leftovers[0].endswith(".bak"))
+        backup = os.path.join(self.directory, leftovers[0])
+        self.assertEqual(open(backup, "rb").read(), self.good_bytes)
+        self.assertEqual(os.stat(backup).st_ino, self.good_ino)
+
+        # Restart recovery promotes the preserved last-known-good backup; the
+        # retried revocation then lands as a single new generation.
+        restarted = DeviceService()
+        attach_persistence(restarted, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        self.assertEqual(self._all_state_names(), [])
+        restarted.revoke_device("alice")
+        self.assertTrue(
+            restarted.store.find_by_device_id("alice").revoked)
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["commit_seq"],
+                             self.good_seq + 1)
+
+    def test_failed_commit_consumes_no_generation_within_one_process(
+            self) -> None:
+        # After a definitive abort vacates the formal file, a repaired disk in
+        # the SAME process recreates it at the identical generation: the two
+        # failed attempts consumed no generation, so the retry writes exactly
+        # one continuous new generation.
+        import e2ee_backend.persistence as persistence_mod
+        from e2ee_backend.persistence import PersistenceUnavailable
+
+        real_fsync = persistence_mod.os.fsync
+        failing = {"on": True}
+
+        def fail_directory_while_on(fd: int) -> None:  # noqa: ANN001
+            if failing["on"] and os.fstat(fd).st_mode & 0o170000 == 0o040000:
+                raise OSError("simulated directory fsync failure")
+            real_fsync(fd)
+
+        persistence_mod.os.fsync = fail_directory_while_on
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("alice")
+        finally:
+            persistence_mod.os.fsync = real_fsync
+        failing["on"] = False
+        # Repaired retry in the same process recreates the missing file and
+        # commits once; the stale pre-failure backup is only swept at the next
+        # startup (a now-valid formal file wins and removes leftovers).
+        body = self.service.revoke_device("alice")
+        self.assertEqual(body["revoked"], True)
+        with open(self.path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertEqual(document["commit_seq"], self.good_seq + 1)
+        self.assertTrue(
+            self.service.store.find_by_device_id("alice").revoked)
+
+        # A restart sees the valid formal file (strictly newer than the stale
+        # backup), keeps it authoritative and sweeps the leftover.
+        restarted = DeviceService()
+        attach_persistence(restarted, self.path)
+        self.assertEqual(self._all_state_names(), [])
+        self.assertTrue(
+            restarted.store.find_by_device_id("alice").revoked)
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["commit_seq"],
+                             self.good_seq + 1)
 
 
 class NoValidSnapshotFallbackTest(unittest.TestCase):
