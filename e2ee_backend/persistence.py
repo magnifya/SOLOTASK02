@@ -25,10 +25,24 @@ durably — the rollback rename fails, or the second fsync fails — the failure
 stays *decidable*: the old inode is kept under a ``.state-*.bak`` backup and
 the new snapshot is taken off the formal path (parked under a
 ``.state-*.quarantine`` name the recovery scan never promotes, or deleted), so
-the formal path is missing. The store is then marked degraded and refuses
-further writes in that process (each still answered 503/field=data_file);
-restart recovery promotes the pinned backup. This guarantees an
-un-committed snapshot can never become authoritative.
+the formal path is missing. The store is then marked degraded and reports 503
+for the failed request.
+
+The degraded store also heals itself *within the same process*: the next
+persist-able write runs, inside the storage lock, :meth:`JsonStateStore.heal`
+before saving — the unique pinned ``.bak`` is fully verified (version=1,
+commit generation, the complete-transaction sections, every cross-entity /
+cursor / nonce / audit-chain semantic check, and exact equality with the
+last committed in-memory state) and atomically promoted back onto the formal
+path, same-transaction leftovers (``.quarantine``/``.tmp``) are removed, and
+only then is that one triggering request committed (a single consecutive
+``commit_seq`` advance). The request that originally got 503 is never
+replayed; the healed commit carries only the later, current request. A
+corrupt, dangling or ambiguous backup is refused promotion: the request gets
+503/field=data_file, memory is rolled back, the formal path stays missing,
+no leftover or generation moves, and the next write retries the heal. A
+valid formal file always takes precedence over every backup. Restart
+recovery remains the fallback that promotes the pinned backup.
 
 A crash between steps can leave ``.state-*.tmp`` (staged document) or
 ``.state-*.bak`` (pinned previous inode) files beside the target. At the next
@@ -58,7 +72,7 @@ import json
 import os
 import sys
 import tempfile
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .storage import DeviceStore
 
@@ -132,13 +146,13 @@ class JsonStateStore:
         #: Set once a transaction ends in the undecidable-on-disk state where
         #: the formal path is missing and the last committed inode survives
         #: only as a ``.bak`` (a failed rollback rename, or a rollback rename
-        #: whose follow-up fsync failed). A later write in the same process
-        #: could not pin that backup again (the formal file is gone), so
-        #: failing again would strand an un-committed snapshot at the formal
-        #: path, which a restart would wrongly treat as authoritative. The
-        #: store therefore refuses further writes with an :class:`OSError`
-        #: (mapped to 503/field=data_file) until a fresh process recovers the
-        #: pinned backup via :func:`recover_crash_leftovers`.
+        #: whose follow-up fsync failed). While set, every write first runs
+        #: :meth:`heal` under the store lock: the pinned backup is fully
+        #: verified and atomically promoted back onto the formal path, the
+        #: same-transaction leftovers are cleaned, and only then the
+        #: triggering write itself is committed. A heal that cannot verify or
+        #: promote the backup keeps the store degraded and the write fails
+        #: with 503/field=data_file, retryable by the next write.
         self.degraded = False
 
     def load(self) -> Optional[Dict[str, Any]]:
@@ -204,21 +218,21 @@ class JsonStateStore:
         ``.bak`` backup and the new snapshot is taken off the formal path
         (renamed aside to a ``.quarantine`` name the recovery scan never
         promotes, or deleted), so the formal path is missing and the next
-        startup restores that backup. Any failure propagates the underlying
-        :class:`OSError` to the caller.
+        write self-heals via :meth:`heal` (or, after a restart,
+        :func:`recover_crash_leftovers`). Any failure propagates the
+        underlying :class:`OSError` to the caller.
         """
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
         if self.degraded:
-            # A previous failure left the formal path missing with the last
-            # committed inode pinned only as a .bak; another replace here
-            # could not be rolled back (there is no target to back up) and a
-            # crash could promote the un-committed snapshot. Refuse until a
-            # restart recovers the backup. The caller maps this OSError to
-            # PersistenceUnavailable/503 exactly like a write failure.
+            # The formal path is missing and the last committed inode is
+            # pinned only as a .bak. A save here could not be rolled back
+            # (there is no target to back up), so the persistence hook must
+            # run self.heal() first and only reach this point once the formal
+            # path is restored. Refuse any save that bypassed the heal.
             raise OSError(
-                f"state store for {self.path} is degraded after an "
-                f"un-rollbackable write failure; restart required to recover")
+                f"state store for {self.path} is degraded; heal() must "
+                f"promote the pinned backup before another save")
         document = {"version": STATE_VERSION, **state}
         # Stamp the commit generation this save is committing. The counter
         # advances only after the replace and directory fsync succeed, so a
@@ -297,6 +311,133 @@ class JsonStateStore:
                 pass
         # The generation advances exactly once per durable commit.
         self.commit_seq = seq + 1
+
+    def heal(self, baseline: Dict[str, Any]) -> None:
+        """Self-heal the degraded formal path from the pinned ``.bak``.
+
+        Called under the store lock by the persistence hook at the start of
+        the next persist-able write after an undecidable write failure. The
+        pinned backup is verified in full — version=1, a valid commit
+        generation exactly one below the next save's generation, the whole
+        cross-entity/cursor/nonce/audit-chain semantic restore, and exact
+        equality with the process's last committed in-memory state — before
+        it is promoted. Promotion is a same-directory *hard link*: the backup
+        name keeps pinning the inode until the formal directory entry is
+        fsync-durable, so a crash at this instant leaves either a valid
+        formal file or the still-present backup, never neither. Only then are
+        the same-transaction leftovers (redundant backups, staged ``.tmp``
+        snapshots and the un-committed ``.quarantine``) removed.
+
+        A later write commit still goes through the normal atomic
+        :meth:`save`, so healing consumes no generation: the healed commit
+        advances ``commit_seq`` exactly once and carries only that triggering
+        request — the earlier request that got 503 is never replayed.
+
+        Raises :class:`OSError` (mapped to 503/field=data_file by the caller)
+        when no verifiable backup exists, backups disagree, or the promotion
+        cannot be made durable; in every such case the formal path stays
+        missing, no leftover and no generation moves, :attr:`degraded` stays
+        set, and the next write retries this heal. A formal file that
+        reappeared valid and matching always takes precedence over backups.
+        """
+        if not self.degraded:
+            return
+        directory = os.path.dirname(os.path.abspath(self.path))
+        leftovers = _leftover_tmp_paths(directory, self.path)
+        quarantined = _quarantined_paths(directory, self.path)
+
+        if os.path.exists(self.path):
+            # The formal path can only reappear out-of-band while degraded. A
+            # valid one that matches the committed state always wins: keep it,
+            # sweep every leftover and resume normal saves. Anything else is
+            # left untouched — exactly the refusal a restart would give.
+            formal = _read_version1_document(self.path)
+            if (formal is not None
+                    and (COMMIT_SEQ_KEY not in formal
+                         or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
+                    and _commit_seq_of(formal) == self.commit_seq - 1
+                    and _document_restores(formal)
+                    and _document_payload_equals(formal, baseline)):
+                _sweep_leftovers(directory, leftovers + quarantined)
+                self.degraded = False
+                return
+            raise OSError(
+                f"cannot self-heal {self.path}: the formal file reappeared "
+                f"in an unexpected state")
+
+        # Verify every leftover against this process's last committed state.
+        # Equality with *baseline* is the anti-dangling gate in addition to
+        # the full semantic restore: a staged new snapshot (the transaction
+        # already reported 503 and rolled back in memory) parses and may even
+        # restore, but it can never equal the committed baseline and is
+        # therefore never eligible here; quarantine files are never even
+        # considered.
+        eligible: List[str] = []
+        for candidate in leftovers:
+            try:
+                with open(candidate, "rb") as handle:
+                    raw = handle.read()
+            except OSError:
+                continue
+            try:
+                document = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            version = document.get("version")
+            if not isinstance(version, int) or isinstance(version, bool) \
+                    or version != STATE_VERSION:
+                continue
+            if COMMIT_SEQ_KEY in document and not _valid_commit_seq(
+                    document[COMMIT_SEQ_KEY]):
+                continue
+            # The backup must pin the immediately-previous generation (a
+            # field-less legacy backup ranks at 0 with the counter at 1).
+            if _commit_seq_of(document) != self.commit_seq - 1:
+                continue
+            if not _document_restores(document):
+                continue
+            if not _document_payload_equals(document, baseline):
+                continue
+            eligible.append(candidate)
+
+        if not eligible:
+            raise OSError(
+                f"cannot self-heal {self.path}: no verifiable pinned backup "
+                f"of the last committed state")
+        # Every eligible pin is the same generation and equals the committed
+        # state, so choosing among them cannot diverge state; prefer a .bak
+        # pin over a byte-identical staged .tmp, then the stable name order.
+        eligible.sort(key=lambda path: (
+            not path.endswith(_BAK_SUFFIX), path))
+        chosen = eligible[0]
+
+        # Promote with a hard link, never a rename: the backup keeps pinning
+        # the inode until the new formal directory entry is fsync-durable.
+        linked = False
+        try:
+            os.link(chosen, self.path)
+            linked = True
+            _fsync_directory(directory)
+        except OSError:
+            if linked:
+                # The entry may not be durable. Drop the name we just added —
+                # the inode stays pinned under the backup name — and best
+                # effort flush the removal, then hand the failure back.
+                _remove_quietly(self.path)
+                try:
+                    _fsync_directory(directory)
+                except OSError:
+                    pass
+            raise
+
+        # The formal path durably names the committed inode; every pinned
+        # copy, staged snapshot and demoted (quarantined) new snapshot is now
+        # stale garbage. Sweep failures are harmless: a valid formal file
+        # always wins the leftover scan at every later startup.
+        _sweep_leftovers(directory, leftovers + quarantined)
+        self.degraded = False
 
 
 def _directory_fsync_unsupported(error: OSError) -> bool:
@@ -508,6 +649,53 @@ def _document_restores(document: Dict[str, Any]) -> bool:
     except (ValueError, TypeError):
         return False
     return True
+
+
+def _document_payload_equals(document: Dict[str, Any],
+                             baseline: Dict[str, Any]) -> bool:
+    """Compare a document's payload with the process's last committed state.
+
+    The on-disk document wraps the store snapshot with ``version`` and
+    ``commit_seq``; strip those envelope fields and compare the remainder,
+    semantically, to *baseline* (a value straight from
+    :meth:`DeviceStore.snapshot_state`). Comparison goes through a fresh
+    :meth:`DeviceStore.restore_state` + :meth:`DeviceStore.snapshot_state`
+    round-trip rather than a raw dict diff, so an older *committed* document
+    that legitimately predates an optional section (``used_nonces``, the
+    sync-cursor sections, ``key_events`` ...) still matches a baseline whose
+    snapshot fills those with their defaults — while a newer, un-committed
+    snapshot cannot, because its extra business state (a revoked device, an
+    appended message) round-trips to a different snapshot. This is the
+    anti-dangling gate for self-heal: verifiable but newer content is never
+    promoted. Returns ``False`` for any document that does not restore.
+    """
+    payload = {key: value for key, value in document.items()
+               if key not in ("version", COMMIT_SEQ_KEY)}
+    try:
+        candidate_store = DeviceStore()
+        candidate_store.restore_state(payload)
+        restored = candidate_store.snapshot_state()
+    except (ValueError, TypeError):
+        return False
+    return restored == baseline
+
+
+def _sweep_leftovers(directory: str, paths: List[str]) -> None:
+    """Best-effort remove crash/transaction leftovers and flush the directory.
+
+    Used once a valid formal file is (re-)established authoritatively — by
+    self-heal or restart recovery — after which pinned backups, staged
+    ``.tmp`` snapshots and demoted ``.quarantine`` files are pure garbage.
+    Removal failures are swallowed: a valid formal file wins the leftover
+    scan at the next startup anyway, so a stray file can never become
+    authoritative.
+    """
+    for path in paths:
+        _remove_quietly(path)
+    try:
+        _fsync_directory(directory)
+    except OSError:
+        pass
 
 
 def _leftover_tmp_paths(directory: str, target_path: str) -> List[str]:
@@ -726,6 +914,23 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
         # roll the in-memory store back to the last good state before
         # surfacing the error, so the failed mutation is visible nowhere.
         pending = service.store.snapshot_state()
+        if state_store.degraded:
+            # A previous transaction ended undecidable on disk: the formal
+            # path is missing and the last committed inode survives only as
+            # a pinned .bak. Before this (the next) write may commit, verify
+            # and atomically promote that backup inside the same storage
+            # lock, cleaning the failed transaction's leftovers. Memory was
+            # rolled back to last_good after the 503 and, like every later
+            # failed attempt, restored to it again, so the only difference
+            # between pending and last_good is *this* current request — the
+            # earlier 503 request is never replayed.
+            try:
+                state_store.heal(copy.deepcopy(last_good))
+            except OSError:
+                service.store.restore_state(copy.deepcopy(last_good))
+                raise PersistenceUnavailable(
+                    f"could not self-heal state file {state_store.path}") \
+                    from None
         try:
             state_store.save(pending)
         except OSError:

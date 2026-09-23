@@ -314,7 +314,7 @@ class DirectoryFsyncFailureTest(unittest.TestCase):
         self.assertTrue(
             self.service.store.find_by_device_id("alice").revoked)
 
-    def test_same_process_retry_is_refused_while_degraded(self) -> None:
+    def test_same_process_next_write_self_heals_and_commits_once(self) -> None:
         import e2ee_backend.persistence as persistence_mod
         from e2ee_backend.persistence import PersistenceUnavailable
 
@@ -328,22 +328,44 @@ class DirectoryFsyncFailureTest(unittest.TestCase):
         persistence_mod.os.fsync = fail_on_directory_fd
         try:
             with self.assertRaises(PersistenceUnavailable):
+                # This is the request that gets 503 (revoke "alice"); it must
+                # never be replayed by the self-heal below.
                 self.service.revoke_device("alice")
         finally:
             persistence_mod.os.fsync = real_fsync
 
-        baks_before = bak_names(self.directory)
-        self.assertEqual(len(baks_before), 1)
-        # Even with storage healthy again, the degraded process refuses the
-        # write (a 503 at the HTTP boundary) rather than risk an un-backed
-        # replace over the missing formal path; nothing on disk changes.
-        with self.assertRaises(PersistenceUnavailable):
-            self.service.revoke_device("alice")
+        self.assertEqual(len(bak_names(self.directory)), 1)
         self.assertFalse(os.path.exists(self.path))
-        self.assertEqual(bak_names(self.directory), baks_before)
+
+        # Storage is healthy again. The next persist-able write is a
+        # *different*, current request (revoke "bob"), not a replay of the
+        # 503ed revoke("alice"). It heals the pinned backup inside the store
+        # lock and then commits exactly one new generation.
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(tmp_names(self.directory), [])
         self.assertEqual(quarantine_names(self.directory), [])
+        # Exactly one consecutive generation was added.
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq + 1)
+        # The old request was not replayed: alice is still active, while the
+        # current request (bob) is revoked and durable.
         self.assertFalse(
             self.service.store.find_by_device_id("alice").revoked)
+        self.assertTrue(
+            self.service.store.find_by_device_id("bob").revoked)
+        restarted = DeviceService()
+        attach_persistence(restarted, self.path)
+        self.assertFalse(restarted.store.find_by_device_id("alice").revoked)
+        self.assertTrue(restarted.store.find_by_device_id("bob").revoked)
+        # A further write after the heal commits normally, another single step.
+        restarted.revoke_device("alice")
+        self.assertEqual(
+            json.loads(open(self.path, encoding="utf-8").read())[
+                "commit_seq"],
+            self.good_seq + 2)
 
     def test_restart_recovers_pinned_backup_and_retry_commits_once(
             self) -> None:
@@ -461,6 +483,436 @@ class RollbackRenameFailureTest(unittest.TestCase):
                 "commit_seq"],
             self.good_seq + 1)
         self.assertTrue(service.store.find_by_device_id("alice").revoked)
+
+
+class SameProcessSelfHealTest(unittest.TestCase):
+    """Same-process self-heal after an undecidable write failure.
+
+    A transaction that leaves the formal path missing, the last committed
+    inode pinned as the sole ``.bak`` and the un-committed snapshot in
+    ``.quarantine`` is reported 503. The *next* persist-able write in the
+    same process must, inside the storage lock, fully verify and atomically
+    promote the backup, sweep the same-transaction leftovers, and then commit
+    only that current request — one consecutive ``commit_seq`` step, never a
+    replay of the request that already got 503. A failed heal or a failed
+    current write keeps 503 and moves nothing, yet stays retryable.
+    """
+
+    def setUp(self) -> None:
+        import e2ee_backend.persistence as persistence_mod
+        self.persistence_mod = persistence_mod
+        self._real_fsync = persistence_mod.os.fsync
+        self._real_replace = persistence_mod.os.replace
+        self.directory = tempfile.mkdtemp()
+        self.path = os.path.join(self.directory, "state.json")
+        self.service = DeviceService()
+        self.state_store = attach_persistence(self.service, self.path)
+        for device_id in ("creator", "alice", "bob"):
+            self.service.store.add_device(Device("u", device_id, "ik"))
+        self.service.create_group({
+            "group_id": "g1", "creator_device_id": "creator",
+            "member_device_ids": ["alice", "bob"]})
+        session = self.service.create_group_session({
+            "group_id": "g1", "initiator_device_id": "creator",
+            "ephemeral_key": "epk"})
+        self.sid = session["session_id"]
+        for sequence in range(1, 4):
+            self.service.post_message({
+                "session_id": self.sid, "sender_device_id": "creator",
+                "message_id": f"m{sequence}", "sequence": sequence,
+                "nonce": f"n{sequence}", "ciphertext": "ct"})
+        self.service.sync_group_checkpoint(
+            self.sid, {"device_id": "alice", "cursor": 2})
+        with open(self.path, "rb") as handle:
+            self.good_bytes = handle.read()
+        self.good_seq = json.loads(self.good_bytes.decode("utf-8"))[
+            "commit_seq"]
+
+    def tearDown(self) -> None:
+        self.persistence_mod.os.fsync = self._real_fsync
+        self.persistence_mod.os.replace = self._real_replace
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def _fail_directory_fsync(self, *, fail_rollback_rename: bool = False,
+                              ) -> None:
+        real_fsync = self._real_fsync
+        real_replace = self._real_replace
+        target = os.path.abspath(self.path)
+
+        def fail_on_directory_fd(fd: int) -> None:  # noqa: ANN001
+            if os.fstat(fd).st_mode & 0o170000 == 0o040000:
+                raise OSError("simulated directory fsync failure")
+            real_fsync(fd)
+
+        self.persistence_mod.os.fsync = fail_on_directory_fd
+        if fail_rollback_rename:
+            def fail_backup_rename(src: str, dst: str) -> None:
+                if os.path.abspath(dst) == target and src.endswith(".bak"):
+                    raise OSError("simulated rollback rename failure")
+                return real_replace(src, dst)
+
+            self.persistence_mod.os.replace = fail_backup_rename
+
+    def _restore_io(self) -> None:
+        self.persistence_mod.os.fsync = self._real_fsync
+        self.persistence_mod.os.replace = self._real_replace
+
+    def _induce_degraded(self, device_id: str = "alice", *,
+                         with_quarantine: bool = False) -> str:
+        """Drive one write into the undecidable failure; return the .bak.
+
+        With *with_quarantine* the failure is the rollback-rename variant,
+        which also parks the un-committed new snapshot in a ``.quarantine``
+        file; otherwise it is the pure post-replace fsync variant, which
+        leaves the formal path missing with exactly one ``.bak`` and no
+        quarantine file.
+        """
+        from e2ee_backend.persistence import PersistenceUnavailable
+        self.assertFalse(self.state_store.degraded)
+        self._fail_directory_fsync(
+            fail_rollback_rename=with_quarantine)
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device(device_id)
+        finally:
+            self._restore_io()
+        baks = bak_names(self.directory)
+        self.assertEqual(len(baks), 1)
+        self.assertEqual(len(quarantine_names(self.directory)),
+                         1 if with_quarantine else 0)
+        self.assertFalse(os.path.exists(self.path))
+        self.assertTrue(self.state_store.degraded)
+        return os.path.join(self.directory, baks[0])
+
+    def _formal_doc(self) -> Dict[str, Any]:
+        with open(self.path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_heal_promotes_backup_sweeps_leftovers_commits_current(
+            self) -> None:
+        backup = self._induce_degraded("alice", with_quarantine=True)
+        backup_ino = os.stat(backup).st_ino
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(quarantine_names(self.directory), [])
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
+        # Current request applied; the 503 request was never replayed.
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+
+    def test_heal_alone_hard_links_backup_without_advancing_generation(
+            self) -> None:
+        # Drive heal() directly to observe the promotion instant: the formal
+        # path must name the pinned inode via a hard link (same inode and
+        # bytes), no leftover may remain and no generation may be consumed —
+        # the following request's save() is what advances commit_seq.
+        import copy
+        backup = self._induce_degraded("alice", with_quarantine=True)
+        backup_ino = os.stat(backup).st_ino
+        baseline = copy.deepcopy(self.service.store.snapshot_state())
+        self.state_store.heal(baseline)
+        self.assertFalse(self.state_store.degraded)
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(os.stat(self.path).st_ino, backup_ino)
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(quarantine_names(self.directory), [])
+        self.assertEqual(self.state_store.commit_seq, self.good_seq + 1)
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq)
+
+    def test_heal_is_redone_by_restart_and_state_is_consistent(self) -> None:
+        self._induce_degraded("alice")
+        self.service.revoke_device("bob")
+        # Restart recovery accepts exactly what same-process heal produced,
+        # including the saved cursor, the messages and the audit chains.
+        restarted = DeviceService()
+        attach_persistence(restarted, self.path)
+        self.assertTrue(restarted.store.find_by_device_id("bob").revoked)
+        self.assertFalse(restarted.store.find_by_device_id("alice").revoked)
+        self.assertEqual(
+            restarted.store._group_sync_cursors[(self.sid, "alice")].cursor,
+            2)
+        body = restarted.sync_group_messages(self.sid, "alice", None, 100)
+        self.assertEqual([m["sequence"] for m in body["messages"]], [3])
+        events = restarted.store.key_events_page("bob", 0, 100)[0]
+        self.assertTrue(any(e["type"] == "device_revoked" for e in events))
+
+    def test_corrupt_backup_is_refused_and_the_heal_stays_retryable(
+            self) -> None:
+        from e2ee_backend.persistence import PersistenceUnavailable
+        backup = self._induce_degraded("alice", with_quarantine=True)
+        with open(backup, "wb") as handle:
+            handle.write(b"{not json")
+        with self.assertRaises(PersistenceUnavailable):
+            self.service.revoke_device("bob")
+        # Nothing advanced: memory rolled back, formal still missing, the pin
+        # and the quarantine leftover remain, and no generation was used.
+        self.assertFalse(os.path.exists(self.path))
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        self.assertEqual(len(bak_names(self.directory)), 1)
+        self.assertEqual(len(quarantine_names(self.directory)), 1)
+        self.assertTrue(self.state_store.degraded)
+        # Repair the pin with the original committed bytes and retry: heal
+        # succeeds and the current request commits one generation.
+        os.unlink(backup)
+        write_tmp(self.directory, ".state-fixed.bak", self.good_bytes)
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(quarantine_names(self.directory), [])
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+
+    def test_dangling_uncommitted_snapshot_is_never_promoted(self) -> None:
+        self._induce_degraded("alice", with_quarantine=True)
+        quarantine = os.path.join(
+            self.directory, quarantine_names(self.directory)[0])
+        with open(quarantine, "rb") as handle:
+            newer_bytes = handle.read()
+        # Stage the un-committed snapshot as a .tmp leftover too; it parses
+        # and restores but is not the committed baseline, so heal must skip
+        # it and promote the backup instead.
+        write_tmp(self.directory, ".state-dangling.tmp", newer_bytes)
+        self.service.revoke_device("bob")
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(quarantine_names(self.directory), [])
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+
+    def test_promotion_failure_moves_nothing_and_next_write_heals(self) -> None:
+        from e2ee_backend.persistence import PersistenceUnavailable
+        self._induce_degraded("alice")
+        real_link = self.persistence_mod.os.link
+
+        def fail_link(src: str, dst: str) -> None:
+            raise OSError("simulated promotion failure")
+
+        self.persistence_mod.os.link = fail_link
+        try:
+            with self.assertRaises(PersistenceUnavailable):
+                self.service.revoke_device("bob")
+        finally:
+            self.persistence_mod.os.link = real_link
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(len(bak_names(self.directory)), 1)
+        self.assertTrue(self.state_store.degraded)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        # The next write retries the heal and commits the current request.
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+
+    def test_current_write_failure_after_heal_advances_nothing_then_commits(
+            self) -> None:
+        from e2ee_backend.persistence import PersistenceUnavailable
+        self._induce_degraded("alice")
+        real_save = self.state_store.save
+        failures = {"left": 1}
+
+        def fail_once(state):  # noqa: ANN001
+            if failures["left"]:
+                failures["left"] -= 1
+                raise OSError("simulated post-heal write failure")
+            return real_save(state)
+
+        self.state_store.save = fail_once  # type: ignore[assignment]
+        with self.assertRaises(PersistenceUnavailable):
+            self.service.revoke_device("bob")
+        # Heal landed (no longer degraded, formal is the committed baseline)
+        # but the current write failed: bytes/inode/generation unchanged.
+        self.assertFalse(self.state_store.degraded)
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(open(self.path, "rb").read(), self.good_bytes)
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("bob").revoked)
+        # The retry is a normal write: one generation, current request only.
+        self.service.revoke_device("bob")
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+
+    def test_valid_formal_file_takes_precedence_over_backup(self) -> None:
+        backup = self._induce_degraded("alice")
+        with open(backup, "rb") as handle:
+            committed = handle.read()
+        with open(self.path, "wb") as handle:
+            handle.write(committed)
+        # The same request heals (accepts the valid formal, sweeps pins) and
+        # commits its own write in one generation.
+        self.service.revoke_device("bob")
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(quarantine_names(self.directory), [])
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 1)
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+
+    def test_unexpected_formal_file_is_refused_and_left_untouched(self) -> None:
+        from e2ee_backend.persistence import PersistenceUnavailable
+        self._induce_degraded("alice", with_quarantine=True)
+        quarantine = os.path.join(
+            self.directory, quarantine_names(self.directory)[0])
+        with open(quarantine, "rb") as handle:
+            newer_bytes = handle.read()
+        with open(self.path, "wb") as handle:
+            handle.write(newer_bytes)
+        before = open(self.path, "rb").read()
+        before_ino = os.stat(self.path).st_ino
+        with self.assertRaises(PersistenceUnavailable):
+            self.service.revoke_device("bob")
+        self.assertEqual(open(self.path, "rb").read(), before)
+        self.assertEqual(os.stat(self.path).st_ino, before_ino)
+        self.assertEqual(len(bak_names(self.directory)), 1)
+        self.assertTrue(self.state_store.degraded)
+
+    def test_concurrent_writes_run_one_recovery_and_serial_commits(self) -> None:
+        import threading
+        self._induce_degraded("alice")
+        real_heal = self.state_store.heal
+        calls = {"heal": 0}
+
+        def counted_heal(baseline):  # noqa: ANN001
+            calls["heal"] += 1
+            return real_heal(baseline)
+
+        self.state_store.heal = counted_heal  # type: ignore[assignment]
+        errors: List[Exception] = []
+
+        def revoke(device_id: str) -> None:
+            try:
+                self.service.revoke_device(device_id)
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=revoke, args=(device_id,))
+                   for device_id in ("bob", "creator")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual(errors, [])
+        # Exactly one self-heal, then two serialized commits.
+        self.assertEqual(calls["heal"], 1)
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+        self.assertTrue(
+            self.service.store.find_by_device_id("creator").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 2)
+        self.assertEqual(tmp_names(self.directory), [])
+        self.assertEqual(quarantine_names(self.directory), [])
+
+    def test_heal_from_a_legacy_sectionless_pinned_backup(self) -> None:
+        # Build a legacy version-1 document by hand: no commit_seq and no
+        # key_events section (a file written before audit chains existed).
+        legacy_service = DeviceService()
+        for device_id in ("creator", "alice", "bob"):
+            legacy_service.store.add_device(Device("u", device_id, "ik"))
+        legacy_service.create_group({
+            "group_id": "g1", "creator_device_id": "creator",
+            "member_device_ids": ["alice", "bob"]})
+        legacy_doc = dict(legacy_service.store.snapshot_state())
+        legacy_doc.pop("key_events", None)  # the legacy gap
+        shutil.rmtree(self.directory, ignore_errors=True)
+        os.makedirs(self.directory)
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, **legacy_doc}, handle)
+
+        # Re-attach onto the legacy file; the first persist-able change
+        # anchors the chains and writes generation 1. Make that write end in
+        # the undecidable failure, pinning the section-less legacy bytes.
+        self.service = DeviceService()
+        self.state_store = attach_persistence(self.service, self.path)
+        self.assertEqual(self.state_store.commit_seq, 1)
+        self.good_bytes = open(self.path, "rb").read()
+        self.good_seq = 0
+        backup = self._induce_degraded("alice")
+        self.assertNotIn(b"key_events", open(backup, "rb").read())
+
+        # The next write heals the legacy pin (semantic, not raw-dict
+        # equality), anchors the chains and commits generation 1 once.
+        self.service.revoke_device("bob")
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(tmp_names(self.directory), [])
+        document = self._formal_doc()
+        self.assertEqual(document["commit_seq"], 1)
+        self.assertIsInstance(document["key_events"], list)
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
+        # A restart fully accepts the healed-then-committed document.
+        restarted = DeviceService()
+        attach_persistence(restarted, self.path)
+        self.assertTrue(restarted.store.find_by_device_id("bob").revoked)
+        self.assertFalse(restarted.store.find_by_device_id("alice").revoked)
+        events = restarted.store.key_events_page("bob", 0, 100)[0]
+        self.assertTrue(any(e["type"] == "device_revoked" for e in events))
+
+    def test_http_heal_commits_current_request_and_failed_heal_is_503(
+            self) -> None:
+        import threading
+        from http.client import HTTPConnection
+        from e2ee_backend.http_app import create_server
+
+        self._induce_degraded("alice")
+        server, _ = create_server("127.0.0.1", 0, service=self.service)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            def revoke(device_id: str):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", f"/v1/devices/{device_id}/revoke")
+                response = conn.getresponse()
+                body = json.loads(response.read().decode("utf-8"))
+                conn.close()
+                return response.status, body
+
+            # A failed heal (corrupt pin) is 503/field=data_file and moves
+            # nothing.
+            bak = os.path.join(self.directory, bak_names(self.directory)[0])
+            with open(bak, "wb") as handle:
+                handle.write(b"{nope")
+            status, body = revoke("bob")
+            self.assertEqual(status, 503)
+            self.assertEqual(body["field"], "data_file")
+            self.assertFalse(os.path.exists(self.path))
+            # Repair the pin; the next HTTP request self-heals and succeeds.
+            with open(bak, "wb") as handle:
+                handle.write(self.good_bytes)
+            status, body = revoke("bob")
+            self.assertEqual(status, 200, body)
+            # alice still posts messages: its 503 revocation never happened.
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/messages",
+                         body=json.dumps({
+                             "session_id": self.sid,
+                             "sender_device_id": "alice",
+                             "message_id": "after-heal", "sequence": 4,
+                             "nonce": "n4", "ciphertext": "ct"}),
+                         headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 201, response.read())
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertEqual(self._formal_doc()["commit_seq"], self.good_seq + 2)
+        self.assertTrue(self.service.store.find_by_device_id("bob").revoked)
+        self.assertFalse(
+            self.service.store.find_by_device_id("alice").revoked)
 
 
 class NoValidSnapshotFallbackTest(unittest.TestCase):
