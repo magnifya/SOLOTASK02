@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import copy
 import errno
+import hashlib
 import json
 import os
 import sys
@@ -150,6 +151,107 @@ class PersistenceUnavailable(Exception):
     under the store lock, the previous state file is intact, and the temporary
     file was removed. The HTTP layer reports this as 503/field=data_file.
     """
+
+
+class IntegrityAuditError(Exception):
+    """The integrity audit found the durable state unreadable or inconsistent.
+
+    Raised by :func:`audit_integrity` for any parse/version/semantic error
+    and for a generation or snapshot mismatch. The audit is strictly
+    read-only, so nothing — memory, the file or its inode, the cursors, the
+    commit generation — has been touched when this is raised. The HTTP layer
+    reports it as 503/field=data_file.
+    """
+
+
+#: Canonical section set (in declaration order) of the integrity-audit
+#: snapshot: exactly the sections a full :meth:`DeviceStore.snapshot_state`
+#: document carries. A section missing from the audited document (a legacy
+#: file predating it, or the not-yet-anchored ``key_events`` of a legacy
+#: restore) is filled with its empty value; elements keep their existing
+#: snapshot format.
+INTEGRITY_SECTION_ORDER = (
+    "devices", "sessions", "groups", "group_sessions", "messages",
+    "delivery", "prekey_claims", "prekey_batch_claims",
+    "claim_session_bindings", "batch_claim_session_bindings",
+    "group_session_rotations", "group_delivery", "used_nonces",
+    "group_sync_cursors", "message_sync_cursors", "message_submissions",
+    "key_events",
+)
+
+#: Sections whose empty value is a mapping rather than a list.
+_INTEGRITY_MAPPING_SECTIONS = frozenset(("messages", "used_nonces"))
+
+
+def _canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Project *snapshot* onto the integrity section set, filling gaps.
+
+    The result carries exactly :data:`INTEGRITY_SECTION_ORDER` — envelope
+    fields (``version``/``commit_seq``) and any unknown section are dropped,
+    and a missing section is filled with its empty value (``{}`` for the two
+    mapping sections, ``[]`` for every list section).
+    """
+    return {
+        name: snapshot.get(
+            name, {} if name in _INTEGRITY_MAPPING_SECTIONS else [])
+        for name in INTEGRITY_SECTION_ORDER
+    }
+
+
+def audit_integrity(store: DeviceStore,
+                    state_store: "JsonStateStore") -> Dict[str, Any]:
+    """Audit the durable state file against the in-memory state.
+
+    Runs entirely under the store lock — the audit shares the mutation
+    lock, so no commit can land halfway through the check — and is strictly
+    read-only: memory, the file and its inode, the cursors and the commit
+    generation are all left untouched. The file is re-read and validated
+    with exactly the startup checks (:meth:`JsonStateStore.load`: JSON
+    object, version=1, a valid ``commit_seq`` when present), its generation
+    must be the last committed one (the store's next generation minus one),
+    and its payload must pass the full semantic restore and reproduce the
+    current in-memory snapshot.
+
+    Returns the 200 body: ``commit_seq`` (the previous, non-negative
+    generation), ``state_hash`` (the SHA-256 lowercase hex of the canonical
+    snapshot — the 17 sections without ``version``/``commit_seq``, keys
+    sorted, compact JSON with ``ensure_ascii=False`` encoded as UTF-8) and
+    ``consistent`` (``True``). Any parse/version/semantic error and any
+    generation or snapshot mismatch raises :class:`IntegrityAuditError`.
+    """
+    # The store's reentrant lock is the same lock every mutation (and the
+    # persistence hook) commits under; snapshot_state() re-enters it.
+    with store._lock:
+        try:
+            document = state_store.load()
+        except StateFileError as error:
+            raise IntegrityAuditError(str(error)) from None
+        if document is None:
+            raise IntegrityAuditError(
+                f"state file is missing: {state_store.path}")
+        commit_seq = _commit_seq_of(document)
+        if commit_seq != state_store.commit_seq - 1:
+            raise IntegrityAuditError(
+                f"state file commit generation {commit_seq} does not match "
+                f"the last committed generation {state_store.commit_seq - 1}")
+        payload = {key: value for key, value in document.items()
+                   if key not in ("version", COMMIT_SEQ_KEY)}
+        try:
+            restored_store = DeviceStore()
+            restored_store.restore_state(payload)
+            restored = restored_store.snapshot_state()
+        except (ValueError, TypeError) as error:
+            raise IntegrityAuditError(
+                f"state file has a malformed payload: {error}") from None
+        canonical = _canonical_integrity_snapshot(store.snapshot_state())
+        if _canonical_integrity_snapshot(restored) != canonical:
+            raise IntegrityAuditError(
+                "state file does not match the in-memory state")
+        state_hash = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False).encode("utf-8")).hexdigest()
+        return {"commit_seq": commit_seq, "state_hash": state_hash,
+                "consistent": True}
 
 
 class JsonStateStore:
@@ -1209,4 +1311,7 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
         last_good.update(copy.deepcopy(pending))
 
     service.store.on_change = persist
+    # Expose the attached store so the integrity-audit endpoint can find it;
+    # a purely in-memory service keeps its ``state_store`` of ``None``.
+    service.state_store = state_store
     return state_store

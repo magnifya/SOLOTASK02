@@ -160,6 +160,9 @@ class DeviceService:
 
     def __init__(self, store: Optional[DeviceStore] = None) -> None:
         self.store = store if store is not None else DeviceStore()
+        #: The attached state store when persistence is enabled (set by
+        #: ``attach_persistence``); ``None`` for a purely in-memory service.
+        self.state_store: Any = None
 
     # -- registration ------------------------------------------------------
 
@@ -262,7 +265,30 @@ class DeviceService:
         return {"events": events, "next_after": next_after,
                 "has_more": has_more}
 
-    # -- revocation --------------------------------------------------------
+    # -- persistence integrity audit ---------------------------------------
+
+    def persistence_integrity(self) -> Dict[str, Any]:
+        """Audit the durable state file against the in-memory state.
+
+        Only available when persistence is attached; a purely in-memory
+        service raises 409/field=data_file. Otherwise returns the 200 body
+        (``commit_seq``/``state_hash``/``consistent``); any parse, version,
+        semantic, generation or snapshot mismatch is 503/field=data_file
+        and changes nothing — not memory, the file or its inode, the
+        cursors, or the commit generation.
+        """
+        from .persistence import IntegrityAuditError, audit_integrity
+
+        state_store = self.state_store
+        if state_store is None:
+            raise ServiceError("persistence is not enabled for this server",
+                               "data_file", status_code=409)
+        try:
+            return audit_integrity(self.store, state_store)
+        except IntegrityAuditError as error:
+            raise ServiceError(str(error), "data_file", status_code=503)
+
+    # -- revocation ----------------------------------------------------------------
 
     def revoke_device(self, device_id: str) -> Dict[str, Any]:
         """Revoke a device (and its pre-keys); idempotent, 404 when unknown."""
