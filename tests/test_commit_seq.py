@@ -159,6 +159,8 @@ class LegacyCommitSeqCompatibilityTest(unittest.TestCase):
             self.directory, cursor=2)
         self.document = json.loads(formal_bytes.decode("utf-8"))
         del self.document["commit_seq"]
+        # A legacy document also predates the integrity-log marker/sidecar.
+        del self.document["integrity_log_version"]
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)
@@ -181,6 +183,9 @@ class InvalidCommitSeqStartupTest(unittest.TestCase):
         self.directory = tempfile.mkdtemp()
         _service, self.path, _sid, formal_bytes = build_fixture(self.directory)
         self.document = json.loads(formal_bytes.decode("utf-8"))
+        # Treat the fixture as a pre-marker legacy document so rejection is
+        # solely about the commit_seq value under test.
+        del self.document["integrity_log_version"]
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)
@@ -237,6 +242,9 @@ class MissingFormalGenerationRankingTest(unittest.TestCase):
         _service, self.path, self.sid, formal_bytes = build_fixture(
             self.directory, cursor=2)
         self.formal = json.loads(formal_bytes.decode("utf-8"))
+        # The crafted leftovers here simulate pre-marker legacy snapshots;
+        # the fixture's own sidecar is removed together with the formal.
+        del self.formal["integrity_log_version"]
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)
@@ -249,6 +257,7 @@ class MissingFormalGenerationRankingTest(unittest.TestCase):
 
     def _remove_formal(self) -> None:
         os.unlink(self.path)
+        os.unlink(self.path + ".integrity")
 
     def _recover(self) -> Tuple[DeviceService, Any]:
         service = DeviceService()

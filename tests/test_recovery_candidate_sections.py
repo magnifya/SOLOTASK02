@@ -128,6 +128,9 @@ class SectionGateDoesNotAffectFormalFileTest(unittest.TestCase):
         document = json.loads(formal_bytes.decode("utf-8"))
         del document["key_events"]
         del document["group_sync_cursors"]
+        # A legacy file also predates the integrity-log marker/sidecar.
+        del document["integrity_log_version"]
+        os.unlink(self.path + ".integrity")
         with open(self.path, "wb") as handle:
             handle.write(json.dumps(document).encode("utf-8"))
 

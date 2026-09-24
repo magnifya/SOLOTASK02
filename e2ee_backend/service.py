@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import is_nonempty_string, load_public_key
 from .models import Device, SignedPreKey
-from .persistence import IntegrityCheckError
+from .persistence import IntegrityCheckError, IntegrityLogUnavailable
 from .storage import (
     BATCH_CLAIM_NO_ACTIVE_DEVICE,
     BATCH_CLAIM_NO_PREKEY,
@@ -1374,6 +1374,33 @@ class DeviceService:
                 "data_file", status_code=409)
         try:
             return self.integrity_state_store.integrity_report(self.store)
+        except IntegrityCheckError as error:
+            raise ServiceError(str(error), "data_file",
+                               status_code=503) from None
+
+    def persistence_integrity_history(self) -> Dict[str, Any]:
+        """Commit history of the integrity-log sidecar (no parameters/body).
+
+        Only available when persistence is enabled (``--data-file`` or
+        ``$E2EE_DATA_FILE``); the purely in-memory mode answers
+        409/field=data_file, and so does a legacy state file whose
+        ``integrity_log_version`` marker has not been stamped yet (the log
+        starts at the first commit of this build). On success returns
+        ``{"commit_seq", "entries"}`` in that key order, where
+        ``commit_seq`` equals the last committed generation and the last
+        entry's ``commit_seq``, and ``entries`` are the sidecar's verified
+        entries (``commit_seq``/``state_hash``/``prev_hash``/``hash``).
+        """
+        if self.integrity_state_store is None:
+            raise ServiceError(
+                "persistence is not enabled; start the server with a data "
+                "file to inspect the commit integrity history",
+                "data_file", status_code=409)
+        try:
+            return self.integrity_state_store.integrity_history(self.store)
+        except IntegrityLogUnavailable as error:
+            raise ServiceError(str(error), "data_file",
+                               status_code=409) from None
         except IntegrityCheckError as error:
             raise ServiceError(str(error), "data_file",
                                status_code=503) from None

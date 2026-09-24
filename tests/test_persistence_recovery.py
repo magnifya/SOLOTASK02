@@ -362,6 +362,8 @@ class MalformedCursorSectionStartupTest(unittest.TestCase):
     def test_old_file_without_section_loads_empty(self) -> None:
         document = dict(self.good_document)
         del document["group_sync_cursors"]
+        # A legacy file also predates the integrity-log marker/sidecar.
+        del document["integrity_log_version"]
         path = os.path.join(self.directory, "legacy.json")
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
@@ -705,6 +707,8 @@ class MalformedDeliverySectionStartupTest(_MalformedSectionStartupBase):
 
     def test_well_formed_record_loads(self) -> None:
         document = self._with_delivery(self._record())
+        # A hand-written legacy document carries no integrity-log marker.
+        del document["integrity_log_version"]
         path = os.path.join(self.directory, "with-delivery.json")
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)

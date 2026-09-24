@@ -49,6 +49,10 @@ class GroupRotationRecoveryTest(unittest.TestCase):
         self.rotated = rotated
         with open(self.path, encoding="utf-8") as handle:
             self.document = json.load(handle)
+        # The candidate documents written by these tests exercise section
+        # validation, not the integrity log: treat them as pre-marker
+        # legacy documents (no marker, no sidecar at the candidate path).
+        del self.document["integrity_log_version"]
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)

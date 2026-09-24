@@ -315,9 +315,12 @@ class LegacyAnchorReplayTest(unittest.TestCase):
         self.sid = sid
         # Rewrite as a legacy version-1 document without the audit section:
         # a replay against it must not trigger the lazy anchor migration.
+        # A legacy document also predates the integrity-log marker/sidecar.
         with open(self.path, encoding="utf-8") as handle:
             document = json.load(handle)
         del document["key_events"]
+        del document["integrity_log_version"]
+        os.unlink(self.path + ".integrity")
         with open(self.path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
 

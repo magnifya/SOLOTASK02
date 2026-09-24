@@ -75,18 +75,42 @@ advances it exactly once (a failed write consumes no generation). A legacy
 version=1 file without the field loads as generation 0; a present field must
 be a non-negative integer or startup refuses (bool, negative, float and
 string values are rejected) with the file untouched.
+
+Alongside the state file sits the commit-integrity log
+(``<state>.integrity``): a compact, newline-free UTF-8 JSON document
+``{"version":1,"entries":[...]}`` where every entry is
+``{"commit_seq","state_hash","prev_hash","hash"}`` (that key order), the
+first entry chains from an empty ``prev_hash`` and every later one from the
+previous entry's ``hash``; ``state_hash`` is the read-only probe's
+canonical-state SHA-256 and ``hash`` is the SHA-256 of the entry minus
+``hash`` serialised with sorted keys in the same compact encoding. Each
+durable transaction rewrites both files under one store-lock transaction
+(state first, sidecar second); any I/O/fsync/replace failure rolls both
+files back, removes every temporary file and surfaces
+:class:`PersistenceUnavailable` (503/field=data_file). The state document
+carries an ``integrity_log_version=1`` marker once this build has committed
+to it: a legacy document without the marker (and without a sidecar) still
+starts and the first commit stamps the marker and writes the log's first
+entry, while a missing/extra sidecar, a marker other than 1, or any
+structural/chain/hash/last-entry mismatch makes startup refuse with the
+original files untouched.
 """
 from __future__ import annotations
 
 import copy
 import errno
+import hashlib
 import json
 import os
 import sys
 import tempfile
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from .storage import DeviceStore
+from .storage import (
+    DeviceStore,
+    canonical_integrity_snapshot,
+    integrity_state_hash,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .service import DeviceService
@@ -122,6 +146,24 @@ _BLOCK_SUFFIX = ".block"
 #: file written before this field loads as if it carried 0.
 COMMIT_SEQ_KEY = "commit_seq"
 
+#: Marker field stamped into the state document once a server of this build
+#: has committed its first transaction while maintaining the integrity-log
+#: sidecar. Its presence (value 1) is the marker that the sibling
+#: ``<state>.integrity`` log exists and must be verified at every startup;
+#: its absence means a legacy document that a server of this build has never
+#: committed over (it may start without the sidecar — the first commit
+#: stamps the marker and writes the log's first entry).
+INTEGRITY_LOG_VERSION_KEY = "integrity_log_version"
+INTEGRITY_LOG_VERSION = 1
+#: Sidecar suffix for the append-only commit integrity log.
+_INTEGRITY_LOG_SUFFIX = ".integrity"
+
+
+def _is_hex64(value: Any) -> bool:
+    """A 64-character lowercase hex string (a SHA-256 digest)."""
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value))
+
 
 def _valid_commit_seq(value: Any) -> bool:
     """A commit generation is a non-negative JSON integer (never a bool)."""
@@ -137,6 +179,102 @@ def _commit_seq_of(document: Dict[str, Any]) -> int:
     """
     value = document.get(COMMIT_SEQ_KEY, 0)
     return value if _valid_commit_seq(value) else 0
+
+
+def _integrity_entry_hash(commit_seq: int, state_hash: str,
+                          prev_hash: str) -> str:
+    """SHA-256 (lowercase hex) of one log entry minus its ``hash`` field.
+
+    The hashed form is the entry's remaining three fields as compact JSON
+    (``separators=(",", ":")``, ``ensure_ascii=False``, UTF-8) with keys
+    sorted, so the digest is independent of the serialised key order.
+    """
+    payload = json.dumps(
+        {"commit_seq": commit_seq, "prev_hash": prev_hash,
+         "state_hash": state_hash},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _make_integrity_entry(commit_seq: int, state_hash: str,
+                          prev_hash: str) -> Dict[str, Any]:
+    """Build one log entry with the canonical key order."""
+    return {
+        "commit_seq": commit_seq,
+        "state_hash": state_hash,
+        "prev_hash": prev_hash,
+        "hash": _integrity_entry_hash(commit_seq, state_hash, prev_hash),
+    }
+
+
+def _serialize_integrity_log(entries: List[Dict[str, Any]]) -> str:
+    """Serialise the log document: compact JSON, no newline, key order kept."""
+    return json.dumps({"version": INTEGRITY_LOG_VERSION, "entries": entries},
+                      separators=(",", ":"), ensure_ascii=False)
+
+
+def _parse_integrity_log(raw: bytes, path: str) -> List[Dict[str, Any]]:
+    """Parse and fully verify an integrity-log sidecar; return its entries.
+
+    Raises :class:`StateFileError` on any structural, chain or hash error:
+    the document must be a JSON object ``{"version": 1, "entries": [...]}``
+    with no other keys; every entry must carry exactly ``commit_seq``,
+    ``state_hash``, ``prev_hash``, ``hash``; ``commit_seq`` values must be
+    non-negative integers in strictly ascending order; the first entry's
+    ``prev_hash`` must be empty and every later one the previous entry's
+    ``hash``; every ``hash`` must be the recomputed entry digest. Nothing is
+    written — a rejected file is left byte-for-byte untouched.
+    """
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StateFileError(
+            f"integrity log is not valid JSON: {path} ({error})") from None
+    if not isinstance(document, dict):
+        raise StateFileError("integrity log must be a JSON object")
+    if set(document) != {"version", "entries"}:
+        raise StateFileError(
+            "integrity log must carry exactly 'version' and 'entries'")
+    version = document["version"]
+    if not isinstance(version, int) or isinstance(version, bool) \
+            or version != INTEGRITY_LOG_VERSION:
+        raise StateFileError(
+            f"unsupported integrity log version: {version!r} "
+            f"(this server supports {INTEGRITY_LOG_VERSION})")
+    entries = document["entries"]
+    if not isinstance(entries, list):
+        raise StateFileError("integrity log 'entries' must be a list")
+    prev_hash = ""
+    prev_seq = -1
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or set(entry) != {
+                "commit_seq", "state_hash", "prev_hash", "hash"}:
+            raise StateFileError(
+                f"integrity log entry {index} must carry exactly "
+                f"'commit_seq', 'state_hash', 'prev_hash', 'hash'")
+        seq = entry["commit_seq"]
+        if not _valid_commit_seq(seq):
+            raise StateFileError(
+                f"integrity log entry {index} 'commit_seq' must be a "
+                f"non-negative integer")
+        if seq <= prev_seq:
+            raise StateFileError(
+                f"integrity log entries must be ordered by strictly "
+                f"ascending commit_seq (entry {index})")
+        if not _is_hex64(entry["state_hash"]):
+            raise StateFileError(
+                f"integrity log entry {index} 'state_hash' must be a "
+                f"64-character lowercase hex string")
+        if entry["prev_hash"] != prev_hash:
+            raise StateFileError(
+                f"integrity log entry {index} breaks the prev_hash chain")
+        if not _is_hex64(entry["hash"]) or entry["hash"] != \
+                _integrity_entry_hash(seq, entry["state_hash"], prev_hash):
+            raise StateFileError(
+                f"integrity log entry {index} has an invalid hash")
+        prev_hash = entry["hash"]
+        prev_seq = seq
+    return entries
 
 
 class StateFileError(Exception):
@@ -164,11 +302,23 @@ class IntegrityCheckError(Exception):
     """
 
 
+class IntegrityLogUnavailable(Exception):
+    """The commit integrity log is not initialised for this state file.
+
+    The state document carries no ``integrity_log_version`` marker (a legacy
+    file no commit of this build has rewritten yet), so there is no history
+    to report; the HTTP layer answers 409/field=data_file.
+    """
+
+
 class JsonStateStore:
     """Versioned JSON document loaded from and atomically saved to one file."""
 
     def __init__(self, path: str) -> None:
         self.path = path
+        #: Path of the append-only commit integrity log sitting beside the
+        #: state file (``<state>.integrity``).
+        self.integrity_path = path + _INTEGRITY_LOG_SUFFIX
         #: Commit generation the *next* save writes. The first (empty) state
         #: is created at 0; :func:`attach_persistence` re-seeds it from a
         #: loaded or recovered document (plus one) so generations stay
@@ -199,6 +349,15 @@ class JsonStateStore:
         #: makes the state survive a restart, which keeps refusing while the residual
         #: formal file is present or no unique backup can be promoted.
         self.blocked = False
+        #: In-memory copy of the integrity log's entries (the sidecar is
+        #: rewritten in full on every commit from this list). ``None`` means
+        #: the log has not been initialised yet: the attached state file is a
+        #: legacy document without the ``integrity_log_version`` marker and
+        #: no sidecar exists. The first successful commit stamps the marker
+        #: and writes the log's first entry. A failed commit never advances
+        #: this list, so the next commit's full-file rewrite is always
+        #: consistent with the last durable state.
+        self.integrity_entries: Optional[List[Dict[str, Any]]] = None
 
     def load(self) -> Optional[Dict[str, Any]]:
         """Load the document, or ``None`` when the file does not exist yet.
@@ -248,6 +407,18 @@ class JsonStateStore:
         a crash — the target is either the previous full document or the new
         full one, never a truncated mix.
 
+        The state file and the integrity-log sidecar commit as one
+        transaction: the state document is replaced first (a crashed
+        post-state-replace state simply logs a replayable append at the next
+        startup), then the rewritten sidecar; both temporary files are
+        fsync-ed before either replace and a final directory fsync follows
+        the second replace. Any I/O, fsync or replace failure rolls the
+        transaction back (the same inode-level state rollback as always,
+        plus restoring the previous sidecar when it had already been
+        replaced), removes every temporary file and propagates the
+        :class:`OSError`; memory is rolled back by the persistence hook and
+        the caller answers 503/field=data_file.
+
         Before the replace a hard link to the current target is taken in the
         same directory. If the replace itself succeeds but the following
         directory fsync fails, that link is renamed back over the target,
@@ -289,30 +460,64 @@ class JsonStateStore:
         # strictly consecutive.
         seq = self.commit_seq
         document[COMMIT_SEQ_KEY] = seq
+        # Every commit of this build stamps the integrity-log marker (the
+        # first commit on a legacy document introduces it) and appends one
+        # sidecar entry.
+        document[INTEGRITY_LOG_VERSION_KEY] = INTEGRITY_LOG_VERSION
+        state_hash = integrity_state_hash(
+            canonical_integrity_snapshot(state))
+        entries = self.integrity_entries or []
+        prev_hash = entries[-1]["hash"] if entries else ""
+        new_entry = _make_integrity_entry(seq, state_hash, prev_hash)
+        new_entries = entries + [new_entry]
+
         tmp_handle = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=directory, delete=False,
             prefix=".state-", suffix=".tmp")
         tmp_path = tmp_handle.name
+        integrity_tmp_handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory, delete=False,
+            prefix=".integrity-", suffix=".tmp")
+        integrity_tmp_path = integrity_tmp_handle.name
         backup_path: Optional[str] = None
+        integrity_backup_path: Optional[str] = None
         replaced = False
+        integrity_replaced = False
         try:
             json.dump(document, tmp_handle, separators=(",", ":"),
                       ensure_ascii=False)
             tmp_handle.flush()
             os.fsync(tmp_handle.fileno())
             tmp_handle.close()
-            # Pin the old inode before renaming over it. On the first save the
-            # target does not exist yet, so there is no old state to preserve.
+            integrity_tmp_handle.write(
+                _serialize_integrity_log(new_entries))
+            integrity_tmp_handle.flush()
+            os.fsync(integrity_tmp_handle.fileno())
+            integrity_tmp_handle.close()
+            # Pin the old inodes before renaming over them. On the first save
+            # the targets do not exist yet, so there is nothing to preserve.
             backup_path = _hardlink_backup(directory, self.path)
+            integrity_backup_path = _hardlink_backup(
+                directory, self.integrity_path,
+                prefix=".integrity-", suffix=".bak")
             os.replace(tmp_path, self.path)
             replaced = True
             # The rename is only durable once the directory entry is flushed;
             # without this fsync a crash can leave the directory pointing at
             # the pre-rename entry even though the replacement landed.
             _fsync_directory(directory)
+            # State landed first on purpose: a crash at (or after) this point
+            # leaves a valid new state document with the previous integrity
+            # log, which startup accepts as a replayable append rather than a
+            # broken chain.
+            os.replace(integrity_tmp_path, self.integrity_path)
+            integrity_replaced = True
+            _fsync_directory(directory)
         except BaseException:
             tmp_handle.close()
             _remove_quietly(tmp_path)
+            integrity_tmp_handle.close()
+            _remove_quietly(integrity_tmp_path)
             if replaced and backup_path is not None:
                 # The replacement landed but the following directory fsync
                 # failed. Restore the pinned old inode atomically first (the
@@ -356,19 +561,43 @@ class JsonStateStore:
                         # (the safe outcome), so the store is not degraded.
                         if _repin_old_inode(directory, self.path):
                             self.degraded = True
+            # Restore the previous integrity log when its replace landed
+            # before the failure (only meaningful while the state rollback
+            # left a last-committed formal file; in the blocked state the
+            # block marker makes startup refuse regardless). A rename that
+            # cannot go through parks the un-committed new log off the
+            # formal sidecar path (or removes it), so the committed state
+            # document is never left paired with the wrong log.
+            if integrity_replaced and integrity_backup_path is not None:
+                try:
+                    os.replace(integrity_backup_path,
+                               self.integrity_path)
+                    _fsync_directory(directory)
+                except OSError:
+                    _vacate_integrity_log(directory, self.integrity_path)
+                    integrity_backup_path = None
             if backup_path is not None:
                 _remove_quietly(backup_path)
-            raise
-        # Commit is durable; drop the pinned old inode (best effort — a
-        # leftover backup is harmless and cleaned up at the next startup).
-        if backup_path is not None:
-            _remove_quietly(backup_path)
+            if integrity_backup_path is not None:
+                _remove_quietly(integrity_backup_path)
             try:
                 _fsync_directory(directory)
             except OSError:
                 pass
-        # The generation advances exactly once per durable commit.
+            raise
+        # Commit is durable; drop the pinned old inodes (best effort — a
+        # leftover backup is harmless and cleaned up at the next startup).
+        if backup_path is not None:
+            _remove_quietly(backup_path)
+        if integrity_backup_path is not None:
+            _remove_quietly(integrity_backup_path)
+        try:
+            _fsync_directory(directory)
+        except OSError:
+            pass
+        # The generation and the log advance exactly once per durable commit.
         self.commit_seq = seq + 1
+        self.integrity_entries = new_entries
 
     def heal(self, baseline: Dict[str, Any]) -> None:
         """Self-heal the degraded formal path from the pinned ``.bak``.
@@ -409,6 +638,8 @@ class JsonStateStore:
         directory = os.path.dirname(os.path.abspath(self.path))
         leftovers = _leftover_tmp_paths(directory, self.path)
         quarantined = _quarantined_paths(directory, self.path)
+        integrity_leftovers = _integrity_leftover_paths(
+            directory, self.integrity_path)
 
         if os.path.exists(self.path):
             # The formal path can only reappear (or, while blocked, never
@@ -432,7 +663,7 @@ class JsonStateStore:
             if formal_is_committed:
                 _sweep_leftovers(
                     directory,
-                    leftovers + quarantined
+                    leftovers + quarantined + integrity_leftovers
                     + _block_marker_paths(directory, self.path))
                 self.degraded = False
                 self.blocked = False
@@ -521,9 +752,12 @@ class JsonStateStore:
 
         # The formal path durably names the committed inode; every pinned
         # copy, staged snapshot and demoted (quarantined) new snapshot is now
-        # stale garbage. Sweep failures are harmless: a valid formal file
+        # stale garbage (the sidecar transaction's staged/backed-up logs
+        # included — the next save rewrites the sidecar from the in-memory
+        # entry list). Sweep failures are harmless: a valid formal file
         # always wins the leftover scan at every later startup.
-        _sweep_leftovers(directory, leftovers + quarantined)
+        _sweep_leftovers(directory,
+                         leftovers + quarantined + integrity_leftovers)
         self.degraded = False
         if self.blocked:
             # The path was vacated out-of-band and the unique verifiable
@@ -587,7 +821,8 @@ class JsonStateStore:
                     f"state document '{COMMIT_SEQ_KEY}' must be a "
                     f"non-negative integer")
             payload = {key: value for key, value in document.items()
-                       if key not in ("version", COMMIT_SEQ_KEY)}
+                       if key not in ("version", COMMIT_SEQ_KEY,
+                                      INTEGRITY_LOG_VERSION_KEY)}
             return payload, commit_seq
 
         def expected_generation() -> int:
@@ -607,6 +842,42 @@ class JsonStateStore:
         return {"commit_seq": commit_seq,
                 "state_hash": state_hash,
                 "consistent": True}
+
+    def integrity_history(self,
+                          store: "DeviceStore") -> Dict[str, Any]:
+        """Commit history backing ``GET /v1/persistence/integrity/history``.
+
+        Runs under *store*'s lock so it is linearised with commits (a
+        writer replaces the state file, the sidecar and the in-memory entry
+        list inside one store-lock transaction). Raises
+        :class:`IntegrityLogUnavailable` (409/field=data_file at the HTTP
+        layer) when the state document has no
+        ``integrity_log_version`` marker — a legacy file no commit of this
+        build has rewritten yet, which can therefore have no sidecar. On
+        success returns ``{"commit_seq", "entries"}`` in that key order:
+        ``commit_seq`` is the last committed generation (equal to the state
+        file's generation and the last entry's) and ``entries`` are the
+        sidecar's entries (key order ``commit_seq``, ``state_hash``,
+        ``prev_hash``, ``hash``), copied so the caller can serialise them
+        without holding the lock.
+        """
+        with store._lock:
+            entries = self.integrity_entries
+            if entries is None:
+                raise IntegrityLogUnavailable(
+                    "the state file carries no integrity_log_version "
+                    "marker; there is no commit integrity history yet")
+            copied = copy.deepcopy(entries)
+            commit_seq = self.commit_seq - 1
+            if not copied or copied[-1]["commit_seq"] != commit_seq:
+                # The in-memory copy is only ever replaced after a durable
+                # commit, so this can only result from programming error;
+                # report it through the data_file field rather than emit a
+                # misleading history.
+                raise IntegrityCheckError(
+                    "integrity log is out of step with the commit "
+                    "generation")
+            return {"commit_seq": commit_seq, "entries": copied}
 
 
 def _directory_fsync_unsupported(error: OSError) -> bool:
@@ -658,7 +929,9 @@ def _fsync_directory(directory: str) -> bool:
     return True
 
 
-def _hardlink_backup(directory: str, target: str) -> Optional[str]:
+def _hardlink_backup(directory: str, target: str,
+                     prefix: str = _TMP_PREFIX,
+                     suffix: str = _BAK_SUFFIX) -> Optional[str]:
     """Pin the current *target*'s inode via a same-directory hard link.
 
     Returns the backup path, or ``None`` when *target* does not exist yet
@@ -670,8 +943,8 @@ def _hardlink_backup(directory: str, target: str) -> Optional[str]:
     """
     if not os.path.exists(target):
         return None
-    fd, backup = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
-                                  suffix=_BAK_SUFFIX)
+    fd, backup = tempfile.mkstemp(dir=directory, prefix=prefix,
+                                  suffix=suffix)
     os.close(fd)
     try:
         # mkstemp created an empty file under that unique name; remove it so
@@ -682,6 +955,34 @@ def _hardlink_backup(directory: str, target: str) -> Optional[str]:
         _remove_quietly(backup)
         raise
     return backup
+
+
+def _integrity_quarantine_path(directory: str) -> str:
+    """Reserve a unique same-directory name for a demoted integrity log."""
+    fd, quarantine = tempfile.mkstemp(dir=directory, prefix=".integrity-",
+                                      suffix=".quarantine")
+    os.close(fd)
+    os.unlink(quarantine)
+    return quarantine
+
+
+def _vacate_integrity_log(directory: str, target: str) -> None:
+    """Take an un-committed integrity log off its formal sidecar path.
+
+    Mirrors :func:`_vacate_new_snapshot` for the sidecar: a rollback that
+    cannot rename the previous log back over the path parks the new one
+    under a ``.integrity-*.quarantine`` name the recovery scan never
+    promotes, or removes it. Best effort only.
+    """
+    try:
+        quarantine = _integrity_quarantine_path(directory)
+        try:
+            os.replace(target, quarantine)
+        except OSError:
+            _remove_quietly(quarantine)
+            raise
+    except OSError:
+        _remove_quietly(target)
 
 
 def _quarantine_path(directory: str) -> str:
@@ -955,6 +1256,159 @@ def _block_marker_paths(directory: str, target_path: str) -> List[str]:
     return markers
 
 
+def _integrity_leftover_paths(directory: str, target_path: str) -> List[str]:
+    """List staged/backed-up/quarantined integrity-log files.
+
+    These carry the ``.integrity-`` prefix :meth:`JsonStateStore.save` uses
+    for its sidecar transaction; the formal sidecar (``<state>.integrity``)
+    never matches and is never listed.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    leftovers: List[str] = []
+    for name in names:
+        if not name.startswith(".integrity-"):
+            continue
+        if not (name.endswith(".tmp") or name.endswith(".bak")
+                or name.endswith(".quarantine")):
+            continue
+        full = os.path.join(directory, name)
+        if os.path.abspath(full) != os.path.abspath(target_path):
+            leftovers.append(full)
+    return leftovers
+
+
+def _read_integrity_log_file(path: str) -> Optional[List[Dict[str, Any]]]:
+    """Read and verify one integrity-log file, or ``None`` if unusable."""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+    try:
+        return _parse_integrity_log(raw, path)
+    except StateFileError:
+        return None
+
+
+def _integrity_log_matches_state(entries: List[Dict[str, Any]],
+                                 commit_seq: int,
+                                 state_hash: str) -> bool:
+    """Whether a verified log ends with an entry proving *commit_seq*.
+
+    The last entry must record exactly the formal document's generation and
+    the SHA-256 of its canonical snapshot; earlier entries chain into it and
+    were already verified by :func:`_parse_integrity_log`.
+    """
+    return bool(entries) and entries[-1]["commit_seq"] == commit_seq \
+        and entries[-1]["state_hash"] == state_hash
+
+
+def _formal_state_hash(formal: Dict[str, Any]) -> Optional[str]:
+    """Canonical state hash of a version-1 formal document, or ``None``."""
+    if not isinstance(formal, dict):
+        return None
+    payload = {key: value for key, value in formal.items()
+               if key not in ("version", COMMIT_SEQ_KEY,
+                              INTEGRITY_LOG_VERSION_KEY)}
+    try:
+        restored = DeviceStore()
+        restored.restore_state(payload)
+        canonical = canonical_integrity_snapshot(restored.snapshot_state())
+    except (ValueError, TypeError):
+        return None
+    return integrity_state_hash(canonical)
+
+
+def _integrity_sidecar_matches_formal(
+        state_store: "JsonStateStore") -> Optional[bool]:
+    """Whether the formal sidecar proves the formal state document.
+
+    Returns ``None`` for a legacy formal document (no marker — no sidecar is
+    expected and the gate does not apply), ``True`` when the formal sidecar's
+    last entry proves the document, and ``False`` when it does not (the
+    startup gate will refuse).
+    """
+    try:
+        with open(state_store.path, "rb") as handle:
+            formal = json.loads(handle.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(formal, dict) \
+            or formal.get(INTEGRITY_LOG_VERSION_KEY) != INTEGRITY_LOG_VERSION:
+        return None
+    seq = formal.get(COMMIT_SEQ_KEY)
+    if not _valid_commit_seq(seq):
+        return False
+    state_hash = _formal_state_hash(formal)
+    if state_hash is None:
+        return False
+    entries = _read_integrity_log_file(state_store.integrity_path)
+    return entries is not None and _integrity_log_matches_state(
+        entries, seq, state_hash)
+
+
+def _reconcile_integrity_sidecar(
+        state_store: "JsonStateStore",
+        integrity_leftovers: List[str]) -> Optional[str]:
+    """Reconcile the formal sidecar with the established formal state file.
+
+    Called by crash recovery after a valid formal state document is in place
+    (kept or promoted). A crash between the transaction's two atomic
+    replaces can leave the new formal state paired with the *previous*
+    integrity log while the complete new log survives as an
+    ``.integrity-*.tmp`` leftover (and, on the first commit, no formal
+    sidecar at all). When the formal document carries the
+    ``integrity_log_version`` marker, keep its existing sidecar if that
+    sidecar already proves the formal state; otherwise promote the unique
+    best verifying leftover log whose last entry proves the formal state
+    (full-log rewrites make every such log identical; the longest, then the
+    name, breaks ties deterministically). Returns the promoted leftover path
+    (so the caller can keep it out of the sweep) or ``None``. When nothing
+    verifiable matches, every file is left untouched and the startup gate
+    rejects the mismatch itself.
+    """
+    try:
+        with open(state_store.path, "rb") as handle:
+            formal = json.loads(handle.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(formal, dict) \
+            or formal.get(INTEGRITY_LOG_VERSION_KEY) != INTEGRITY_LOG_VERSION:
+        # Legacy formal (no marker): no sidecar may belong to it; nothing to
+        # promote. The startup gate decides about any formal sidecar.
+        return None
+    seq = formal.get(COMMIT_SEQ_KEY)
+    if not _valid_commit_seq(seq):
+        return None
+    state_hash = _formal_state_hash(formal)
+    if state_hash is None:
+        return None
+    entries = _read_integrity_log_file(state_store.integrity_path)
+    if entries is not None and _integrity_log_matches_state(
+            entries, seq, state_hash):
+        return None
+    candidates: List[Tuple[int, str, List[Dict[str, Any]]]] = []
+    for path in integrity_leftovers:
+        log_entries = _read_integrity_log_file(path)
+        if log_entries is not None and _integrity_log_matches_state(
+                log_entries, seq, state_hash):
+            candidates.append((len(log_entries), path, log_entries))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    chosen = candidates[-1][1]
+    try:
+        os.replace(chosen, state_store.integrity_path)
+        _fsync_directory(
+            os.path.dirname(os.path.abspath(state_store.integrity_path)))
+    except OSError:
+        return None
+    return chosen
+
+
 def _write_block_marker(directory: str) -> Optional[str]:
     """Persist a blocking-state marker in *directory* (best effort).
 
@@ -1070,7 +1524,10 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
     leftovers = _leftover_tmp_paths(directory, state_store.path)
     quarantined = _quarantined_paths(directory, state_store.path)
     markers = _block_marker_paths(directory, state_store.path)
-    if not leftovers and not quarantined and not markers:
+    integrity_leftovers = _integrity_leftover_paths(
+        directory, state_store.integrity_path)
+    if not leftovers and not quarantined and not markers \
+            and not integrity_leftovers:
         return
 
     if markers:
@@ -1119,8 +1576,15 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
                         for path, _, _ in verified)
                     if pin_doc is not None))
             if formal_is_committed:
+                promoted_log = _reconcile_integrity_sidecar(
+                    state_store, integrity_leftovers)
+                matches = _integrity_sidecar_matches_formal(state_store)
                 for path in leftovers + quarantined + markers:
                     _remove_quietly(path)
+                if not (matches is False and promoted_log is None):
+                    for path in integrity_leftovers:
+                        if path != promoted_log:
+                            _remove_quietly(path)
                 _fsync_directory(directory)
                 return
             raise OSError(
@@ -1134,8 +1598,12 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
         os.replace(recovered, state_store.path)
         _fsync_directory(directory)
         leftovers = [path for path in leftovers if path != recovered]
-        for path in leftovers + quarantined + markers:
-            _remove_quietly(path)
+        promoted_log = _reconcile_integrity_sidecar(
+            state_store, integrity_leftovers)
+        for path in leftovers + quarantined + markers \
+                + integrity_leftovers:
+            if path != promoted_log:
+                _remove_quietly(path)
         _fsync_directory(directory)
         return
 
@@ -1152,8 +1620,23 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
                  or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
             and _document_restores(formal))
         if formal_valid:
-            for path in leftovers + quarantined:
-                _remove_quietly(path)
+            # Reconcile the sidecar with the valid formal state before
+            # sweeping its leftovers (a crash between the two replaces can
+            # have staged the matching new log as .integrity-*.tmp).
+            promoted_log = _reconcile_integrity_sidecar(
+                state_store, integrity_leftovers)
+            matches = _integrity_sidecar_matches_formal(state_store)
+            if matches is False and promoted_log is None:
+                # A marked formal whose sidecar still does not prove it:
+                # keep the integrity leftovers untouched for inspection and
+                # let the startup gate refuse. State leftovers are stale
+                # relative to the valid formal as usual.
+                for path in leftovers + quarantined:
+                    _remove_quietly(path)
+            else:
+                for path in leftovers + quarantined + integrity_leftovers:
+                    if path != promoted_log:
+                        _remove_quietly(path)
         return
 
     # Formal file missing. Verify every leftover first (unverifiable ones are
@@ -1200,6 +1683,12 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
         os.replace(recovered, state_store.path)
         _fsync_directory(directory)
         leftovers = [path for path in leftovers if path != recovered]
+        # The promoted formal may be a crashed post-state-replace document:
+        # promote the matching staged integrity log before sweeping.
+        promoted_log = _reconcile_integrity_sidecar(
+            state_store, integrity_leftovers)
+    else:
+        promoted_log = None
     for path in leftovers:
         _remove_quietly(path)
     # A demoted snapshot is never a recovery candidate (its transaction was
@@ -1207,6 +1696,103 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
     # resolved above, any quarantine file is pure garbage.
     for path in quarantined:
         _remove_quietly(path)
+    matches = _integrity_sidecar_matches_formal(state_store)
+    for path in integrity_leftovers:
+        # Preserve every integrity leftover when a marked formal still has
+        # no sidecar proving it, so the startup gate refuses with the files
+        # in place for inspection instead of silently deleting evidence.
+        if matches is False and promoted_log is None:
+            continue
+        if path != promoted_log:
+            _remove_quietly(path)
+
+
+def _valid_integrity_log_marker(document: Dict[str, Any]) -> bool:
+    """The ``integrity_log_version`` marker is absent, or exactly 1."""
+    if INTEGRITY_LOG_VERSION_KEY not in document:
+        return True
+    value = document[INTEGRITY_LOG_VERSION_KEY]
+    return isinstance(value, int) and not isinstance(value, bool) \
+        and value == INTEGRITY_LOG_VERSION
+
+
+def _verify_startup_integrity(
+        state_store: "JsonStateStore",
+        document: Dict[str, Any]) -> None:
+    """Verify the integrity-log sidecar against the formal document at startup.
+
+    Refuses startup (raising :class:`StateFileError`, the original files
+    untouched) when:
+
+    * the document carries an ``integrity_log_version`` marker other than 1;
+    * the marker is missing but a sidecar exists (a log no state document
+      claims);
+    * the marker is 1 but the sidecar is missing;
+    * the sidecar fails its structure / chain / per-entry hash verification;
+    * its last entry does not prove the formal document's
+      ``commit_seq``/canonical ``state_hash`` (the entry generations must
+      also be exactly consecutive from 0).
+
+    A legacy document without the marker and without a sidecar is accepted:
+    such a server may start, and its first commit stamps the marker and
+    writes the log's first entry.
+    """
+    marker = INTEGRITY_LOG_VERSION_KEY in document
+    if marker and not _valid_integrity_log_marker(document):
+        raise StateFileError(
+            f"state document '{INTEGRITY_LOG_VERSION_KEY}' must be 1")
+    sidecar_exists = os.path.exists(state_store.integrity_path)
+    if not marker and not sidecar_exists:
+        # Legacy state: startable; the first commit initialises the log.
+        return
+    if not marker:
+        raise StateFileError(
+            "state document has no integrity_log_version marker but an "
+            "integrity log sidecar exists")
+    if not sidecar_exists:
+        raise StateFileError(
+            "state document marks integrity_log_version=1 but the "
+            "integrity log sidecar is missing")
+    try:
+        with open(state_store.integrity_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as error:
+        raise StateFileError(
+            f"cannot read integrity log {state_store.integrity_path}: "
+            f"{error}") from None
+    entries = _parse_integrity_log(raw, state_store.integrity_path)
+    if not entries:
+        raise StateFileError("integrity log has no entries")
+    # Entries are appended one per commit, so after the first entry the
+    # generations must be consecutive (the first entry itself may sit above
+    # 0 when a legacy document was only stamped on this build's first
+    # commit).
+    first_seq = entries[0]["commit_seq"]
+    if [entry["commit_seq"] for entry in entries] \
+            != list(range(first_seq, first_seq + len(entries))):
+        raise StateFileError(
+            "integrity log entries do not cover consecutive commit "
+            "generations")
+    commit_seq = document.get(COMMIT_SEQ_KEY, 0)
+    if not _valid_commit_seq(commit_seq):
+        raise StateFileError(
+            f"state document '{COMMIT_SEQ_KEY}' must be a non-negative "
+            f"integer")
+    last = entries[-1]
+    if last["commit_seq"] != commit_seq:
+        raise StateFileError(
+            f"integrity log ends at commit_seq {last['commit_seq']} but the "
+            f"state document is at {commit_seq}")
+    state_hash = _formal_state_hash(document)
+    if state_hash is None:
+        raise StateFileError(
+            "state document fails semantic verification against the "
+            "integrity log")
+    if last["state_hash"] != state_hash:
+        raise StateFileError(
+            "integrity log's last state_hash does not match the state "
+            "document")
+    state_store.integrity_entries = entries
 
 
 def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
@@ -1240,6 +1826,13 @@ def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
             raise StateFileError(
                 f"cannot create state file {path}: {error}") from None
     else:
+        # Verify the integrity-log sidecar against the formal document
+        # before touching memory: a missing/extra sidecar, bad marker value,
+        # broken log structure/chain/hashes, or a last entry that does not
+        # prove the document makes the server refuse to start with every
+        # original file left untouched. A legacy document (no marker, no
+        # sidecar) starts normally; its first commit initialises the log.
+        _verify_startup_integrity(state_store, document)
         # Resume commit generations exactly where the durable document left
         # off (a legacy file without the field is generation 0): the next
         # successful transaction writes commit_seq + 1, never repeating or

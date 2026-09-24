@@ -310,6 +310,9 @@ class LegacyAnchorMigrationTest(unittest.TestCase):
         document = self._read_document()
         self.assertIn("key_events", document)
         del document["key_events"]
+        # A legacy file predates the integrity-log marker/sidecar too.
+        del document["integrity_log_version"]
+        os.unlink(self.path + ".integrity")
         self._write_document(document)
 
         service = self._restart()

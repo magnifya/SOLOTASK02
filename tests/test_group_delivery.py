@@ -346,6 +346,9 @@ class GroupDeliveryPersistenceTest(unittest.TestCase):
                               {"device_id": "d2", "attempt_id": "a1"})
         document = self._document()
         del document["group_delivery"]
+        # Emulate a pre-marker legacy file: drop the marker and sidecar too.
+        del document["integrity_log_version"]
+        os.unlink(self.path + ".integrity")
         with open(self.path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
 
