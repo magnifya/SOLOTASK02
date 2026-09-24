@@ -19,6 +19,7 @@ _MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 _PERSISTENCE_INTEGRITY_PATH = "/v1/persistence/integrity"
+_PERSISTENCE_INTEGRITY_HISTORY_PATH = "/v1/persistence/integrity/history"
 
 #: Sentinel meaning a 400 for a malformed body was already sent.
 _BAD_REQUEST = object()
@@ -190,7 +191,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
 
     def _route_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path == _PERSISTENCE_INTEGRITY_PATH:
+        if path == _PERSISTENCE_INTEGRITY_HISTORY_PATH:
+            self._handle_persistence_integrity_history()
+        elif path == _PERSISTENCE_INTEGRITY_PATH:
             self._handle_persistence_integrity()
         elif path.startswith(_GROUPS_PATH + "/"):
             suffix = path[len(_GROUPS_PATH) + 1:]
@@ -270,6 +273,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_persistence_integrity(self) -> None:
         try:
             body = self.service.persistence_integrity()
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_persistence_integrity_history(self) -> None:
+        try:
+            body = self.service.persistence_integrity_history()
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

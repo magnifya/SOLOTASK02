@@ -316,6 +316,9 @@ class SessionFromClaimPersistenceTest(unittest.TestCase):
         with open(self.path, encoding="utf-8") as handle:
             document = json.load(handle)
         del document["claim_session_bindings"]
+        # Genuinely pre-integrity-log legacy document (no marker); its own
+        # sidecar never exists under the renamed old.json path.
+        document.pop("integrity_log_version", None)
         old_path = os.path.join(self.directory, "old.json")
         with open(old_path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)

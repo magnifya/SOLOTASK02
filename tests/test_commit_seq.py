@@ -159,6 +159,9 @@ class LegacyCommitSeqCompatibilityTest(unittest.TestCase):
             self.directory, cursor=2)
         self.document = json.loads(formal_bytes.decode("utf-8"))
         del self.document["commit_seq"]
+        # The recreated legacy file lives at its own path with no sidecar;
+        # drop the integrity marker so it is a genuine pre-feature document.
+        self.document.pop("integrity_log_version", None)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)
@@ -181,6 +184,9 @@ class InvalidCommitSeqStartupTest(unittest.TestCase):
         self.directory = tempfile.mkdtemp()
         _service, self.path, _sid, formal_bytes = build_fixture(self.directory)
         self.document = json.loads(formal_bytes.decode("utf-8"))
+        # Hand-built bad-*.json/good-*.json files at their own paths carry no
+        # sidecar; drop the marker so they are genuine pre-feature documents.
+        self.document.pop("integrity_log_version", None)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)
@@ -237,6 +243,14 @@ class MissingFormalGenerationRankingTest(unittest.TestCase):
         _service, self.path, self.sid, formal_bytes = build_fixture(
             self.directory, cursor=2)
         self.formal = json.loads(formal_bytes.decode("utf-8"))
+        # These tests carve pre-integrity-log crash leftovers out of the
+        # fixture: strip the marker and remove the modern sidecar so a
+        # recovered leftover loads as a genuine legacy document (the ranking
+        # logic under test predates the integrity history).
+        self.formal.pop("integrity_log_version", None)
+        sidecar = self.path + ".integrity"
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)

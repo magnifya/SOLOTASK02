@@ -55,6 +55,9 @@ class GroupRotationRecoveryTest(unittest.TestCase):
 
     def _load(self, document) -> DeviceService:
         path = os.path.join(self.directory, "candidate.json")
+        # The candidate lives at its own path with no sidecar, so treat it as
+        # a genuine pre-integrity-log document by dropping the marker.
+        document.pop("integrity_log_version", None)
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
         service = DeviceService()
@@ -63,6 +66,9 @@ class GroupRotationRecoveryTest(unittest.TestCase):
 
     def _assert_rejected(self, document) -> None:
         path = os.path.join(self.directory, "bad.json")
+        # No sidecar accompanies this hand-built bad file; drop the marker so
+        # refusal comes from the malformed content the test is exercising.
+        document.pop("integrity_log_version", None)
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
         before = open(path, "rb").read()

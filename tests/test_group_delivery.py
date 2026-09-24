@@ -346,8 +346,12 @@ class GroupDeliveryPersistenceTest(unittest.TestCase):
                               {"device_id": "d2", "attempt_id": "a1"})
         document = self._document()
         del document["group_delivery"]
+        # Genuinely pre-integrity-log legacy document: no marker, no sidecar.
+        document.pop("integrity_log_version", None)
         with open(self.path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
+        if os.path.exists(self.path + ".integrity"):
+            os.remove(self.path + ".integrity")
 
         restored = DeviceService()
         attach_persistence(restored, self.path)  # must not refuse to start

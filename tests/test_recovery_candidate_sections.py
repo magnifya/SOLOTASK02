@@ -128,8 +128,14 @@ class SectionGateDoesNotAffectFormalFileTest(unittest.TestCase):
         document = json.loads(formal_bytes.decode("utf-8"))
         del document["key_events"]
         del document["group_sync_cursors"]
+        # Make it a genuine pre-integrity-log formal file: no marker and no
+        # sidecar beside it.
+        document.pop("integrity_log_version", None)
         with open(self.path, "wb") as handle:
             handle.write(json.dumps(document).encode("utf-8"))
+        sidecar = self.path + ".integrity"
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)

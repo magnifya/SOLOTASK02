@@ -397,7 +397,12 @@ class KeyEventsPersistenceTest(unittest.TestCase):
     def test_missing_section_loads_as_empty(self) -> None:
         document = self._document()
         del document["key_events"]
+        # Simulate a genuinely pre-integrity-log legacy document: drop the
+        # marker alongside the missing section and its sidecar.
+        document.pop("integrity_log_version", None)
         self._write_document(document)
+        if os.path.exists(self.path + ".integrity"):
+            os.remove(self.path + ".integrity")
         service = self._restart()
         page = service.store.key_events_page("d1", 0, 100)
         assert page is not None

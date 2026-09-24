@@ -318,8 +318,13 @@ class LegacyAnchorReplayTest(unittest.TestCase):
         with open(self.path, encoding="utf-8") as handle:
             document = json.load(handle)
         del document["key_events"]
+        # A genuine pre-integrity-log legacy file: no marker, no sidecar.
+        document.pop("integrity_log_version", None)
         with open(self.path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
+        sidecar = self.path + ".integrity"
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)

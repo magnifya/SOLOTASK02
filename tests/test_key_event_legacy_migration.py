@@ -310,7 +310,13 @@ class LegacyAnchorMigrationTest(unittest.TestCase):
         document = self._read_document()
         self.assertIn("key_events", document)
         del document["key_events"]
+        # Emulate a genuine pre-integrity-log old file: drop the marker and
+        # its sidecar as well.
+        document.pop("integrity_log_version", None)
         self._write_document(document)
+        sidecar = self.path + ".integrity"
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
 
         service = self._restart()
         # A message (a persisting non-key business change) anchors d1/d2 in

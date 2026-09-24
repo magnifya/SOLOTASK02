@@ -1377,3 +1377,34 @@ class DeviceService:
         except IntegrityCheckError as error:
             raise ServiceError(str(error), "data_file",
                                status_code=503) from None
+
+    def persistence_integrity_history(self) -> Dict[str, Any]:
+        """Read-only probe of the append-only integrity-history sidecar.
+
+        Answers ``409/field=data_file`` whenever the state document carries
+        no ``integrity_log_version`` marker — the purely in-memory mode and a
+        file-mode store that has not made its first (migrating) commit. With
+        the marker, the sidecar is read under the store lock and fully
+        verified (structure, hash chain, per-entry hashes) and its last entry
+        must equal the current committed generation and the live state hash;
+        success returns ``{"commit_seq", "entries"}`` in that key order with
+        ``commit_seq`` identical to the state generation and the last entry.
+        Any parse/chain/hash/tail failure is 503/field=data_file and changes
+        nothing.
+        """
+        if self.integrity_state_store is None:
+            raise ServiceError(
+                "persistence is not enabled; start the server with a data "
+                "file to inspect state integrity history",
+                "data_file", status_code=409)
+        try:
+            report = self.integrity_state_store.history_report(self.store)
+        except IntegrityCheckError as error:
+            raise ServiceError(str(error), "data_file",
+                               status_code=503) from None
+        if report is None:
+            raise ServiceError(
+                "integrity history is not enabled; the state file has not "
+                "committed since the integrity log was introduced",
+                "data_file", status_code=409)
+        return report
