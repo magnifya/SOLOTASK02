@@ -20,6 +20,8 @@ _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 _PERSISTENCE_INTEGRITY_PATH = "/v1/persistence/integrity"
 _PERSISTENCE_INTEGRITY_HISTORY_PATH = "/v1/persistence/integrity/history"
+_PERSISTENCE_INTEGRITY_HISTORY_PAGE_PATH = \
+    "/v1/persistence/integrity/history/page"
 
 #: Sentinel meaning a 400 for a malformed body was already sent.
 _BAD_REQUEST = object()
@@ -191,7 +193,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
 
     def _route_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path == _PERSISTENCE_INTEGRITY_HISTORY_PATH:
+        if path == _PERSISTENCE_INTEGRITY_HISTORY_PAGE_PATH:
+            self._handle_persistence_integrity_history_page()
+        elif path == _PERSISTENCE_INTEGRITY_HISTORY_PATH:
             self._handle_persistence_integrity_history()
         elif path == _PERSISTENCE_INTEGRITY_PATH:
             self._handle_persistence_integrity()
@@ -281,6 +285,25 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_persistence_integrity_history(self) -> None:
         try:
             body = self.service.persistence_integrity_history()
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_persistence_integrity_history_page(self) -> None:
+        # keep_blank_values: an explicitly blank after=/limit= is a malformed
+        # value (400), not an omitted parameter.
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        after = self._int_param(query, "after", default=0, minimum=0)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._int_param(query, "limit", default=100,
+                                minimum=1, maximum=100)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.persistence_integrity_history_page(
+                after, limit)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

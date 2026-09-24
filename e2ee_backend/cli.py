@@ -374,6 +374,16 @@ def build_parser() -> argparse.ArgumentParser:
                            help="base64-encoded ciphertext with appended GCM tag")
     p_decrypt.set_defaults(handler=cmd_decrypt_message)
 
+    p_integrity_history_page = sub.add_parser(
+        "integrity-history-page",
+        help="list a page of the persistence integrity-history audit chain")
+    p_integrity_history_page.add_argument(
+        "--after", type=int, default=0,
+        help="start after this commit generation (default: 0, from the "
+             "first entry)")
+    p_integrity_history_page.add_argument("--limit", type=int, default=100)
+    p_integrity_history_page.set_defaults(handler=cmd_integrity_history_page)
+
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
@@ -978,6 +988,27 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
     return 0
+
+
+def cmd_integrity_history_page(args: argparse.Namespace) -> int:
+    """Call GET /v1/persistence/integrity/history/page and print the JSON.
+
+    Success prints the single-line compact page JSON on stdout and exits 0;
+    any API or connection failure prints the single-line JSON on stderr and
+    exits non-zero (connection failures use field=server).
+    """
+    from urllib.parse import urlencode
+
+    query = urlencode({"after": args.after, "limit": args.limit})
+    url = (f"{args.base_url}/v1/persistence/integrity/history/page?{query}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False),
+          file=stream)
+    return 0 if status == 200 else 1
 
 
 def _serve_data_file_path(data_file: Optional[str]) -> Optional[str]:

@@ -1378,19 +1378,13 @@ class DeviceService:
             raise ServiceError(str(error), "data_file",
                                status_code=503) from None
 
-    def persistence_integrity_history(self) -> Dict[str, Any]:
-        """Read-only probe of the append-only integrity-history sidecar.
+    def _integrity_history_report(self) -> Dict[str, Any]:
+        """Return the verified full integrity-history report.
 
-        Answers ``409/field=data_file`` whenever the state document carries
-        no ``integrity_log_version`` marker — the purely in-memory mode and a
-        file-mode store that has not made its first (migrating) commit. With
-        the marker, the sidecar is read under the store lock and fully
-        verified (structure, hash chain, per-entry hashes) and its last entry
-        must equal the current committed generation and the live state hash;
-        success returns ``{"commit_seq", "entries"}`` in that key order with
-        ``commit_seq`` identical to the state generation and the last entry.
-        Any parse/chain/hash/tail failure is 503/field=data_file and changes
-        nothing.
+        Shared enablement gate for the history probes: raises
+        ``409/field=data_file`` without the ``integrity_log_version`` marker
+        (in-memory mode or a not-yet-migrated file) and
+        ``503/field=data_file`` on any verification failure.
         """
         if self.integrity_state_store is None:
             raise ServiceError(
@@ -1408,3 +1402,50 @@ class DeviceService:
                 "committed since the integrity log was introduced",
                 "data_file", status_code=409)
         return report
+
+    def persistence_integrity_history(self) -> Dict[str, Any]:
+        """Read-only probe of the append-only integrity-history sidecar.
+
+        Answers ``409/field=data_file`` whenever the state document carries
+        no ``integrity_log_version`` marker — the purely in-memory mode and a
+        file-mode store that has not made its first (migrating) commit. With
+        the marker, the sidecar is read under the store lock and fully
+        verified (structure, hash chain, per-entry hashes) and its last entry
+        must equal the current committed generation and the live state hash;
+        success returns ``{"commit_seq", "entries"}`` in that key order with
+        ``commit_seq`` identical to the state generation and the last entry.
+        Any parse/chain/hash/tail failure is 503/field=data_file and changes
+        nothing.
+        """
+        return self._integrity_history_report()
+
+    def persistence_integrity_history_page(self, after: int, limit: int
+                                           ) -> Dict[str, Any]:
+        """Paginated read-only probe of the integrity-history sidecar.
+
+        Same enablement and verification rules as
+        :meth:`persistence_integrity_history` (409 without the marker, 503 on
+        any parse/version/generation/chain/hash/read failure). On success
+        returns ``{"commit_seq", "entries", "next_after", "has_more"}`` in
+        that key order: ``entries`` holds the up-to-*limit* entries with
+        ``commit_seq > after`` in ascending order (each entry keeps its
+        ``commit_seq``/``state_hash``/``prev_hash``/``hash`` key order),
+        ``next_after`` is *after* for an empty page and the last returned
+        entry's generation otherwise, and ``has_more`` tells whether further
+        entries follow the page. ``commit_seq`` is the current committed
+        generation, identical to the full history report's tail.
+        """
+        report = self._integrity_history_report()
+        page = [entry for entry in report["entries"]
+                if entry["commit_seq"] > after][:limit]
+        if page:
+            next_after = page[-1]["commit_seq"]
+        else:
+            next_after = after
+        # Entries ascend strictly to the verified tail, so any generation
+        # beyond next_after means a successor exists.
+        has_more = report["commit_seq"] > next_after
+        return {"commit_seq": report["commit_seq"],
+                "entries": page,
+                "next_after": next_after,
+                "has_more": has_more}
