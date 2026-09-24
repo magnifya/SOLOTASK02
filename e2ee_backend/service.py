@@ -1408,3 +1408,45 @@ class DeviceService:
                 "committed since the integrity log was introduced",
                 "data_file", status_code=409)
         return report
+
+    def persistence_integrity_history_page(self, after: int,
+                                           limit: int) -> Dict[str, Any]:
+        """Read-only ascending page of the integrity-history sidecar.
+
+        ``after`` must be a non-negative integer (0 replays from the first
+        entry) and ``limit`` an integer in 1..100 (the HTTP layer defaults
+        them to 0 and 100). Availability and verification are identical to
+        :meth:`persistence_integrity_history`: 409/field=data_file without
+        the ``integrity_log_version`` marker (in-memory or not-yet-migrated
+        file), and 503/field=data_file for any parse/version/generation/
+        chain/hash/read failure. On success returns
+        ``{"commit_seq", "entries", "next_after", "has_more"}`` in that key
+        order — the verified entries with ``commit_seq > after`` (ascending,
+        at most ``limit``), ``next_after`` equal to *after* on an empty page
+        and otherwise the last entry's generation, and ``has_more`` saying
+        whether a later entry exists. The probe changes nothing.
+        """
+        if not isinstance(after, int) or isinstance(after, bool) or after < 0:
+            raise ServiceError(
+                "field must be a non-negative integer: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        if self.integrity_state_store is None:
+            raise ServiceError(
+                "persistence is not enabled; start the server with a data "
+                "file to inspect state integrity history",
+                "data_file", status_code=409)
+        try:
+            report = self.integrity_state_store.history_page_report(
+                self.store, after, limit)
+        except IntegrityCheckError as error:
+            raise ServiceError(str(error), "data_file",
+                               status_code=503) from None
+        if report is None:
+            raise ServiceError(
+                "integrity history is not enabled; the state file has not "
+                "committed since the integrity log was introduced",
+                "data_file", status_code=409)
+        return report

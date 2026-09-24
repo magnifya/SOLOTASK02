@@ -84,7 +84,9 @@ document records the format with ``integrity_log_version=1``; a legacy file
 without that marker and without a sidecar still starts and anchors the chain
 on its first commit, while any marker/sidecar disagreement or a broken /
 tail-mismatched chain makes startup refuse with both files untouched. The
-sidecar backs ``GET /v1/persistence/integrity/history``.
+sidecar backs ``GET /v1/persistence/integrity/history`` and its ascending,
+cursor-paged variant ``GET /v1/persistence/integrity/history/page``
+(``commit_seq > after``, at most ``limit``).
 """
 from __future__ import annotations
 
@@ -1026,6 +1028,63 @@ class JsonStateStore:
         parse/chain/hash/tail failure raises :class:`IntegrityCheckError`
         (mapped to 503/field=data_file) without writing anything.
         """
+        verified = self._verified_history(store)
+        if verified is None:
+            return None
+        commit_seq, entries = verified
+        return {"commit_seq": commit_seq,
+                "entries": copy.deepcopy(entries)}
+
+    def history_page_report(self, store: "DeviceStore", after: int,
+                            limit: int) -> Optional[Dict[str, Any]]:
+        """Read-only paged integrity-history probe backing
+        ``GET /v1/persistence/integrity/history/page``.
+
+        Marker/verification semantics are identical to
+        :meth:`history_report`: ``None`` means no
+        ``integrity_log_version`` marker (the service answers
+        409/field=data_file) and any parse/version/generation/chain/hash/tail
+        or read failure raises :class:`IntegrityCheckError` (503/data_file),
+        all under the store lock shared with every commit and without
+        writing anything.
+
+        The page is the verified entries with ``commit_seq > after`` in
+        ascending order, at most *limit*. On success returns
+        ``{"commit_seq", "entries", "next_after", "has_more"}`` in that key
+        order: ``commit_seq`` is the current committed generation (the tail),
+        ``next_after`` is *after* unchanged on an empty page and otherwise
+        the last returned entry's generation, and ``has_more`` says whether a
+        verified entry follows that page. ``entries`` keeps each entry's
+        ``commit_seq``/``state_hash``/``prev_hash``/``hash`` order.
+        """
+        verified = self._verified_history(store)
+        if verified is None:
+            return None
+        commit_seq, entries = verified
+        page = [entry for entry in entries
+                if entry["commit_seq"] > after][:limit]
+        next_after = page[-1]["commit_seq"] if page else after
+        has_more = any(entry["commit_seq"] > next_after for entry in entries)
+        return {"commit_seq": commit_seq,
+                "entries": copy.deepcopy(page),
+                "next_after": next_after,
+                "has_more": has_more}
+
+    def _verified_history(
+            self, store: "DeviceStore"
+    ) -> Optional[Tuple[int, List[Dict[str, Any]]]]:
+        """Verify the state document and sidecar and return ``(seq, entries)``.
+
+        Shared by :meth:`history_report` and :meth:`history_page_report`.
+        Returns ``None`` when the state document carries no
+        ``integrity_log_version`` marker (a decision made from the envelope
+        alone). With the marker, the document is fully verified
+        (parse/version/generation/semantic/snapshot against the live store)
+        and the sidecar is read and fully verified under the store lock
+        shared with every commit; its last entry must carry the current
+        committed generation and the live committed state's canonical hash.
+        Any failure raises :class:`IntegrityCheckError`; nothing is written.
+        """
         def parse_state() -> Tuple[Dict[str, Any], int, Any]:
             try:
                 with open(self.path, "rb") as handle:
@@ -1108,8 +1167,7 @@ class JsonStateStore:
                 raise IntegrityCheckError(
                     "integrity log last entry state_hash does not match the "
                     "current state hash")
-        return {"commit_seq": commit_seq,
-                "entries": copy.deepcopy(entries)}
+        return commit_seq, entries
 
 
 def _directory_fsync_unsupported(error: OSError) -> bool:

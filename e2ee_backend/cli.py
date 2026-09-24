@@ -374,6 +374,19 @@ def build_parser() -> argparse.ArgumentParser:
                            help="base64-encoded ciphertext with appended GCM tag")
     p_decrypt.set_defaults(handler=cmd_decrypt_message)
 
+    p_integrity_history_page = sub.add_parser(
+        "integrity-history-page",
+        help="page through the append-only persistence integrity history")
+    p_integrity_history_page.add_argument(
+        "--after", type=int, default=0,
+        help="return entries with commit_seq strictly after this generation "
+             "(default: 0)")
+    p_integrity_history_page.add_argument(
+        "--limit", type=int, default=100,
+        help="maximum number of entries to return, 1..100 (default: 100)")
+    p_integrity_history_page.set_defaults(
+        handler=cmd_integrity_history_page)
+
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
@@ -929,6 +942,25 @@ def cmd_message_status(args: argparse.Namespace) -> int:
     url = (f"{args.base_url}/v1/messages/"
            f"{quote(args.session_id, safe='')}/status/"
            f"{quote(args.message_id, safe='')}?{query}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_integrity_history_page(args: argparse.Namespace) -> int:
+    """Call GET /v1/persistence/integrity/history/page and print one JSON line.
+
+    Success (200) prints the server's compact page on stdout and exits 0;
+    any API failure (400/409/503/…) prints the server's single-line JSON on
+    stderr and exits non-zero; a connection failure prints one stderr JSON
+    line with field=server and exits non-zero.
+    """
+    from urllib.parse import urlencode
+
+    query = urlencode({"after": args.after, "limit": args.limit})
+    url = (f"{args.base_url}/v1/persistence/integrity/history/page?{query}")
     try:
         status, response = _request_json("GET", url)
     except ServerUnavailable:

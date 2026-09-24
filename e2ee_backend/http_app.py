@@ -20,6 +20,8 @@ _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 _PERSISTENCE_INTEGRITY_PATH = "/v1/persistence/integrity"
 _PERSISTENCE_INTEGRITY_HISTORY_PATH = "/v1/persistence/integrity/history"
+_PERSISTENCE_INTEGRITY_HISTORY_PAGE_PATH = \
+    "/v1/persistence/integrity/history/page"
 
 #: Sentinel meaning a 400 for a malformed body was already sent.
 _BAD_REQUEST = object()
@@ -191,7 +193,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
 
     def _route_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path == _PERSISTENCE_INTEGRITY_HISTORY_PATH:
+        if path == _PERSISTENCE_INTEGRITY_HISTORY_PAGE_PATH:
+            self._handle_persistence_integrity_history_page()
+        elif path == _PERSISTENCE_INTEGRITY_HISTORY_PATH:
             self._handle_persistence_integrity_history()
         elif path == _PERSISTENCE_INTEGRITY_PATH:
             self._handle_persistence_integrity()
@@ -281,6 +285,26 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_persistence_integrity_history(self) -> None:
         try:
             body = self.service.persistence_integrity_history()
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_persistence_integrity_history_page(self) -> None:
+        # keep_blank_values so an explicit ``after=``/``limit=`` is an empty
+        # (hence malformed, 400) value rather than silently defaulting.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        after = self._decimal_nonneg_param(query, "after", default=0)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.persistence_integrity_history_page(
+                after, limit)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
@@ -706,6 +730,38 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"message": f"{name} must be an integer",
                                   "field": name})
             return None
+        if value < minimum or (maximum is not None and value > maximum):
+            self._send_json(400, {"message": f"{name} is out of range",
+                                  "field": name})
+            return None
+        return value
+
+    def _decimal_nonneg_param(self, query: Dict[str, list], name: str,
+                              default: int, minimum: int = 0,
+                              maximum: Optional[int] = None) -> Optional[int]:
+        """Parse one strict decimal non-negative integer query parameter.
+
+        Unlike :meth:`_int_param`, the value must be one or more ASCII
+        decimal digits and nothing else — no sign, whitespace, leading
+        ``+``/``-``, decimal point or hex prefix — so strings Python's
+        ``int()`` would otherwise accept (``" 1"``, ``"+1"``, ``"01 "``) are
+        refused. Sends a 400 and returns ``None`` when the parameter is
+        repeated, empty, not a strict decimal integer, or outside
+        *minimum*..*maximum*; an absent parameter yields *default*.
+        """
+        values = query.get(name)
+        if not values:
+            return default
+        if len(values) != 1:
+            self._send_json(400, {"message": f"{name} must appear at most once",
+                                  "field": name})
+            return None
+        text = values[0]
+        if not text or not all("0" <= ch <= "9" for ch in text):
+            self._send_json(400, {"message": f"{name} must be a decimal integer",
+                                  "field": name})
+            return None
+        value = int(text)
         if value < minimum or (maximum is not None and value > maximum):
             self._send_json(400, {"message": f"{name} is out of range",
                                   "field": name})
