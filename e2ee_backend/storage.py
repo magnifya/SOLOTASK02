@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -458,6 +459,12 @@ class DeviceStore:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        # Condition bound to the store lock. Read-only long polls (the inbox
+        # wait) block on it without holding the lock between wakeups, while
+        # every committed mutation notifies it once, so a wait is woken
+        # promptly when a message could become deliverable or a device is
+        # revoked. It carries no state of its own and is never persisted.
+        self._condition = threading.Condition(self._lock)
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
@@ -520,6 +527,12 @@ class DeviceStore:
 
     def _notify_change(self) -> None:
         """Invoke the persistence hook after a committed mutation."""
+        # Wake long-polling inbox waits first: the mutation has been applied
+        # to the in-memory state under this lock, so a waiter released here
+        # can immediately re-observe it. The wake is harmless if the
+        # persistence hook then fails and rolls the mutation back: the waiter
+        # rechecks under the lock and simply waits again.
+        self._condition.notify_all()
         # Any change that will be persisted first closes the legacy gap:
         # anchor every chainless device in the same locked transaction.
         self._migrate_pending_anchors()
@@ -2260,6 +2273,55 @@ class DeviceStore:
                 "messages": [self.message_view(entry[2]) for entry in page],
                 "has_more": len(entries) > limit,
             }
+
+    def device_inbox_wait(self, device_id: str, limit: int,
+                          timeout_ms: int) -> Dict[str, Any]:
+        """Long-polling variant of :meth:`device_inbox` (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox/wait``. Under the store lock, if
+        the device already has at least one unacked 1:1 message, the first
+        *limit* entries are returned immediately, exactly as
+        :meth:`device_inbox` would. Otherwise the caller waits — **without**
+        holding the lock, so message submission, ack and revocation stay
+        unblocked — on the store condition until a committed mutation makes a
+        message deliverable, the device is revoked, or *timeout_ms*
+        milliseconds (measured against a monotonic clock) elapse. After every
+        wakeup and once more at the deadline the state is rechecked under the
+        lock, revocation taking priority over message delivery. Only a
+        still-empty snapshot at the deadline answers ``200`` with
+        ``messages`` empty and ``has_more`` false. Nothing is written: no
+        persistence notification is produced by the wait itself, no
+        ``commit_seq`` generation is consumed, and no cursor, lease, attempt
+        count or sidecar is touched. The device must exist and not be revoked
+        (both mapped to 409/device_id by the service).
+        """
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        with self._condition:
+            while True:
+                device = self._find_device(device_id)
+                if device is None:
+                    raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+                if device.revoked:
+                    raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+                entries = self._inbox_entries_locked(device_id)
+                if entries:
+                    page = entries[:limit]
+                    return {
+                        "device_id": device_id,
+                        "messages": [self.message_view(entry[2])
+                                     for entry in page],
+                        "has_more": len(entries) > limit,
+                    }
+                # Nothing deliverable yet: release the lock and block until a
+                # committed mutation notifies, then recheck under the lock.
+                # wait_for needs a predicate; wait() with the remaining budget
+                # gives the explicit deadline recheck the spec calls for. A
+                # non-positive remaining budget is 0.0 (return immediately).
+                remaining = max(deadline - time.monotonic(), 0.0)
+                if remaining <= 0.0:
+                    return {"device_id": device_id, "messages": [],
+                            "has_more": False}
+                self._condition.wait(remaining)
 
     def inbox_claim(
             self, device_id: str, lease_id: str, limit: int
