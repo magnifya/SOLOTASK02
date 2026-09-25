@@ -333,8 +333,14 @@ class RedeliveryJob:
     outcome (``delivered`` -> ``succeeded``, ``failed`` -> ``failed``) in the
     same locked transaction. An ``op=recover`` may re-lease a running job
     whose dispatch lease expired or was released; each committed recovery is
-    recorded, in order, in ``recoveries``. Only identifiers and the state
-    machine are retained.
+    recorded, in order, in ``recoveries``. An ``op=cancel`` moves a
+    ``pending`` or ``running`` job to the terminal ``cancelled`` state, releasing
+    a running job's current lease so its messages can be claimed again; the
+    client-chosen ``cancellation_id`` (the idempotency key of the cancel) and
+    the UTC ``cancelled_at`` timestamp are frozen on the job so a replay of
+    the same id returns its first response. Both are ``None`` while the job
+    was never cancelled. Only identifiers and the state machine are
+    retained.
     """
 
     job_id: str
@@ -342,6 +348,8 @@ class RedeliveryJob:
     state: str = "pending"
     lease_id: Optional[str] = None
     recoveries: List[RedeliveryJobRecovery] = field(default_factory=list)
+    cancellation_id: Optional[str] = None
+    cancelled_at: Optional[str] = None
 
 
 @dataclass

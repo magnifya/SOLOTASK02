@@ -175,11 +175,13 @@ REDELIVERY_JOB_PENDING = "pending"
 REDELIVERY_JOB_RUNNING = "running"
 REDELIVERY_JOB_SUCCEEDED = "succeeded"
 REDELIVERY_JOB_FAILED = "failed"
+REDELIVERY_JOB_CANCELLED = "cancelled"
 REDELIVERY_JOB_STATES = frozenset({
     REDELIVERY_JOB_PENDING,
     REDELIVERY_JOB_RUNNING,
     REDELIVERY_JOB_SUCCEEDED,
     REDELIVERY_JOB_FAILED,
+    REDELIVERY_JOB_CANCELLED,
 })
 
 #: Outcome codes for a 1:1-inbox redelivery job submission.
@@ -204,6 +206,13 @@ REDELIVERY_JOB_RECOVERY_STATE = "job_not_recoverable"
 #: recoveries; the batch is atomic, so a partial replay conflicts
 #: (409/items[i].recovery_id of the first replayed item).
 REDELIVERY_JOB_RECOVERY_PARTIAL_REPLAY = "partial_replay"
+#: A cancel named a cancellation_id different from the one the already
+#: cancelled job committed (409/cancellation_id). Ids are scoped to one job.
+REDELIVERY_JOB_CANCELLATION_CONFLICT = "cancellation_id_conflict"
+#: A cancel targeted a job already in a terminal state
+#: (``succeeded``/``failed``; an already ``cancelled`` job is handled by the
+#: replay/conflict rules above) — 409/job_id.
+REDELIVERY_JOB_CANCEL_STATE = "job_not_cancellable"
 
 #: Number of inbox messages one redelivery-job dispatch leases at most.
 REDELIVERY_JOB_DISPATCH_LIMIT = 100
@@ -3251,6 +3260,80 @@ class DeviceStore:
             self._notify_change()
             return self.redelivery_job_view(job), 201
 
+    def redelivery_job_cancel(
+            self, device_id: str, job_id: str, cancellation_id: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Cancel a pending or running redelivery job.
+
+        ``POST /v1/inbox-jobs`` with ``op=cancel`` (the non-empty
+        *cancellation_id* is already validated by the service). Under the
+        one store lock — shared with lease claims, completions, recoveries,
+        acks and revocation — the device is resolved first
+        (unknown/revoked -> ``device_unknown``/``device_inactive``,
+        409/device_id), then the job: a never-queued id raises
+        ``job_not_found`` (404/job_id) and an id committed for another
+        device raises ``job_id_conflict`` (409/job_id).
+
+        An already ``cancelled`` job replays: the same *cancellation_id*
+        returns the job's current view with 200 and writes nothing, while a
+        different one raises ``cancellation_id_conflict``
+        (409/cancellation_id). A terminal ``succeeded``/``failed`` job
+        raises ``job_not_cancellable`` (409/job_id).
+
+        A first cancel of a ``pending`` or ``running`` job moves it to the
+        terminal ``cancelled`` state (201, one persistence notification,
+        commit_seq + 1): the *cancellation_id* and the UTC ``cancelled_at``
+        timestamp (six microsecond digits, ``+00:00``) are frozen on the
+        job. A running job's current lease is released in the same
+        transaction — stamped with the same timestamp on every delivery
+        record it lives on — so its messages can be claimed again; the job
+        keeps that lease id in its view (a cancelled ``pending`` job never
+        held one and keeps ``lease_id`` null). Returns ``(body,
+        status_code)`` with the body keys ``job_id``, ``device_id``,
+        ``state``, ``lease_id`` in that order.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_INACTIVE)
+            job = self._redelivery_jobs.get(job_id)
+            if job is not None and job.device_id != device_id:
+                raise RedeliveryJobError(REDELIVERY_JOB_CONFLICT)
+            if job is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_NOT_FOUND)
+            if job.state == REDELIVERY_JOB_CANCELLED:
+                # The cancellation_id is the job-scoped idempotency key of
+                # the cancel: an exact replay answers the current view
+                # (200) and writes nothing; a different id conflicts.
+                if job.cancellation_id == cancellation_id:
+                    return self.redelivery_job_view(job), 200
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_CANCELLATION_CONFLICT)
+            if job.state != REDELIVERY_JOB_PENDING \
+                    and job.state != REDELIVERY_JOB_RUNNING:
+                raise RedeliveryJobError(REDELIVERY_JOB_CANCEL_STATE)
+            cancelled_at = datetime.now(timezone.utc) \
+                .isoformat(timespec="microseconds")
+            if job.state == REDELIVERY_JOB_RUNNING \
+                    and job.lease_id is not None:
+                # Release the current lease so its messages can be claimed
+                # again; the lease stays on the records as history. The
+                # lease copies are identical, so the same timestamp lands
+                # on every record the lease was taken on (an already
+                # released lease keeps its first release timestamp).
+                for state in self._delivery.values():
+                    for lease in state.leases:
+                        if lease.lease_id == job.lease_id \
+                                and lease.released_at is None:
+                            lease.released_at = cancelled_at
+            job.state = REDELIVERY_JOB_CANCELLED
+            job.cancellation_id = cancellation_id
+            job.cancelled_at = cancelled_at
+            self._notify_change()
+            return self.redelivery_job_view(job), 201
+
     def _redelivery_job_apply_recovery_locked(
             self, job: RedeliveryJob, recovery_id: str, now: datetime,
             leased_until: str) -> None:
@@ -4042,10 +4125,12 @@ class DeviceStore:
             } for r in self._message_submissions.values()]
             redelivery_jobs = []
             for job in self._redelivery_jobs.values():
-                # New writes always carry the fixed five keys; an empty
-                # recovery history serializes as []. Older four-key items
-                # (written before the key existed) still load as an empty
-                # history.
+                # New writes always carry the fixed seven keys; an empty
+                # recovery history serializes as [] and a never-cancelled
+                # job carries null cancellation_id/cancelled_at. Older
+                # four/five-key items (written before the later keys
+                # existed) still load as an empty history with no
+                # cancellation.
                 redelivery_jobs.append({
                     "job_id": job.job_id,
                     "device_id": job.device_id,
@@ -4055,6 +4140,8 @@ class DeviceStore:
                         "recovery_id": record.recovery_id,
                         "lease_id": record.lease_id,
                     } for record in job.recoveries],
+                    "cancellation_id": job.cancellation_id,
+                    "cancelled_at": job.cancelled_at,
                 })
             key_events = [
                 self.key_event_view(event)
@@ -5438,7 +5525,7 @@ class DeviceStore:
         # 1:1-inbox redelivery jobs. Older version-1 files predate the
         # section: it is absent and treated as empty. A present section is
         # fully validated — job_id unique, device_id a registered device,
-        # state one of the four wire values, lease_id null or a lease that
+        # state one of the five wire values, lease_id null or a lease that
         # exists, is owned by the job's device and agrees with the state
         # machine — together with the optional per-job ``recoveries``
         # history (absent on older items means empty): each record carries
@@ -5446,7 +5533,11 @@ class DeviceStore:
         # globally unique across every job's recovery history, lease_id is
         # null (an empty recovery that ended the job) or a non-empty string
         # equal to its recovery_id whose inbox lease exists and belongs to
-        # the job's device. The state machine is checked in both
+        # the job's device. The optional ``cancellation_id``/``cancelled_at``
+        # keys (absent on older items means null) freeze the job's cancel:
+        # both null on a never-cancelled job, or — exactly when the state is
+        # ``cancelled`` — a non-empty string id and a canonical UTC
+        # timestamp. The state machine is checked in both
         # directions: a pending job has neither a lease nor recoveries; a
         # running job's current lease is its dispatch lease (the job_id)
         # with no recovery history, or the uncompleted lease of the last
@@ -5454,11 +5545,13 @@ class DeviceStore:
         # lease, carries a lease completed ``delivered`` (its dispatch
         # lease without recoveries, or the last recovery lease), or ended
         # on an empty recovery (last record lease_id null, no current
-        # lease); a failed job's current lease completed ``failed``; every
-        # earlier recovery lease must be uncompleted (it expired or was
-        # released before the next recovery and never terminated the job).
-        # Any contradiction refuses startup rather than silently dropping
-        # the job state machine.
+        # lease); a failed job's current lease completed ``failed``; a
+        # cancelled job either never dispatched a lease (cancelled while
+        # pending) or carries its last current lease released and
+        # uncompleted; every earlier recovery lease must be uncompleted (it
+        # expired or was released before the next recovery and never
+        # terminated the job). Any contradiction refuses startup rather
+        # than silently dropping the job state machine.
         redelivery_jobs: Dict[str, RedeliveryJob] = {}
         recovery_ids_seen: Set[str] = set()
         for index, raw in enumerate(raw_redelivery_jobs):
@@ -5493,6 +5586,35 @@ class DeviceStore:
             if j_device_id not in device_index:
                 raise ValueError(
                     f"{where} references an unknown device: {j_device_id}")
+            # Per-job cancellation. Older items predate the two keys: absent
+            # means null (never cancelled). A present cancellation_id must
+            # be null or a non-empty string; a present cancelled_at must be
+            # null or a canonical UTC timestamp. The pair is exactly
+            # correlated with the cancelled state: a cancelled job carries
+            # both, every other state carries neither.
+            j_cancellation_id = raw.get("cancellation_id")
+            j_cancelled_at = raw.get("cancelled_at")
+            if j_cancellation_id is not None and not (
+                    isinstance(j_cancellation_id, str)
+                    and j_cancellation_id):
+                raise ValueError(
+                    f"{where}.cancellation_id must be null or a non-empty "
+                    f"string")
+            if j_cancelled_at is not None \
+                    and not _is_utc_microsecond_iso(j_cancelled_at):
+                raise ValueError(
+                    f"{where}.cancelled_at must be null or a UTC ISO-8601 "
+                    f"timestamp with six microsecond digits and a +00:00 "
+                    f"offset")
+            if j_state == REDELIVERY_JOB_CANCELLED:
+                if j_cancellation_id is None or j_cancelled_at is None:
+                    raise ValueError(
+                        f"{where} is cancelled but lacks its "
+                        f"cancellation_id/cancelled_at")
+            elif j_cancellation_id is not None \
+                    or j_cancelled_at is not None:
+                raise ValueError(
+                    f"{where} is {j_state} but carries a cancellation")
             # Per-job recovery history. Older items predate the key: it is
             # absent and treated as empty. A present value must be a list
             # of well-formed records with globally unique recovery ids.
@@ -5567,7 +5689,7 @@ class DeviceStore:
                         raise ValueError(
                             f"{where} is succeeded but its lease did not "
                             f"complete 'delivered'")
-                else:  # REDELIVERY_JOB_FAILED
+                elif j_state == REDELIVERY_JOB_FAILED:
                     if j_lease_id is None or dispatch_binding is None \
                             or dispatch_binding[0] != j_device_id \
                             or dispatch_completion is None \
@@ -5575,6 +5697,20 @@ class DeviceStore:
                         raise ValueError(
                             f"{where} is failed but its lease did not "
                             f"complete 'failed'")
+                elif j_state == REDELIVERY_JOB_CANCELLED:
+                    # Cancelled while pending (no lease) or while running:
+                    # the dispatch lease exists, belongs to this device,
+                    # was never completed and is now released.
+                    if j_lease_id is not None and (
+                            j_lease_id != j_job_id
+                            or dispatch_binding is None
+                            or dispatch_binding[0] != j_device_id
+                            or dispatch_completion is not None
+                            or dispatch_binding[3] is None):
+                        raise ValueError(
+                            f"{where} is cancelled but its dispatch lease "
+                            f"is not a released, uncompleted lease owned "
+                            f"by {j_device_id}")
             else:
                 # A recovery history implies the job was dispatched: the
                 # dispatch lease exists, belongs to this device and was
@@ -5650,7 +5786,7 @@ class DeviceStore:
                             raise ValueError(
                                 f"{where} is succeeded but its recovery "
                                 f"lease did not complete 'delivered'")
-                else:  # REDELIVERY_JOB_FAILED
+                elif j_state == REDELIVERY_JOB_FAILED:
                     if last_record.lease_id is None \
                             or j_lease_id != last_record.lease_id:
                         raise ValueError(
@@ -5663,9 +5799,28 @@ class DeviceStore:
                         raise ValueError(
                             f"{where} is failed but its recovery lease did "
                             f"not complete 'failed'")
+                else:  # REDELIVERY_JOB_CANCELLED
+                    # Cancelled while running on its latest recovery lease:
+                    # that lease is the job's current lease_id, was never
+                    # completed and is now released.
+                    if last_record.lease_id is None \
+                            or j_lease_id != last_record.lease_id:
+                        raise ValueError(
+                            f"{where} is cancelled but its lease_id does "
+                            f"not match its latest recovery lease")
+                    last_binding = lease_index.get(j_lease_id)
+                    if last_binding is None \
+                            or last_binding[5] is not None \
+                            or last_binding[3] is None:
+                        raise ValueError(
+                            f"{where} is cancelled but its current "
+                            f"recovery lease is missing, completed or not "
+                            f"released")
             redelivery_jobs[j_job_id] = RedeliveryJob(
                 job_id=j_job_id, device_id=j_device_id, state=j_state,
-                lease_id=j_lease_id, recoveries=recoveries)
+                lease_id=j_lease_id, recoveries=recoveries,
+                cancellation_id=j_cancellation_id,
+                cancelled_at=j_cancelled_at)
 
         # Per-device group-session delivery records. Older version-1 files
         # predate the section: it is absent and treated as empty. A present

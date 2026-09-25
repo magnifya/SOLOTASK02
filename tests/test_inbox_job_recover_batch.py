@@ -116,6 +116,30 @@ class InboxJobRecoverBatchServiceTest(_BatchMixin, unittest.TestCase):
             self.assertEqual((error.status_code, error.field),
                              (400, field), items)
 
+    def test_item_with_extra_keys_rejected(self) -> None:
+        # An item may only carry job_id and recovery_id; any other key is
+        # 400/items[i] and aborts the batch before anything is written.
+        self._two_running_jobs()
+        cases = (
+            [{"job_id": "j1", "recovery_id": "r1", "extra": 1}],
+            [{"job_id": "j1", "recovery_id": "r1", "op": "recover"}],
+            [{"job_id": "j1", "recovery_id": "r1",
+              "cancellation_id": "c1"}],
+            [{"job_id": "j1", "recovery_id": "r1"},
+             {"job_id": "j2", "recovery_id": "r2", "extra": None}],
+        )
+        for items in cases:
+            index = 1 if len(items) > 1 else 0
+            error = self._error(lambda items=items: self._batch(items=items))
+            self.assertEqual((error.status_code, error.field),
+                             (400, f"items[{index}]"), items)
+        # Nothing was recovered: both jobs are still running on their
+        # dispatch leases.
+        for job_id in ("j1", "j2"):
+            body, _ = self._job(job_id=job_id, op="status")
+            self.assertEqual((body["state"], body["lease_id"]),
+                             ("running", job_id))
+
     def test_duplicate_job_id_or_recovery_id_rejected(self) -> None:
         items = [{"job_id": "j1", "recovery_id": "r1"},
                  {"job_id": "j1", "recovery_id": "r2"}]
@@ -381,7 +405,9 @@ class InboxJobRecoverBatchPersistenceTest(_BatchMixin, unittest.TestCase):
                  for item in document["redelivery_jobs"]}
         for item in items.values():
             self.assertEqual(list(item), ["job_id", "device_id", "state",
-                                          "lease_id", "recoveries"])
+                                          "lease_id", "recoveries",
+                                          "cancellation_id",
+                                          "cancelled_at"])
         self.assertEqual(items["pending"]["recoveries"], [])
         self.assertEqual(items["j1"]["recoveries"], [
             {"recovery_id": "r1", "lease_id": "r1"}])

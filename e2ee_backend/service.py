@@ -77,6 +77,8 @@ from .storage import (
     INBOX_LEASE_NOT_FOUND,
     INBOX_LEASE_UNAVAILABLE,
     PREKEY_CONFLICT,
+    REDELIVERY_JOB_CANCEL_STATE,
+    REDELIVERY_JOB_CANCELLATION_CONFLICT,
     REDELIVERY_JOB_CONFLICT,
     REDELIVERY_JOB_DEVICE_INACTIVE,
     REDELIVERY_JOB_DEVICE_UNKNOWN,
@@ -1810,13 +1812,17 @@ class DeviceService:
 
         ``POST /v1/inbox-jobs``. The body must be a JSON object carrying
         non-empty strings ``device_id``, ``job_id`` and ``op``, with ``op``
-        one of ``queue``, ``dispatch``, ``status`` or ``recover``. A
-        bad/non-object body is 400/field ``request_body``; a missing,
-        empty or wrongly typed field is 400 with the corresponding ``field``
-        (``device_id`` / ``job_id`` / ``op``), as is an ``op`` outside the
-        four verbs. A ``recover`` additionally requires a non-empty string
-        ``recovery_id``; it missing, empty or wrongly typed is
-        400/field ``recovery_id``.
+        one of ``queue``, ``dispatch``, ``status``, ``recover`` or
+        ``cancel``. A bad/non-object body is 400/field ``request_body``; a
+        missing, empty or wrongly typed field is 400 with the corresponding
+        ``field`` (``device_id`` / ``job_id`` / ``op``), as is an ``op``
+        outside the five verbs. A ``recover`` additionally requires a
+        non-empty string ``recovery_id``; it missing, empty or wrongly
+        typed is 400/field ``recovery_id``. A ``cancel`` likewise requires
+        a non-empty string ``cancellation_id`` (400/field
+        ``cancellation_id``) and admits no other keys beyond the three
+        common ones and ``cancellation_id``: any extra key is 400 with that
+        key as the ``field``.
 
         The device must be registered and not revoked, else 409/field
         ``device_id`` (checked in the store under the lock, ahead of the
@@ -1847,6 +1853,19 @@ class DeviceService:
         ``lease_id``), or ends the job ``succeeded`` with ``lease_id``
         null when nothing remains — both 201. The response keys are
         ``job_id``, ``device_id``, ``state``, ``lease_id`` in that order.
+
+        ``cancel`` moves a ``pending`` or ``running`` job to the terminal
+        ``cancelled`` state (201), releasing a running job's current lease
+        in the same locked transaction so its messages can be claimed
+        again; a cancelled ``pending`` job answers ``lease_id`` null, a
+        cancelled ``running`` job keeps the released lease's id. Replaying
+        the same ``cancellation_id`` on the cancelled job returns its
+        current view (200) without writing; a different ``cancellation_id``
+        is 409/field ``cancellation_id``; a terminal
+        ``succeeded``/``failed`` job is 409/field ``job_id``. Unknown and
+        cross-device jobs are 404/409/field ``job_id`` as with the other
+        ops, and the device gate (unknown/revoked -> 409/field
+        ``device_id``) is checked first.
         """
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object",
@@ -1858,10 +1877,10 @@ class DeviceService:
                 raise ServiceError(
                     f"field must be a non-empty string: {name}", name)
         op = payload["op"]
-        if op not in ("queue", "dispatch", "status", "recover"):
+        if op not in ("queue", "dispatch", "status", "recover", "cancel"):
             raise ServiceError(
-                "field must be one of 'queue', 'dispatch', 'status' or "
-                "'recover': op",
+                "field must be one of 'queue', 'dispatch', 'status', "
+                "'recover' or 'cancel': op",
                 "op")
         recovery_id = None
         if op == "recover":
@@ -1873,10 +1892,31 @@ class DeviceService:
                     "field must be a non-empty string: recovery_id",
                     "recovery_id")
             recovery_id = payload["recovery_id"]
+        cancellation_id = None
+        if op == "cancel":
+            if "cancellation_id" not in payload:
+                raise ServiceError(
+                    "missing required field: cancellation_id",
+                    "cancellation_id")
+            if not is_nonempty_string(payload["cancellation_id"]):
+                raise ServiceError(
+                    "field must be a non-empty string: cancellation_id",
+                    "cancellation_id")
+            cancellation_id = payload["cancellation_id"]
+            # A cancel body carries exactly the three common keys plus
+            # cancellation_id; any other key is rejected by name.
+            for key in payload:
+                if key not in ("device_id", "job_id", "op",
+                               "cancellation_id"):
+                    raise ServiceError(
+                        f"unexpected field in cancel body: {key}", key)
         try:
             if op == "recover":
                 return self.store.redelivery_job_recover(
                     payload["device_id"], payload["job_id"], recovery_id)
+            if op == "cancel":
+                return self.store.redelivery_job_cancel(
+                    payload["device_id"], payload["job_id"], cancellation_id)
             return self.store.redelivery_job_submit(
                 payload["device_id"], payload["job_id"], op)
         except RedeliveryJobError as error:
@@ -1896,6 +1936,15 @@ class DeviceService:
                 raise ServiceError(
                     "only a running job with an expired or released lease "
                     "can be recovered", "job_id", status_code=409)
+            if error.reason == REDELIVERY_JOB_CANCELLATION_CONFLICT:
+                raise ServiceError(
+                    "cancellation_id does not match the cancellation "
+                    "committed on this job", "cancellation_id",
+                    status_code=409)
+            if error.reason == REDELIVERY_JOB_CANCEL_STATE:
+                raise ServiceError(
+                    "only a pending or running job can be cancelled",
+                    "job_id", status_code=409)
             if error.reason in (REDELIVERY_JOB_CONFLICT,
                                 REDELIVERY_JOB_LEASE_OCCUPIED):
                 raise ServiceError(
@@ -1914,13 +1963,15 @@ class DeviceService:
         ``POST /v1/inbox-jobs/recover-batch``. The body must be a JSON
         object carrying a non-empty string ``device_id`` and a non-empty
         ``items`` array; each item is an object with a non-empty string
-        ``job_id`` and ``recovery_id``, and neither field may repeat across
-        items. Shape errors are reported, in order, as 400/field
-        ``request_body`` (bad/non-object body), ``device_id``
-        (missing/empty/non-string), ``items`` (missing/not-a-non-empty
-        array), ``items[i]`` (non-object element or a repeated
-        ``job_id``/``recovery_id``) or ``items[i].job_id`` /
-        ``items[i].recovery_id`` for the offending field.
+        ``job_id`` and ``recovery_id`` and no other keys, and neither
+        field may repeat across items. Shape errors are reported, in
+        order, as 400/field ``request_body`` (bad/non-object body),
+        ``device_id`` (missing/empty/non-string), ``items``
+        (missing/not-a-non-empty array), ``items[i]`` (non-object
+        element, an element carrying keys beyond ``job_id``/
+        ``recovery_id``, or a repeated ``job_id``/``recovery_id``) or
+        ``items[i].job_id`` / ``items[i].recovery_id`` for the offending
+        field.
 
         The device is then resolved (unknown/revoked -> 409/field
         ``device_id``) and every item is prechecked in array order with the
@@ -1969,6 +2020,13 @@ class DeviceService:
                 raise ServiceError(
                     f"array element must be an object: {item_field}",
                     item_field)
+            # An item carries exactly job_id and recovery_id; any other
+            # key rejects the whole batch as 400/items[i].
+            for key in element:
+                if key not in ("job_id", "recovery_id"):
+                    raise ServiceError(
+                        f"unexpected field in array element: {item_field}",
+                        item_field)
             job_field = f"{item_field}.job_id"
             if "job_id" not in element:
                 raise ServiceError(

@@ -302,8 +302,9 @@ class InboxJobRecoverPersistenceTest(InboxMixin, unittest.TestCase):
         self.assertEqual(self.state_store.commit_seq, before + 1)
 
     def test_state_file_shape(self) -> None:
-        # New writes always carry the fixed five keys; an empty recovery
-        # history serializes as [].
+        # New writes always carry the fixed seven keys; an empty recovery
+        # history serializes as [] and a never-cancelled job carries null
+        # cancellation_id/cancelled_at.
         self._job(job_id="pending")
         self._dispatch(job_id="j1")
         self._expire("j1")
@@ -316,12 +317,14 @@ class InboxJobRecoverPersistenceTest(InboxMixin, unittest.TestCase):
                  for item in document["redelivery_jobs"]}
         self.assertEqual(list(items["pending"]),
                          ["job_id", "device_id", "state", "lease_id",
-                          "recoveries"])
+                          "recoveries", "cancellation_id", "cancelled_at"])
         self.assertEqual(items["pending"]["recoveries"], [])
+        self.assertIsNone(items["pending"]["cancellation_id"])
+        self.assertIsNone(items["pending"]["cancelled_at"])
         j1 = items["j1"]
         self.assertEqual(list(j1),
                          ["job_id", "device_id", "state", "lease_id",
-                          "recoveries"])
+                          "recoveries", "cancellation_id", "cancelled_at"])
         self.assertEqual(j1["recoveries"], [
             {"recovery_id": "r1", "lease_id": "r1"},
             {"recovery_id": "r2", "lease_id": "r2"},
@@ -449,14 +452,17 @@ class InboxJobRecoverPersistenceTest(InboxMixin, unittest.TestCase):
 
     def test_legacy_item_without_recoveries_key_loads(self) -> None:
         self._dispatch()
-        # A legacy document predates the fifth key: strip it (written to a
-        # fresh path with the integrity marker removed, so it is a genuine
-        # marker-less, sidecar-less legacy document). It must load as an
-        # empty history.
+        # A legacy document predates the fifth key (and the later
+        # cancellation pair): strip them (written to a fresh path with the
+        # integrity marker removed, so it is a genuine marker-less,
+        # sidecar-less legacy document). It must load as an empty history
+        # with no cancellation.
         with open(self.path, encoding="utf-8") as handle:
             document = json.load(handle)
         for item in document["redelivery_jobs"]:
             item.pop("recoveries", None)
+            item.pop("cancellation_id", None)
+            item.pop("cancelled_at", None)
         self.assertNotIn("recoveries", document["redelivery_jobs"][0])
         document.pop("integrity_log_version", None)
         legacy_path = os.path.join(self.directory, "legacy.json")
