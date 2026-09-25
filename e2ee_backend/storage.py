@@ -1771,6 +1771,116 @@ class DeviceStore:
             return self._message_sync_cursor_view(
                 session_id, device_id, record), advanced
 
+    def _authorize_sync_ack_device(self, session_id: str,
+                                   device_id: str) -> str:
+        """Resolve a session and authorize a batch sync-ack device.
+
+        Must be called while holding the store lock. Returns the anchor
+        session's ``created_at`` (the timestamp a never-advanced equal ack
+        reports). An unknown session (neither a 1:1 nor a group session)
+        raises ``session_unknown``; an unknown/revoked device raises
+        ``device_unknown``/``device_inactive``. A 1:1 session may be acked by
+        its recipient only (the initiator has no receive side there); a group
+        session by a frozen member (a later-added member cannot, a removed
+        member still can) — both raise ``device_not_participant``.
+        """
+        session = self._sessions.get(session_id)
+        if session is not None:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            if device_id != session.recipient_device_id:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT)
+            return session.created_at
+        group_session = self._group_sessions.get(session_id)
+        if group_session is None:
+            raise MessageSyncError(MESSAGE_SYNC_SESSION_UNKNOWN)
+        device = self._find_device(device_id)
+        if device is None:
+            raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+        if device.revoked:
+            raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+        if device_id not in group_session.members:
+            raise MessageSyncError(MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT)
+        return group_session.created_at
+
+    def message_sync_ack(self, session_id: str, device_id: str,
+                         cursor: int) -> Tuple[Dict[str, Any], bool]:
+        """Atomically batch-acknowledge receivable messages and advance the cursor.
+
+        The delivery acknowledgements and the ``message_sync_cursors`` advance
+        commit as one locked transaction (one persistence notification).
+        *cursor* must sit between the device's stored cursor (0 when none)
+        and the session's largest stored sequence; a smaller or larger cursor
+        raises ``cursor_conflict`` (409/cursor). On a forward move every
+        receivable message with ``stored_cursor < sequence <= cursor`` is
+        marked acked one by one: for a 1:1 session the recipient's delivery
+        record (``delivery``) of each message is acked (created on demand,
+        ``attempts``/attempt ids untouched); for a group session the per-device
+        ``group_delivery`` record is acked for every such message except ones
+        the acking device itself sent. The cursor then advances to *cursor*
+        with a fresh ``updated_at`` (201). An equal cursor acks nothing, writes
+        nothing and consumes no generation (200, timestamp unchanged); with no
+        cursor record ever written its ``updated_at`` is the session's
+        ``created_at``. Returns ``(view, advanced)``.
+        """
+        with self._lock:
+            anchor_created_at = self._authorize_sync_ack_device(
+                session_id, device_id)
+            stream = self._messages.get(session_id, [])
+            max_sequence = stream[-1].sequence if stream else 0
+            if cursor > max_sequence:
+                raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
+            cursor_key = (session_id, device_id)
+            record = self._message_sync_cursors.get(cursor_key)
+            current = record.cursor if record is not None else 0
+            if cursor < current:
+                raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
+            advanced = cursor > current
+            if advanced:
+                group_session = self._group_sessions.get(session_id)
+                for message in stream:
+                    if not (current < message.sequence <= cursor):
+                        continue
+                    if group_session is not None:
+                        # A device never acknowledges its own outgoing group
+                        # message; every other frozen member holds a record.
+                        if message.sender_device_id == device_id:
+                            continue
+                        key = (session_id, message.message_id, device_id)
+                        state = self._group_delivery.get(key)
+                        if state is None:
+                            state = MessageDelivery()
+                            self._group_delivery[key] = state
+                    else:
+                        key = (session_id, message.message_id)
+                        state = self._delivery.get(key)
+                        if state is None:
+                            state = MessageDelivery()
+                            self._delivery[key] = state
+                    if not state.acked:
+                        state.acked = True
+                        state.ack_sequence = message.sequence
+                if record is None:
+                    record = MessageSyncCursor(cursor=cursor)
+                    self._message_sync_cursors[cursor_key] = record
+                else:
+                    record.cursor = cursor
+                    record.updated_at = utc_now_iso()
+                # Acks and the cursor commit together: exactly one persistence
+                # notification, so a durable write failure rolls back all the
+                # delivery flags, the cursor and its timestamp as one.
+                self._notify_change()
+            if record is None:
+                # An equal ack on a device that never advanced a cursor is a
+                # state-free no-op anchored at the session's creation time.
+                record = MessageSyncCursor(cursor=0,
+                                           updated_at=anchor_created_at)
+            return self._message_sync_cursor_view(
+                session_id, device_id, record), advanced
+
     # -- messages ----------------------------------------------------------
 
     @staticmethod

@@ -64,6 +64,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         elif path.startswith(_SESSIONS_PATH + "/") \
                 and path.endswith("/sync/checkpoint"):
             self._route_session_sync_checkpoint(path)
+        elif path.startswith(_SESSIONS_PATH + "/") \
+                and path.endswith("/sync/ack"):
+            self._route_session_sync_ack(path)
         elif path == _MESSAGES_PATH:
             self._handle_post_message()
         elif path == _MESSAGES_SUBMIT_PATH:
@@ -133,6 +136,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                       -len("/sync/checkpoint")]
         if suffix and "/" not in suffix:
             self._handle_sync_session_checkpoint(unquote(suffix))
+        else:
+            self._send_json(404, {"message": "session not found",
+                                  "field": "session_id"})
+
+    def _route_session_sync_ack(self, path: str) -> None:
+        suffix = path[len(_SESSIONS_PATH) + 1:-len("/sync/ack")]
+        if suffix and "/" not in suffix:
+            self._handle_sync_session_ack(unquote(suffix))
         else:
             self._send_json(404, {"message": "session not found",
                                   "field": "session_id"})
@@ -562,6 +573,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.sync_session_checkpoint(
+                session_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_sync_session_ack(self, session_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.sync_session_ack(
                 session_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())

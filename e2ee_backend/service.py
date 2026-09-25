@@ -1126,6 +1126,49 @@ class DeviceService:
             raise self._message_sync_error(error, session_id)
         return view, 201 if advanced else 200
 
+    def sync_session_ack(self, session_id: str,
+                         payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply a batch offline-message acknowledgement.
+
+        The body carries a non-empty ``device_id`` and an integer non-negative
+        non-bool ``cursor``. Advancing the cursor acknowledges, one by one and
+        in the same locked transaction as the cursor advance, every receivable
+        message in ``(old_cursor, cursor]`` (a 1:1 session acks for the
+        recipient; a group session acks for the frozen member device and skips
+        the device's own messages) without changing any retry ``attempts``. A
+        forward move returns 201 with a fresh UTC ISO-8601 ``updated_at``; an
+        equal cursor returns 200 with the timestamp untouched and writes
+        nothing (a never-advanced cursor reports the session's
+        ``created_at``). A cursor below the stored cursor or above the
+        session's max sequence is 409/field=cursor. Unknown session is
+        404/session_id; an unknown, revoked or unauthorized device (recipient
+        only for 1:1, frozen member for a group) is 409/device_id.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id", "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        if "cursor" not in payload:
+            raise ServiceError("missing required field: cursor", "cursor")
+        cursor = payload["cursor"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(cursor, int) or isinstance(cursor, bool):
+            raise ServiceError("field must be an integer: cursor", "cursor")
+        if cursor < 0:
+            raise ServiceError("field must be a non-negative integer: cursor",
+                               "cursor")
+
+        try:
+            view, advanced = self.store.message_sync_ack(
+                session_id, payload["device_id"], cursor)
+        except MessageSyncError as error:
+            raise self._message_sync_error(error, session_id)
+        return view, 201 if advanced else 200
+
     # -- messages ----------------------------------------------------------
 
     def post_message(self, payload: object) -> Dict[str, Any]:
