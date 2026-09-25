@@ -243,6 +243,25 @@ class MessageLeaseRenewal:
 
 
 @dataclass
+class MessageLeaseCompletion:
+    """The terminal completion record of a 1:1-inbox redelivery lease.
+
+    ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/complete``
+    settles the lease exactly once. The record freezes the client-chosen
+    ``completion_id`` (unique within one lease, but reusable across
+    different leases), the reported ``outcome`` (``"delivered"`` or
+    ``"failed"`` — a delivery report, not an acknowledgement) and the UTC
+    ``completed_at`` timestamp, so a replayed completion returns its first
+    response byte-identically. Every delivery record the lease appears on
+    carries an identical copy of the completion.
+    """
+
+    completion_id: str
+    outcome: str
+    completed_at: str
+
+
+@dataclass
 class MessageLease:
     """One 1:1-inbox redelivery lease held on a message.
 
@@ -264,6 +283,12 @@ class MessageLease:
     extension per renewal (i.e. the last renewal's ``leased_until``). The
     claim deadline itself stays frozen, so replaying the original claim
     still returns its first response.
+
+    ``completion`` is ``None`` while the lease is unsettled and the
+    committed ``.../complete`` record afterwards: a completed lease is
+    terminal — it stays on the record as history (the completion replays
+    from it) but no longer withholds the message from new claims, and it
+    can neither be renewed nor released.
     """
 
     lease_id: str
@@ -271,6 +296,7 @@ class MessageLease:
     leased_until: str
     released_at: Optional[str] = None
     renewals: List[MessageLeaseRenewal] = field(default_factory=list)
+    completion: Optional[MessageLeaseCompletion] = None
 
 
 @dataclass

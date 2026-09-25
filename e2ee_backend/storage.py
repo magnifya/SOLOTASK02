@@ -28,6 +28,7 @@ from .models import (
     Message,
     MessageDelivery,
     MessageLease,
+    MessageLeaseCompletion,
     MessageLeaseRenewal,
     MessageSubmission,
     MessageSyncCursor,
@@ -153,6 +154,14 @@ INBOX_LEASE_NOT_FOUND = "lease_not_found"
 #: A renewal named a lease that is released or already past its current
 #: effective deadline; neither can be extended.
 INBOX_LEASE_UNAVAILABLE = "lease_unavailable"
+#: A completion named a lease that was already completed under a different
+#: completion_id; a lease settles exactly once.
+INBOX_LEASE_COMPLETION_CONFLICT = "completion_id_conflict"
+
+#: Outcomes a lease completion may report. ``delivered`` only reports the
+#: hand-off to the client — it is not an acknowledgement, so the messages
+#: stay claimable until they are acked.
+INBOX_LEASE_COMPLETION_OUTCOMES = frozenset({"delivered", "failed"})
 
 #: Lifetime of one inbox redelivery lease, in seconds. A message leased by a
 #: claim is withheld from later claims until this deadline passes, after
@@ -2157,12 +2166,16 @@ class DeviceStore:
                                 now: datetime) -> bool:
         """Whether *lease* has not passed its deadline at *now*.
 
-        A released lease is never active again, whatever its deadline says.
+        A released lease is never active again, whatever its deadline says,
+        and neither is a completed one: completion settles the lease
+        terminally, so its (still unacked) messages become claimable again.
         Deadlines written by this server always parse as timezone-aware ISO
         timestamps; an unparseable (legacy/tampered) value is treated as
         expired rather than withholding the message forever.
         """
         if lease.released_at is not None:
+            return False
+        if lease.completion is not None:
             return False
         deadline = DeviceStore._lease_effective_deadline_locked(lease)
         if deadline is None:
@@ -2369,8 +2382,11 @@ class DeviceStore:
         regardless of the path device's state. A lease that was already
         released is an exact replay: the first response is rebuilt from the
         persisted release timestamp with status 200 and nothing is written —
-        even if the device has since been revoked. Only a first release
-        resolves the device (unknown/revoked -> :class:`InboxLeaseError`
+        even if the device has since been revoked. A completed lease is
+        terminal and cannot be released: a first release on one raises
+        ``lease_unavailable`` (409/lease_id), decided ahead of the path
+        device's state. Only a first release resolves the device
+        (unknown/revoked -> :class:`InboxLeaseError`
         ``device_unknown``/``device_inactive``, 409/device_id).
 
         The release stamps the same UTC ``released_at`` (six microsecond
@@ -2398,6 +2414,19 @@ class DeviceStore:
                 return ({"device_id": device_id, "lease_id": lease_id,
                          "released_at": released_at,
                          "released_count": len(keys)}, 200)
+            # A completed lease is terminal: it cannot be released any
+            # more. Like the lease lookup above, this is decided ahead of
+            # the path device's state. Restore validation keeps every copy
+            # of the lease identical, so the first record is authoritative.
+            for key in keys:
+                state = self._delivery.get(key)
+                if state is None:
+                    continue
+                if any(lease.lease_id == lease_id
+                       and lease.completion is not None
+                       for lease in state.leases):
+                    raise InboxLeaseError(INBOX_LEASE_UNAVAILABLE)
+                break
             device = self._find_device(device_id)
             if device is None:
                 raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
@@ -2510,6 +2539,102 @@ class DeviceStore:
                      "lease_id": lease_id,
                      "renewal_id": renewal_id,
                      "leased_until": leased_until}, 201)
+
+    def inbox_lease_complete(
+            self, device_id: str, lease_id: str, completion_id: str,
+            outcome: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Settle one occupied 1:1-inbox lease with a terminal outcome.
+
+        ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/complete``.
+        Under the one store lock (shared with claims, releases, renewals,
+        acks, retries and revocation), the lease is resolved first: a
+        never-committed *lease_id* raises ``lease_not_found``
+        (404/lease_id) and one owned by another device raises
+        ``lease_id_conflict`` (409/lease_id), regardless of the path
+        device's state. A lease that was already completed is decided
+        next, also ahead of the path device's state: replaying the same
+        *completion_id* returns the frozen first response with status 200
+        and writes nothing (the id is scoped to the lease and may recur on
+        other leases), while a different *completion_id* raises
+        ``completion_id_conflict`` (409/completion_id) — a lease settles
+        exactly once.
+
+        Only a first completion resolves the device (unknown ->
+        ``device_unknown``, revoked -> ``device_inactive``, both
+        409/device_id) and the lease state: an already-released or expired
+        lease raises ``lease_unavailable`` (409/lease_id). On success
+        (201) the same completion record (*completion_id*, *outcome* and
+        one UTC ``completed_at`` with six microsecond digits and
+        ``+00:00``) is stamped onto the lease on every delivery record it
+        lives on. Completion is terminal: the lease can neither be renewed
+        nor released afterwards, and it stops withholding its messages
+        from new claims — a ``delivered`` outcome reports the hand-off
+        only, it does not acknowledge the messages. The completion set
+        commits as one persistence notification (commit_seq + 1); a
+        durable write failure rolls every record back. Returns ``(body,
+        status_code)`` with keys ``device_id``, ``lease_id``,
+        ``completion_id``, ``outcome``, ``completed_at`` in that order.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            # Gather every (delivery key, lease object) carrying the id;
+            # restore validation guarantees the copies stay identical, so
+            # any of them is authoritative for the replay lookup.
+            hits: List[Tuple[Tuple[str, str], MessageLease]] = []
+            for (session_id, message_id), state in self._delivery.items():
+                for lease in state.leases:
+                    if lease.lease_id == lease_id:
+                        hits.append(((session_id, message_id), lease))
+            if not hits:
+                raise InboxLeaseError(INBOX_LEASE_NOT_FOUND)
+            owner_session = self._sessions.get(hits[0][0][0])
+            owner = owner_session.recipient_device_id \
+                if owner_session is not None else ""
+            # A cross-device completion is a conflict regardless of the
+            # path device's current state, mirroring claim/release/renew
+            # replay rules.
+            if owner != device_id:
+                raise InboxLeaseError(INBOX_LEASE_CONFLICT)
+            # The lease settles exactly once. The same completion_id is an
+            # exact replay: rebuild the first response byte-identically,
+            # even if the lease has since expired or the device been
+            # revoked. A different id is a conflict.
+            settled = hits[0][1].completion
+            if settled is not None:
+                if settled.completion_id == completion_id:
+                    return ({"device_id": device_id,
+                             "lease_id": lease_id,
+                             "completion_id": completion_id,
+                             "outcome": settled.outcome,
+                             "completed_at": settled.completed_at}, 200)
+                raise InboxLeaseError(INBOX_LEASE_COMPLETION_CONFLICT)
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            # Every copy of the lease shares one lifecycle; once released
+            # or past its current effective deadline it cannot be
+            # completed.
+            if any(not self._lease_is_active_locked(lease, now)
+                   for _key, lease in hits):
+                raise InboxLeaseError(INBOX_LEASE_UNAVAILABLE)
+            completed_at = now.isoformat(timespec="microseconds")
+            completion = MessageLeaseCompletion(
+                completion_id=completion_id, outcome=outcome,
+                completed_at=completed_at)
+            for _key, lease in hits:
+                lease.completion = completion
+            # One persistence notification for the whole lease set: every
+            # per-message completion commits (or rolls back) together and
+            # the generation advances at most once.
+            self._notify_change()
+            return ({"device_id": device_id,
+                     "lease_id": lease_id,
+                     "completion_id": completion_id,
+                     "outcome": outcome,
+                     "completed_at": completed_at}, 201)
 
     def inbox_retry_batch(
             self, device_id: str, attempt_id: str,
@@ -3045,6 +3170,11 @@ class DeviceStore:
                         "renewal_id": renewal.renewal_id,
                         "leased_until": renewal.leased_until,
                     } for renewal in lease.renewals],
+                    "completion": {
+                        "completion_id": lease.completion.completion_id,
+                        "outcome": lease.completion.outcome,
+                        "completed_at": lease.completion.completed_at,
+                    } if lease.completion is not None else None,
                 } for lease in state.leases],
             } for (sid, mid), state in self._delivery.items()]
             group_delivery = [{
@@ -4204,12 +4334,14 @@ class DeviceStore:
         delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         # Global inbox-lease index, keyed by lease_id. One id is durably
         # bound to exactly one device, one limit, one claim deadline, one
-        # release timestamp and one renewal list across every delivery
-        # record it appears on; a contradiction refuses startup. Built
-        # while delivery records are parsed and cross-checked below
-        # (sessions are already restored, so the owner device is known).
+        # release timestamp, one renewal list and one completion record
+        # across every delivery record it appears on; a contradiction
+        # refuses startup. Built while delivery records are parsed and
+        # cross-checked below (sessions are already restored, so the owner
+        # device is known).
         lease_index: Dict[str, Tuple[str, int, str, Optional[str],
-                                     Tuple[Tuple[str, str], ...]]] = {}
+                                     Tuple[Tuple[str, str], ...],
+                                     Optional[Tuple[str, str, str]]]] = {}
         for index, raw in enumerate(raw_delivery):
             where = f"delivery[{index}]"
             if not isinstance(raw, dict):
@@ -4372,6 +4504,44 @@ class DeviceStore:
                         renewals.append(MessageLeaseRenewal(
                             renewal_id=renewal_id,
                             leased_until=renewal_until))
+                    # The lease completion. Older files predate the key:
+                    # absent means null (never completed). A non-null value
+                    # freezes the client-chosen completion_id, the reported
+                    # outcome and the completion timestamp.
+                    raw_completion = raw_lease.get("completion")
+                    completion: Optional[MessageLeaseCompletion] = None
+                    if raw_completion is not None:
+                        c_where = f"{l_where}.completion"
+                        if not isinstance(raw_completion, dict):
+                            raise ValueError(
+                                f"{c_where} must be an object or null")
+                        try:
+                            completion_id = raw_completion["completion_id"]
+                            completion_outcome = raw_completion["outcome"]
+                            completed_at = raw_completion["completed_at"]
+                        except KeyError as error:
+                            raise ValueError(
+                                f"{c_where} missing field: "
+                                f"{error.args[0]}") from None
+                        if not (isinstance(completion_id, str)
+                                and completion_id):
+                            raise ValueError(
+                                f"{c_where}.completion_id must be a "
+                                f"non-empty string")
+                        if completion_outcome not in \
+                                INBOX_LEASE_COMPLETION_OUTCOMES:
+                            raise ValueError(
+                                f"{c_where}.outcome must be one of "
+                                f"delivered|failed")
+                        if not _is_utc_microsecond_iso(completed_at):
+                            raise ValueError(
+                                f"{c_where}.completed_at must be a UTC "
+                                f"ISO-8601 timestamp with six microsecond "
+                                f"digits and a +00:00 offset")
+                        completion = MessageLeaseCompletion(
+                            completion_id=completion_id,
+                            outcome=completion_outcome,
+                            completed_at=completed_at)
                     if lease_id in seen_lease_ids:
                         raise ValueError(
                             f"{l_where} repeats lease_id {lease_id}")
@@ -4379,18 +4549,22 @@ class DeviceStore:
                     binding = (owner_device, lease_limit, leased_until,
                                released_at,
                                tuple((r.renewal_id, r.leased_until)
-                                     for r in renewals))
+                                     for r in renewals),
+                               (completion.completion_id,
+                                completion.outcome,
+                                completion.completed_at)
+                               if completion is not None else None)
                     prior = lease_index.get(lease_id)
                     if prior is not None and prior != binding:
                         raise ValueError(
                             f"inbox lease {lease_id} is bound inconsistently "
                             f"across records (device/limit/leased_until/"
-                            f"released_at/renewals)")
+                            f"released_at/renewals/completion)")
                     lease_index[lease_id] = binding
                     leases.append(MessageLease(
                         lease_id=lease_id, limit=lease_limit,
                         leased_until=leased_until, released_at=released_at,
-                        renewals=renewals))
+                        renewals=renewals, completion=completion))
             # The ack cursor mirrors the message once acked and is 0 before.
             if acked:
                 if ack_sequence != target.sequence:
