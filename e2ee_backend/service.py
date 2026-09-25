@@ -1265,6 +1265,36 @@ class DeviceService:
         body = {"device_id": device_id, "results": results}
         return body, 201 if any_advanced else 200
 
+    # -- device offline inbox ----------------------------------------------
+
+    def device_inbox(self, device_id: str, limit: int) -> Dict[str, Any]:
+        """Return one device's aggregated offline 1:1 inbox (read-only).
+
+        ``limit`` must be an integer in 1..100 (the HTTP layer defaults it
+        to 100 and rejects repeated, non-decimal or out-of-range values with
+        400/field=limit). The body is ``device_id``, ``messages``,
+        ``has_more`` in that key order; each message carries the seven
+        envelope fields (``session_id`` … ``created_at``). Only 1:1 sessions
+        the device is the recipient of contribute their un-acked messages,
+        ordered by (session ``created_at``, ``session_id``, ``sequence``);
+        group sessions and other devices' sessions never appear. The query
+        is linearized with commits, acks and revocations under the store
+        lock and changes nothing — no cursor, ``attempts``, generation or
+        durable write. An unknown or revoked device is 409/field=device_id.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            return self.store.device_inbox(device_id, limit)
+        except MessageSyncError as error:
+            if error.reason == MESSAGE_SYNC_DEVICE_INACTIVE:
+                text = "device_id is revoked"
+            else:
+                text = "device_id is not a registered device"
+            raise ServiceError(text, "device_id", status_code=409)
+
     # -- messages ----------------------------------------------------------
 
     def post_message(self, payload: object) -> Dict[str, Any]:

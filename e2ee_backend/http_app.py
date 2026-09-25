@@ -255,6 +255,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_key_events(unquote(device_id))
                 return
+            if suffix.endswith("/inbox"):
+                device_id = suffix[:-len("/inbox")]
+                if not device_id or "/" in device_id:
+                    self._send_json(404, {"message": "device not found",
+                                          "field": "device_id"})
+                    return
+                self._handle_device_inbox(unquote(device_id))
+                return
             if not suffix or "/" in suffix:
                 self._send_json(404, {"message": "device not found",
                                       "field": "device_id"})
@@ -362,6 +370,21 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return  # a 400 response was already sent
         try:
             body = self.service.list_key_events(device_id, after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_device_inbox(self, device_id: str) -> None:
+        # keep_blank_values so an explicit ``limit=`` is an empty (hence
+        # malformed, 400) value rather than silently defaulting.
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.device_inbox(device_id, limit)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

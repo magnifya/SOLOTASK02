@@ -2033,6 +2033,55 @@ class DeviceStore:
             } for plan, record in zip(plans, records)]
             return results, any_advanced
 
+    # -- device offline inbox ----------------------------------------------
+
+    def device_inbox(self, device_id: str, limit: int) -> Dict[str, Any]:
+        """Atomically snapshot one device's offline 1:1 inbox (read-only).
+
+        Aggregates the unconfirmed messages of every 1:1 session whose
+        ``recipient_device_id`` is *device_id* — group sessions never
+        contribute, and sessions addressed to another device of the same
+        user are invisible. A message is pending while its ``delivery``
+        record is missing or ``acked`` is false. The result is ordered by
+        (session ``created_at``, ``session_id`` codepoint order,
+        ``sequence``) ascending — each session's stream is already
+        sequence-ascending — and carries at most *limit* items; ``has_more``
+        reports whether the locked snapshot held further pending items.
+
+        The read runs under the same store lock that message commits, acks
+        and revocations take, so it linearizes with them; it mutates nothing
+        (no cursor, ``attempts`` or delivery change), emits no persistence
+        notification and consumes no generation, so a repeated call over
+        unchanged state returns a byte-identical body. No state is derived
+        and stored: after a restart the same answer is rebuilt from the
+        persisted ``messages`` and ``delivery`` sections. An unknown or
+        revoked device raises ``device_unknown``/``device_inactive`` (both
+        mapped to 409/device_id by the service).
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            sessions = sorted(
+                (session for session in self._sessions.values()
+                 if session.recipient_device_id == device_id),
+                key=lambda session: (session.created_at, session.session_id))
+            pending: List[Message] = []
+            for session in sessions:
+                stream = self._messages.get(session.session_id, [])
+                for message in stream:
+                    state = self._delivery.get(
+                        (session.session_id, message.message_id))
+                    if state is None or not state.acked:
+                        pending.append(message)
+            page = pending[:limit]
+            return {
+                "device_id": device_id,
+                "messages": [self.message_view(message) for message in page],
+                "has_more": len(pending) > limit,
+            }
 
     # -- messages ----------------------------------------------------------
 
