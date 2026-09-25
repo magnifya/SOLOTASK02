@@ -65,6 +65,10 @@ from .storage import (
     MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT,
     MESSAGE_SYNC_DEVICE_UNKNOWN,
     MESSAGE_SYNC_SESSION_UNKNOWN,
+    INBOX_RETRY_MESSAGE_ACKED,
+    INBOX_RETRY_MESSAGE_UNKNOWN,
+    INBOX_RETRY_NOT_RECIPIENT,
+    INBOX_RETRY_SESSION_UNKNOWN,
     PREKEY_CONFLICT,
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
@@ -95,6 +99,7 @@ from .storage import (
     GroupSyncError,
     MessageCreateError,
     MessageListError,
+    InboxRetryBatchError,
     MessageSyncAckBatchError,
     MessageSyncError,
     PreKeyClaimError,
@@ -1297,6 +1302,110 @@ class DeviceService:
                                    "device_id", status_code=409)
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
+
+    def inbox_retry_batch(self, device_id: str,
+                          payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one device's batch retry of 1:1 inbox messages.
+
+        ``POST /v1/devices/{device_id}/inbox/retry-batch``. The body must be
+        an object carrying a non-empty string ``attempt_id`` and a non-empty
+        ``items`` array of objects, each with a non-empty string
+        ``session_id`` and ``message_id``, with no repeated
+        ``(session_id, message_id)`` pair. Shape errors are reported, in
+        order, as 400/field ``request_body`` (bad/non-object body),
+        ``attempt_id`` (missing/empty/non-string), ``items``
+        (missing/not-a-non-empty-array), ``items[i]`` (non-object element or
+        a repeated pair) or ``items[i].session_id`` /
+        ``items[i].message_id`` for the offending field.
+
+        The device is then resolved (unknown/revoked -> 409/field
+        ``device_id``) and items are prechecked in array order, the first
+        error aborting the whole batch with nothing written: an unknown
+        session is 404/``items[i].session_id``; a group session or a 1:1
+        session the device is not the recipient of is
+        409/``items[i].session_id``; an unknown message is
+        404/``items[i].message_id``; an already-acked message is
+        409/``items[i].message_id``. On success the body is ``device_id``
+        then ``results``; results keep input order and each item is
+        ``session_id``/``message_id``/``attempts``. Status is 201 when at
+        least one message newly recorded the attempt id and 200 (with no
+        durable write) when every id was a replay.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "attempt_id" not in payload:
+            raise ServiceError("missing required field: attempt_id",
+                               "attempt_id")
+        if not is_nonempty_string(payload["attempt_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: attempt_id", "attempt_id")
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+
+        items: List[Tuple[str, str]] = []
+        seen_pairs: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            session_field = f"{item_field}.session_id"
+            if "session_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {session_field}", session_field)
+            if not is_nonempty_string(element["session_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {session_field}",
+                    session_field)
+            message_field = f"{item_field}.message_id"
+            if "message_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {message_field}", message_field)
+            if not is_nonempty_string(element["message_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {message_field}",
+                    message_field)
+            pair = (element["session_id"], element["message_id"])
+            if pair in seen_pairs:
+                raise ServiceError(
+                    "duplicate (session_id, message_id) pair in items: "
+                    f"({pair[0]}, {pair[1]})", item_field)
+            seen_pairs.add(pair)
+            items.append(pair)
+
+        try:
+            results, any_new = self.store.inbox_retry_batch(
+                device_id, payload["attempt_id"], items)
+        except MessageSyncError as error:
+            # Batch-level device failure (unknown/revoked): 409/device_id.
+            raise self._message_sync_error(error, device_id)
+        except InboxRetryBatchError as error:
+            session_id, message_id = items[error.index]
+            item_field = f"items[{error.index}]"
+            if error.reason == INBOX_RETRY_SESSION_UNKNOWN:
+                raise ServiceError(f"session not found: {session_id}",
+                                   f"{item_field}.session_id",
+                                   status_code=404)
+            if error.reason == INBOX_RETRY_NOT_RECIPIENT:
+                raise ServiceError(
+                    "session is a group session or device is not its "
+                    "recipient", f"{item_field}.session_id",
+                    status_code=409)
+            if error.reason == INBOX_RETRY_MESSAGE_UNKNOWN:
+                raise ServiceError(f"message not found: {message_id}",
+                                   f"{item_field}.message_id",
+                                   status_code=404)
+            raise ServiceError(
+                "message has already been acknowledged",
+                f"{item_field}.message_id", status_code=409)
+        body = {"device_id": device_id, "results": results}
+        return body, 201 if any_new else 200
 
     # -- messages ----------------------------------------------------------
 

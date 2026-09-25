@@ -132,6 +132,12 @@ MESSAGE_SYNC_DEVICE_INACTIVE = "device_inactive"
 MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT = "device_not_participant"
 MESSAGE_SYNC_CURSOR_CONFLICT = "cursor_conflict"
 
+#: Outcome codes for a device 1:1-inbox retry batch.
+INBOX_RETRY_SESSION_UNKNOWN = "session_unknown"
+INBOX_RETRY_NOT_RECIPIENT = "session_not_recipient"
+INBOX_RETRY_MESSAGE_UNKNOWN = "message_unknown"
+INBOX_RETRY_MESSAGE_ACKED = "message_acked"
+
 #: Outcome codes for group-session rotation.
 ROTATION_SESSION_UNKNOWN = "session_unknown"
 ROTATION_ACTOR_UNKNOWN = "actor_unknown"
@@ -287,6 +293,20 @@ class MessageSyncAckBatchError(Exception):
 
     Carries the zero-based *index* of the first (and only reported) offending
     item; validation runs in array order and the whole batch writes nothing.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
+class InboxRetryBatchError(Exception):
+    """A device 1:1-inbox retry batch failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported) offending
+    item; items are prechecked in array order and the whole batch writes
+    nothing.
     """
 
     def __init__(self, reason: str, index: int) -> None:
@@ -2077,6 +2097,92 @@ class DeviceStore:
                 "messages": [self.message_view(entry[2]) for entry in page],
                 "has_more": len(entries) > limit,
             }
+
+    def inbox_retry_batch(
+            self, device_id: str, attempt_id: str,
+            items: List[Tuple[str, str]]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Record one ``attempt_id`` against many unacked 1:1 inbox messages.
+
+        *items* are ``(session_id, message_id)`` pairs already validated for
+        shape and pair uniqueness by the service. The device must exist and
+        not be revoked (a batch-level :class:`MessageSyncError`). Items are
+        then prechecked in array order and the first failure raises
+        :class:`InboxRetryBatchError` carrying that item's index; the batch
+        writes nothing:
+
+        * a session that is neither a 1:1 nor a group session ->
+          ``session_unknown`` (404);
+        * a group session, or a 1:1 session whose recipient is not this device
+          -> ``session_not_recipient`` (409);
+        * a message the session does not hold -> ``message_unknown`` (404);
+        * a message already acked for the recipient -> ``message_acked``
+          (409).
+
+        Only after every item passes does the commit run, under the one store
+        lock: the single *attempt_id* is added to each target message's
+        ``delivery`` dedup set. A message whose set already held the id is a
+        replay (its ``attempts`` is not counted); otherwise the record is
+        created as needed and ``attempts`` advances by one. Every target
+        shares one persistence notification, so the whole batch commits as
+        one generation and a durable write failure rolls every delivery
+        record back. Returns ``(results, any_new)`` with one three-field
+        (``session_id``/``message_id``/``attempts``) result per item, in
+        input order; when no item added the id nothing is persisted.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            targets: List[Tuple[str, Message]] = []
+            for index, (session_id, message_id) in enumerate(items):
+                session = self._sessions.get(session_id)
+                if session is None:
+                    reason = INBOX_RETRY_NOT_RECIPIENT \
+                        if self._group_sessions.get(session_id) is not None \
+                        else INBOX_RETRY_SESSION_UNKNOWN
+                    raise InboxRetryBatchError(reason, index)
+                if device_id != session.recipient_device_id:
+                    raise InboxRetryBatchError(
+                        INBOX_RETRY_NOT_RECIPIENT, index)
+                message = next((m for m in self._messages.get(session_id, [])
+                                if m.message_id == message_id), None)
+                if message is None:
+                    raise InboxRetryBatchError(
+                        INBOX_RETRY_MESSAGE_UNKNOWN, index)
+                state = self._delivery.get((session_id, message_id))
+                if state is not None and state.acked:
+                    raise InboxRetryBatchError(INBOX_RETRY_MESSAGE_ACKED,
+                                               index)
+                # Precheck in array order; only after every item passes are
+                # any dedup sets touched below.
+                targets.append((session_id, message))
+            any_new = False
+            for session_id, message in targets:
+                key = (session_id, message.message_id)
+                state = self._delivery.get(key)
+                if state is not None and attempt_id in state.attempt_ids:
+                    continue
+                if state is None:
+                    state = MessageDelivery()
+                    self._delivery[key] = state
+                state.attempt_ids.add(attempt_id)
+                state.attempts += 1
+                any_new = True
+            if any_new:
+                # One persistence notification for the whole batch: all the
+                # per-message dedup sets and counters commit (or roll back)
+                # together and the generation advances at most once.
+                self._notify_change()
+            results = [{
+                "session_id": session_id,
+                "message_id": message.message_id,
+                "attempts": self._delivery[
+                    (session_id, message.message_id)].attempts,
+            } for session_id, message in targets]
+            return results, any_new
 
     # -- messages ----------------------------------------------------------
 
