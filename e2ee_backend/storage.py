@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -458,6 +459,10 @@ class DeviceStore:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        #: Signalled (under the lock) after every committed mutation so
+        #: long-polling inbox waiters wake up and re-check their predicate;
+        #: waiting releases the lock, so writers are never blocked.
+        self._inbox_changed = threading.Condition(self._lock)
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
         self._sessions: Dict[str, Session] = {}
@@ -523,6 +528,11 @@ class DeviceStore:
         # Any change that will be persisted first closes the legacy gap:
         # anchor every chainless device in the same locked transaction.
         self._migrate_pending_anchors()
+        # Wake long-polling inbox waiters: the mutation may have made a
+        # message receivable or revoked the device they are waiting on.
+        # They re-check their predicate under the lock, so wakeups for
+        # unrelated changes are harmless.
+        self._inbox_changed.notify_all()
         if self.on_change is not None:
             self.on_change()
 
@@ -2260,6 +2270,57 @@ class DeviceStore:
                 "messages": [self.message_view(entry[2]) for entry in page],
                 "has_more": len(entries) > limit,
             }
+
+    def device_inbox_wait(self, device_id: str, limit: int,
+                          timeout_ms: int) -> Dict[str, Any]:
+        """Long-poll one device's aggregated 1:1 offline inbox (read-only).
+
+        Same page shape, ordering and device checks as :meth:`device_inbox`,
+        but when the locked snapshot holds no unacked 1:1 message the call
+        waits — on a monotonic-clock deadline of *timeout_ms* milliseconds —
+        until a message becomes receivable, the device is revoked, or the
+        deadline passes. Waiting blocks on the store condition, which
+        releases the store lock, so submissions, acks and revocations are
+        never blocked; every committed mutation signals the condition. Each
+        wakeup re-checks under the lock, revocation first, then the inbox;
+        the deadline itself triggers one final re-check, and only a still
+        empty inbox answers ``messages=[]``/``has_more=False``. The query is
+        purely read-only: nothing is created, advanced or persisted, no
+        cursor, lease, ``attempts`` or ``commit_seq`` changes.
+        """
+        with self._inbox_changed:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            deadline = time.monotonic() + timeout_ms / 1000.0
+            while True:
+                entries = self._inbox_entries_locked(device_id)
+                if entries:
+                    page = entries[:limit]
+                    return {
+                        "device_id": device_id,
+                        "messages": [self.message_view(entry[2])
+                                     for entry in page],
+                        "has_more": len(entries) > limit,
+                    }
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {
+                        "device_id": device_id,
+                        "messages": [],
+                        "has_more": False,
+                    }
+                # Releases the store lock while waiting; writers signal the
+                # condition from _notify_change after each committed change.
+                self._inbox_changed.wait(remaining)
+                # Re-check under the lock, revocation before the inbox.
+                device = self._find_device(device_id)
+                if device is None:
+                    raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+                if device.revoked:
+                    raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
 
     def inbox_claim(
             self, device_id: str, lease_id: str, limit: int

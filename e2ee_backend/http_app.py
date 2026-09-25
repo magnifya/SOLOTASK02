@@ -364,6 +364,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_device_inbox_leases(unquote(device_id))
                 return
+            if suffix.endswith("/inbox/wait"):
+                device_id = suffix[:-len("/inbox/wait")]
+                if not device_id or "/" in device_id:
+                    self._send_json(404, {"message": "device not found",
+                                          "field": "device_id"})
+                    return
+                self._handle_device_inbox_wait(unquote(device_id))
+                return
             if suffix.endswith("/inbox"):
                 device_id = suffix[:-len("/inbox")]
                 if not device_id or "/" in device_id:
@@ -494,6 +502,50 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return  # a 400 response was already sent
         try:
             body = self.service.device_inbox(device_id, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_device_inbox_wait(self, device_id: str) -> None:
+        # The long poll takes no request body and only the single-valued
+        # ``limit``/``timeout_ms`` query parameters; validation runs in the
+        # fixed order body, other parameters, limit, timeout_ms.
+        # keep_blank_values so an explicit ``limit=``/``timeout_ms=`` is an
+        # empty (hence malformed, 400) value and a bare ``?foo`` flag an
+        # actual (rejected) parameter, while a trailing ``?`` alone is
+        # accepted.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name not in ("limit", "timeout_ms") for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100)
+        if limit is None:
+            return  # a 400 response was already sent
+        timeout_ms = self._decimal_nonneg_param(query, "timeout_ms",
+                                                default=30000, minimum=0,
+                                                maximum=30000)
+        if timeout_ms is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.device_inbox_wait(
+                device_id, limit, timeout_ms)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

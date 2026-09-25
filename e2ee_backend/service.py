@@ -1311,6 +1311,48 @@ class DeviceService:
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
 
+    def device_inbox_wait(self, device_id: str, limit: int,
+                          timeout_ms: int) -> Dict[str, Any]:
+        """Long-poll one device's aggregated 1:1 offline inbox (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox/wait``. ``limit`` must be an
+        integer in 1..100 and ``timeout_ms`` an integer in 0..30000 (the
+        HTTP layer defaults them to 100/30000 and rejects repeats, empty,
+        non-decimal and out-of-range values with 400 naming the field). An
+        unknown or revoked device is 409/field=device_id. When unacked 1:1
+        inbox messages already exist the answer is immediate; otherwise the
+        store waits on a monotonic-clock deadline of ``timeout_ms``
+        milliseconds for a message to become receivable, the device to be
+        revoked (409/field=device_id) or the deadline to pass, re-checking
+        under the lock after every wakeup (revocation first, then the
+        inbox) and once more at the deadline itself — only a still empty
+        inbox answers 200 with ``messages=[]`` and ``has_more=false``. The
+        success body is ``device_id``, ``messages``, ``has_more`` in that
+        key order with the same seven-field message views and the same
+        ``(session.created_at, session_id, sequence)`` ordering as
+        :meth:`device_inbox`. The query is purely read-only: it writes
+        nothing, advances no cursor or ``commit_seq`` and touches no lease
+        or ``attempts``, and waiting never holds the store lock against
+        writers.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) \
+                or not 0 <= timeout_ms <= 30000:
+            raise ServiceError(
+                "field must be an integer in 0..30000: timeout_ms",
+                "timeout_ms")
+        try:
+            return self.store.device_inbox_wait(device_id, limit, timeout_ms)
+        except MessageSyncError as error:
+            if error.reason == MESSAGE_SYNC_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
     def inbox_retry_batch(self, device_id: str,
                           payload: object) -> Tuple[Dict[str, Any], int]:
         """Validate and apply one device's batch retry of 1:1 inbox messages.
