@@ -94,6 +94,8 @@ DELIVERY_MESSAGE_UNKNOWN = "message_unknown"
 DELIVERY_DEVICE_MISMATCH = "device_mismatch"
 DELIVERY_DEVICE_INACTIVE = "device_inactive"
 DELIVERY_BAD_SEQUENCE = "bad_sequence"
+#: A batch inbox retry named a message the recipient already acknowledged.
+DELIVERY_ALREADY_ACKED = "already_acked"
 
 #: Outcome codes for identity-key rotation.
 DEVICE_UNKNOWN = "device_unknown"
@@ -287,6 +289,20 @@ class MessageSyncAckBatchError(Exception):
 
     Carries the zero-based *index* of the first (and only reported) offending
     item; validation runs in array order and the whole batch writes nothing.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
+class InboxRetryBatchError(Exception):
+    """A device-scoped batch 1:1 inbox retry failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported) offending
+    item; every precheck runs in array order before the batch writes a single
+    attempt id, so the whole batch writes nothing on failure.
     """
 
     def __init__(self, reason: str, index: int) -> None:
@@ -2077,6 +2093,96 @@ class DeviceStore:
                 "messages": [self.message_view(entry[2]) for entry in page],
                 "has_more": len(entries) > limit,
             }
+
+    def inbox_retry_batch(
+            self, device_id: str, items: List[Tuple[str, str, str]]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Record delivery attempts for several 1:1 inbox messages at once.
+
+        *items* are unique ``(session_id, message_id, attempt_id)`` triples
+        already validated for shape by the service. The device must exist and
+        not be revoked (a batch-level ``device_unknown``/``device_inactive``
+        :class:`MessageSyncError`). Items are then prechecked in array order
+        and the first failure raises :class:`InboxRetryBatchError` carrying
+        that item's index before any attempt id is written:
+
+        * a session that is neither a 1:1 nor a group session ->
+          ``session_unknown`` (404);
+        * a group session, or a 1:1 session whose recipient is not this device
+          -> ``device_not_participant`` (409);
+        * an unknown message -> ``message_unknown`` (404);
+        * a message the recipient has already acknowledged ->
+          ``already_acked`` (409).
+
+        Once every item passes, each delivery record's attempt-id dedup set
+        gains the item's ``attempt_id`` under the one store lock: an id
+        already recorded (by any earlier retry) is a replay that is not
+        counted, every other id increments ``attempts``. A single persistence
+        notification covers the whole batch, so a durable write failure rolls
+        all the records back and the generation advances at most once.
+        Returns ``(results, any_new)`` with one three-field
+        (``session_id``/``message_id``/``attempts``) result per item, in input
+        order; ``any_new`` says whether at least one attempt id was new (201
+        vs 200; an all-replay batch writes nothing).
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            plans: List[Dict[str, Any]] = []
+            for index, (session_id, message_id, attempt_id) in enumerate(items):
+                session = self._sessions.get(session_id)
+                if session is None:
+                    reason = MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT \
+                        if self._group_sessions.get(session_id) is not None \
+                        else MESSAGE_SYNC_SESSION_UNKNOWN
+                    raise InboxRetryBatchError(reason, index)
+                if device_id != session.recipient_device_id:
+                    raise InboxRetryBatchError(
+                        MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT, index)
+                message = next(
+                    (m for m in self._messages.get(session_id, [])
+                     if m.message_id == message_id), None)
+                if message is None:
+                    raise InboxRetryBatchError(
+                        DELIVERY_MESSAGE_UNKNOWN, index)
+                state = self._delivery.get((session_id, message_id))
+                if state is not None and state.acked:
+                    raise InboxRetryBatchError(
+                        DELIVERY_ALREADY_ACKED, index)
+                # Every precheck above runs before the commit loop below, so
+                # the first failing item leaves the batch completely unwritten.
+                plans.append({
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "attempt_id": attempt_id,
+                    "state": state,
+                })
+            any_new = False
+            for plan in plans:
+                state = plan["state"]
+                if state is None:
+                    state = MessageDelivery()
+                    self._delivery[(plan["session_id"],
+                                    plan["message_id"])] = state
+                if plan["attempt_id"] not in state.attempt_ids:
+                    state.attempt_ids.add(plan["attempt_id"])
+                    state.attempts += 1
+                    any_new = True
+            if any_new:
+                # One persistence notification for the whole batch: every new
+                # attempt id commits (or rolls back) together and the
+                # generation advances at most once.
+                self._notify_change()
+            results = [{
+                "session_id": plan["session_id"],
+                "message_id": plan["message_id"],
+                "attempts": self._delivery[(plan["session_id"],
+                                            plan["message_id"])].attempts,
+            } for plan in plans]
+            return results, any_new
 
     # -- messages ----------------------------------------------------------
 
