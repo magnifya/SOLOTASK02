@@ -2633,6 +2633,97 @@ class DeviceStore:
                      "outcome": outcome,
                      "completed_at": completed_at}, 201)
 
+    def inbox_lease_view(
+            self, device_id: str, lease_id: str) -> Dict[str, Any]:
+        """Read one occupied 1:1-inbox lease's current snapshot.
+
+        ``GET /v1/devices/{device_id}/inbox/leases/{lease_id}``. Under the
+        one store lock (shared with claims, renewals, releases, completions,
+        acks, retries and revocation) the lease is resolved first: a
+        never-committed *lease_id* raises ``lease_not_found`` (404/lease_id)
+        and one owned by another device raises ``lease_id_conflict``
+        (409/lease_id), regardless of the path device's state. A matching
+        lease answers even after its device was revoked — the query never
+        inspects the device record.
+
+        The query is a pure read: it notifies no persistence, advances no
+        commit generation and touches no record, so an unchanged state
+        answers byte-identically and a restart rebuilds the same view from
+        ``delivery[].leases``. The body carries, in key order,
+        ``device_id``, ``lease_id``, ``limit`` (the claim value), ``state``,
+        ``leased_until`` (the last renewal's deadline, or the claim
+        deadline when never renewed), ``released_at`` (string or ``None``),
+        ``completion`` (``None`` or the
+        ``completion_id``/``outcome``/``completed_at`` record) and
+        ``messages``. ``state`` is ``completed`` once a completion
+        committed and ``released`` once a release committed (the terminal
+        states win); otherwise it is ``active`` only while the query moment
+        precedes the effective deadline, else ``expired``. ``messages``
+        keeps every message the lease claimed, in the original claim order
+        — an acknowledgement never drops an item — each item carrying
+        ``session_id``/``message_id``/``sequence``/``acked``/``attempts``
+        with the last two read from the delivery record as it stands under
+        the lock.
+        """
+        with self._lock:
+            existing = self._find_inbox_lease_locked(lease_id)
+            if existing is None:
+                raise InboxLeaseError(INBOX_LEASE_NOT_FOUND)
+            owner, limit, _claim_deadline, released_at, keys = existing
+            # A cross-device query is a conflict regardless of the path
+            # device's current state, mirroring the other lease endpoints.
+            if owner != device_id:
+                raise InboxLeaseError(INBOX_LEASE_CONFLICT)
+            # Restore validation keeps every copy of the lease identical,
+            # so the first record's copy is authoritative for the renewal
+            # chain and the completion.
+            lease = next(
+                candidate
+                for candidate in self._delivery[keys[0]].leases
+                if candidate.lease_id == lease_id)
+            if lease.completion is not None:
+                state = "completed"
+            elif lease.released_at is not None:
+                state = "released"
+            else:
+                now = datetime.now(timezone.utc)
+                deadline = self._lease_effective_deadline_locked(lease)
+                state = "active" if deadline is not None \
+                    and deadline > now else "expired"
+            leased_until = lease.renewals[-1].leased_until \
+                if lease.renewals else lease.leased_until
+            completion = None
+            if lease.completion is not None:
+                completion = {
+                    "completion_id": lease.completion.completion_id,
+                    "outcome": lease.completion.outcome,
+                    "completed_at": lease.completion.completed_at,
+                }
+            messages = []
+            for session_id, message_id in keys:
+                message = next(
+                    m for m in self._messages[session_id]
+                    if m.message_id == message_id)
+                delivery = self._delivery.get((session_id, message_id))
+                messages.append({
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "sequence": message.sequence,
+                    "acked": delivery.acked if delivery is not None else False,
+                    "attempts": delivery.attempts
+                    if delivery is not None else 0,
+                })
+            return {
+                "device_id": device_id,
+                "lease_id": lease_id,
+                "limit": limit,
+                "state": state,
+                "leased_until": leased_until,
+                "released_at": released_at,
+                "completion": completion,
+                "messages": messages,
+            }
+
     def inbox_retry_batch(
             self, device_id: str, attempt_id: str,
             items: List[Tuple[str, str]]

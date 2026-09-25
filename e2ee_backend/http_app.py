@@ -333,6 +333,15 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_device_inbox(unquote(device_id))
                 return
+            # {device_id}/inbox/leases/{lease_id} — split on raw slashes;
+            # the per-lease sub-resources (release/renew/complete) are POST
+            # only, so a GET on them falls through to the generic 404.
+            parts = suffix.split("/")
+            if (len(parts) == 4 and parts[0] and parts[1] == "inbox"
+                    and parts[2] == "leases" and parts[3]):
+                self._handle_device_inbox_lease_get(
+                    unquote(parts[0]), unquote(parts[3]))
+                return
             if not suffix or "/" in suffix:
                 self._send_json(404, {"message": "device not found",
                                       "field": "device_id"})
@@ -755,6 +764,34 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(status_code, body)
+
+    def _handle_device_inbox_lease_get(
+            self, device_id: str, lease_id: str) -> None:
+        # The lease query takes no request body and no query parameters;
+        # either one is a malformed request (400/request_body / 400/query).
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        if urlsplit(self.path).query != "":
+            self._send_json(400, {"message": "query parameters are not "
+                                              "accepted",
+                                  "field": "query"})
+            return
+        try:
+            body = self.service.inbox_lease_get(device_id, lease_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
 
     def _handle_device_inbox_lease_release(
             self, device_id: str, lease_id: str) -> None:

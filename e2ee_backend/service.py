@@ -1638,6 +1638,46 @@ class DeviceService:
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
 
+    def inbox_lease_get(self, device_id: str,
+                        lease_id: str) -> Dict[str, Any]:
+        """Return one occupied 1:1-inbox lease's current snapshot.
+
+        ``GET /v1/devices/{device_id}/inbox/leases/{lease_id}`` (no request
+        body or query parameters — the HTTP layer rejects either with
+        400/field ``request_body`` / ``query``). A never-committed
+        ``lease_id`` is 404/field ``lease_id`` and one owned by another
+        device is 409/field ``lease_id``; both are decided in the store
+        under the lock, ahead of the path device's state, and a matching
+        lease stays queryable after its device has been revoked (a
+        completion or release makes it queryable too).
+
+        On success the body keys are, in order, ``device_id``, ``lease_id``,
+        ``limit`` (the claim value), ``state``, ``leased_until`` (the last
+        renewal's deadline, or the claim deadline when never renewed),
+        ``released_at`` (string or null), ``completion`` (null or the
+        ``completion_id``/``outcome``/``completed_at`` record) and
+        ``messages``. ``state`` is exactly ``active``, ``expired``,
+        ``released`` or ``completed``: completion and release take
+        precedence, and an unterminated lease is ``active`` only while the
+        query moment precedes its effective deadline. ``messages`` keeps
+        the claimed messages in claim order — an acknowledgement never
+        removes an item — each with ``session_id``, ``message_id``,
+        ``sequence``, ``acked`` and ``attempts`` (the last two the current
+        in-lock values). The query is purely read-only: it shares the
+        store lock with every lease and delivery operation but writes
+        nothing and advances no ``commit_seq``, and a restart rebuilds the
+        same view from the persisted delivery records.
+        """
+        try:
+            return self.store.inbox_lease_view(device_id, lease_id)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            raise ServiceError(
+                "lease_id is owned by another device",
+                "lease_id", status_code=409)
+
     # -- messages ----------------------------------------------------------
 
     def post_message(self, payload: object) -> Dict[str, Any]:
