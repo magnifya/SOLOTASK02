@@ -36,6 +36,7 @@ from .models import (
     PreKeyBatchClaim,
     PreKeyClaim,
     RedeliveryJob,
+    RedeliveryJobRecovery,
     Session,
     SignedPreKey,
     utc_now_iso,
@@ -191,6 +192,14 @@ REDELIVERY_JOB_NOT_FOUND = "job_not_found"
 #: A dispatch could not take the job's lease because the job_id is already
 #: occupied as an inbox lease id by an unrelated claim.
 REDELIVERY_JOB_LEASE_OCCUPIED = "lease_occupied"
+#: A recover named a recovery_id already committed on another job, or
+#: already occupied as an unrelated inbox lease id (409/recovery_id).
+REDELIVERY_JOB_RECOVERY_CONFLICT = "recovery_id_conflict"
+#: A recover targeted a job whose dispatch lease is still valid, or a job
+#: not in the ``running`` state (409/lease_id for a still-valid lease,
+#: 409/job_id for the other states).
+REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE = "lease_active"
+REDELIVERY_JOB_RECOVERY_STATE = "job_not_recoverable"
 
 #: Number of inbox messages one redelivery-job dispatch leases at most.
 REDELIVERY_JOB_DISPATCH_LIMIT = 100
@@ -410,7 +419,10 @@ class RedeliveryJobError(Exception):
 
     The device-level reasons (``device_unknown`` / ``device_inactive``) map
     to 409/field=device_id; ``job_not_found`` maps to 404/field=job_id and
-    ``job_id_conflict`` to 409/field=job_id.
+    ``job_id_conflict`` to 409/field=job_id. A ``recover`` additionally
+    raises ``recovery_id_conflict`` (409/field=recovery_id),
+    ``lease_active`` (409/field=lease_id) and ``job_not_recoverable``
+    (409/field=job_id).
     """
 
     def __init__(self, reason: str) -> None:
@@ -3119,21 +3131,159 @@ class DeviceStore:
             self._notify_change()
             return self.redelivery_job_view(job), 201
 
+    def redelivery_job_recover(
+            self, device_id: str, job_id: str, recovery_id: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Recover the expired lease of a running redelivery job.
+
+        ``POST /v1/inbox-jobs`` with ``op=recover`` (the non-empty
+        *recovery_id* is already validated by the service). Under the one
+        store lock — shared with leases, completions, acks and revocation —
+        the device is resolved first (unknown/revoked ->
+        ``device_unknown``/``device_inactive``, 409/device_id), then the
+        job: a never-queued id raises ``job_not_found`` (404/job_id) and an
+        id committed for another device raises ``job_id_conflict``
+        (409/job_id).
+
+        Replaying the same *recovery_id* on the same job returns the job's
+        current view with 200 and writes nothing. A *recovery_id* already
+        committed on another job, or already occupied as any inbox lease id
+        (another recovery's new lease included), raises
+        ``recovery_id_conflict`` (409/recovery_id). Only a ``running`` job
+        whose current lease has expired or been released is recoverable: a
+        still-valid lease raises ``lease_active`` (409/lease_id) and every
+        other state raises ``job_not_recoverable`` (409/job_id).
+
+        On a first recovery the inbox's fixed
+        ``(session.created_at, session_id, sequence)`` order yields up to
+        :data:`REDELIVERY_JOB_DISPATCH_LIMIT` unacked messages without a
+        still-active lease. A non-empty selection is leased for the usual
+        :data:`INBOX_LEASE_SECONDS` window under an *ordinary* inbox lease
+        whose id is the *recovery_id*: the job stays ``running`` and its
+        ``lease_id`` moves to that id (the stale dispatch/previous recovery
+        lease stays on the records as history). An empty selection ends the
+        job as ``succeeded`` with ``lease_id`` null. Either outcome appends
+        one recovery record (``recovery_id`` plus the new lease id, or
+        null), notifies persistence once (201, commit_seq + 1) and is
+        terminal for this request — a later completion of the new lease
+        moves the job to ``succeeded``/``failed`` exactly as a dispatch
+        lease does.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            device = self._find_device(device_id)
+            if device is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_INACTIVE)
+            job = self._redelivery_jobs.get(job_id)
+            if job is not None and job.device_id != device_id:
+                raise RedeliveryJobError(REDELIVERY_JOB_CONFLICT)
+            if job is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_NOT_FOUND)
+            # An exact replay answers the job's current view (200) and
+            # writes nothing.
+            if any(record.recovery_id == recovery_id
+                   for record in job.recoveries):
+                return self.redelivery_job_view(job), 200
+            # recovery_id shares one namespace across every job's id, every
+            # job's recovery history and the ordinary inbox lease ids: it
+            # may not equal any (other, or this) job_id — a dispatch may
+            # still take that id as its lease — may not repeat on another
+            # job (its own job was handled by the replay check above) and
+            # may not collide with a lease already committed, including a
+            # previous recovery lease.
+            if any(other.job_id == recovery_id
+                   for other in self._redelivery_jobs.values()):
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_RECOVERY_CONFLICT)
+            if any(any(record.recovery_id == recovery_id
+                       for record in other.recoveries)
+                   for other in self._redelivery_jobs.values()
+                   if other is not job):
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_RECOVERY_CONFLICT)
+            if self._find_inbox_lease_locked(recovery_id) is not None:
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_RECOVERY_CONFLICT)
+            if job.state != REDELIVERY_JOB_RUNNING:
+                raise RedeliveryJobError(REDELIVERY_JOB_RECOVERY_STATE)
+            # Only an expired or released current lease may be recovered:
+            # a still-valid one rejects 409/lease_id. The lease copies are
+            # identical, so the first copy carrying the job's current id is
+            # authoritative.
+            current_lease: Optional[MessageLease] = None
+            for state in self._delivery.values():
+                for lease in state.leases:
+                    if lease.lease_id == job.lease_id:
+                        current_lease = lease
+                        break
+                if current_lease is not None:
+                    break
+            if current_lease is not None \
+                    and self._lease_is_active_locked(current_lease, now):
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE)
+            picked: List[Tuple[Tuple[str, str], Message]] = []
+            for _, session_id, message in self._inbox_entries_locked(
+                    device_id):
+                key = (session_id, message.message_id)
+                state = self._delivery.get(key)
+                if state is not None \
+                        and self._has_active_lease_locked(state, now):
+                    continue
+                picked.append((key, message))
+                if len(picked) >= REDELIVERY_JOB_DISPATCH_LIMIT:
+                    break
+            if picked:
+                # An ordinary inbox lease named by the recovery_id; the
+                # stale dispatch lease stays on the records as history but
+                # no longer withholds these messages.
+                leased_until = (now + timedelta(
+                    seconds=INBOX_LEASE_SECONDS)) \
+                    .isoformat(timespec="microseconds")
+                for key, _message in picked:
+                    state = self._delivery.get(key)
+                    if state is None:
+                        state = MessageDelivery()
+                        self._delivery[key] = state
+                    state.leases.append(MessageLease(
+                        lease_id=recovery_id,
+                        limit=REDELIVERY_JOB_DISPATCH_LIMIT,
+                        leased_until=leased_until))
+                job.lease_id = recovery_id
+                job.recoveries.append(RedeliveryJobRecovery(
+                    recovery_id=recovery_id, lease_id=recovery_id))
+            else:
+                # Nothing left to redeliver: the job finishes succeeded and
+                # keeps no current lease.
+                job.state = REDELIVERY_JOB_SUCCEEDED
+                job.lease_id = None
+                job.recoveries.append(RedeliveryJobRecovery(
+                    recovery_id=recovery_id, lease_id=None))
+            self._notify_change()
+            return self.redelivery_job_view(job), 201
+
     def _redelivery_job_completed_locked(self, lease_id: str,
                                          outcome: str) -> None:
-        """Move a dispatched redelivery job to its terminal state.
+        """Move a dispatched/redelivering redelivery job to a terminal state.
 
-        Called under the store lock when the inbox lease whose id is
-        *lease_id* is completed with *outcome*: a running job that took
-        that lease becomes ``succeeded`` on ``delivered`` and ``failed``
-        on ``failed``, inside the same locked transaction as the
-        completion itself. Leases not taken by a job change nothing.
+        Called under the store lock when an inbox lease is completed with
+        *outcome*. A dispatch lease's id is the job_id itself, but a lease
+        created by ``op=recover`` carries the client's ``recovery_id`` as
+        its lease id, so the running job is found by its current
+        ``lease_id`` rather than by job id. It becomes ``succeeded`` on
+        ``delivered`` and ``failed`` on ``failed``, inside the same locked
+        transaction as the completion. Leases not currently held by a
+        running job change nothing (an expired/superseded lease cannot be
+        completed anyway).
         """
-        job = self._redelivery_jobs.get(lease_id)
-        if job is not None and job.state == REDELIVERY_JOB_RUNNING \
-                and job.lease_id == lease_id:
-            job.state = REDELIVERY_JOB_SUCCEEDED \
-                if outcome == "delivered" else REDELIVERY_JOB_FAILED
+        for job in self._redelivery_jobs.values():
+            if job.state == REDELIVERY_JOB_RUNNING \
+                    and job.lease_id == lease_id:
+                job.state = REDELIVERY_JOB_SUCCEEDED \
+                    if outcome == "delivered" else REDELIVERY_JOB_FAILED
+                return
 
     def inbox_retry_batch(
             self, device_id: str, attempt_id: str,
@@ -3712,12 +3862,24 @@ class DeviceStore:
                 "ciphertext": r.ciphertext,
                 "created_at": r.created_at,
             } for r in self._message_submissions.values()]
-            redelivery_jobs = [{
-                "job_id": job.job_id,
-                "device_id": job.device_id,
-                "state": job.state,
-                "lease_id": job.lease_id,
-            } for job in self._redelivery_jobs.values()]
+            redelivery_jobs = []
+            for job in self._redelivery_jobs.values():
+                item = {
+                    "job_id": job.job_id,
+                    "device_id": job.device_id,
+                    "state": job.state,
+                    "lease_id": job.lease_id,
+                }
+                # Older items predate the fifth key: an empty recovery
+                # history stays omitted (loading treats the missing key as
+                # an empty list), which also keeps the canonical snapshot
+                # hash of pre-recovery documents identical.
+                if job.recoveries:
+                    item["recoveries"] = [{
+                        "recovery_id": record.recovery_id,
+                        "lease_id": record.lease_id,
+                    } for record in job.recoveries]
+                redelivery_jobs.append(item)
             key_events = [
                 self.key_event_view(event)
                 for chain in self._key_events.values() for event in chain
@@ -5100,15 +5262,29 @@ class DeviceStore:
         # 1:1-inbox redelivery jobs. Older version-1 files predate the
         # section: it is absent and treated as empty. A present section is
         # fully validated — job_id unique, device_id a registered device,
-        # state one of the four wire values, lease_id null or the job_id
-        # itself — and the state machine must agree with the lease records
-        # restored above: a pending job has no lease; a running job's lease
-        # exists, belongs to the job's device and is uncompleted; a
-        # succeeded job either never took a lease (empty dispatch) or its
-        # lease completed ``delivered``; a failed job's lease completed
-        # ``failed``. Any contradiction refuses startup rather than
-        # silently dropping the job state machine.
+        # state one of the four wire values, lease_id null or a lease that
+        # exists, is owned by the job's device and agrees with the state
+        # machine — together with the optional per-job ``recoveries``
+        # history (absent on older items means empty): each record carries
+        # exactly recovery_id/lease_id, the id is a non-empty string
+        # globally unique across every job's recovery history, lease_id is
+        # null (an empty recovery that ended the job) or a non-empty string
+        # equal to its recovery_id whose inbox lease exists and belongs to
+        # the job's device. The state machine is checked in both
+        # directions: a pending job has neither a lease nor recoveries; a
+        # running job's current lease is its dispatch lease (the job_id)
+        # with no recovery history, or the uncompleted lease of the last
+        # (non-empty) recovery; a succeeded job either never dispatched a
+        # lease, carries a lease completed ``delivered`` (its dispatch
+        # lease without recoveries, or the last recovery lease), or ended
+        # on an empty recovery (last record lease_id null, no current
+        # lease); a failed job's current lease completed ``failed``; every
+        # earlier recovery lease must be uncompleted (it expired or was
+        # released before the next recovery and never terminated the job).
+        # Any contradiction refuses startup rather than silently dropping
+        # the job state machine.
         redelivery_jobs: Dict[str, RedeliveryJob] = {}
+        recovery_ids_seen: Set[str] = set()
         for index, raw in enumerate(raw_redelivery_jobs):
             where = f"redelivery_jobs[{index}]"
             if not isinstance(raw, dict):
@@ -5135,47 +5311,185 @@ class DeviceStore:
                     isinstance(j_lease_id, str) and j_lease_id):
                 raise ValueError(
                     f"{where}.lease_id must be null or a non-empty string")
-            if j_lease_id is not None and j_lease_id != j_job_id:
-                raise ValueError(
-                    f"{where}.lease_id must be null or equal the job_id")
             if j_job_id in redelivery_jobs:
                 raise ValueError(
                     f"duplicate redelivery job in state: {j_job_id}")
             if j_device_id not in device_index:
                 raise ValueError(
                     f"{where} references an unknown device: {j_device_id}")
-            binding = lease_index.get(j_job_id)
-            completion = binding[5] if binding is not None else None
-            if j_state == REDELIVERY_JOB_PENDING:
-                if j_lease_id is not None:
+            # Per-job recovery history. Older items predate the key: it is
+            # absent and treated as empty. A present value must be a list
+            # of well-formed records with globally unique recovery ids.
+            raw_recoveries = raw.get("recoveries", [])
+            if not isinstance(raw_recoveries, list):
+                raise ValueError(f"{where}.recoveries must be a list")
+            recoveries: List[RedeliveryJobRecovery] = []
+            for rec_index, raw_recovery in enumerate(raw_recoveries):
+                rec_where = f"{where}.recoveries[{rec_index}]"
+                if not isinstance(raw_recovery, dict):
+                    raise ValueError(f"{rec_where} must be an object")
+                if list(raw_recovery) != ["recovery_id", "lease_id"]:
                     raise ValueError(
-                        f"{where} is pending but carries a lease_id")
-            elif j_state == REDELIVERY_JOB_RUNNING:
-                if j_lease_id is None or binding is None \
-                        or binding[0] != j_device_id \
-                        or completion is not None:
+                        f"{rec_where} must have exactly the keys "
+                        f"'recovery_id', 'lease_id' in order")
+                rec_id = raw_recovery["recovery_id"]
+                rec_lease_id = raw_recovery["lease_id"]
+                if not (isinstance(rec_id, str) and rec_id):
                     raise ValueError(
-                        f"{where} is running but has no matching "
-                        f"uncompleted lease owned by {j_device_id}")
-            elif j_state == REDELIVERY_JOB_SUCCEEDED:
-                if j_lease_id is not None and (
-                        binding is None or binding[0] != j_device_id
-                        or completion is None
-                        or completion[1] != "delivered"):
+                        f"{rec_where}.recovery_id must be a non-empty "
+                        f"string")
+                if rec_lease_id is not None and not (
+                        isinstance(rec_lease_id, str) and rec_lease_id):
                     raise ValueError(
-                        f"{where} is succeeded but its lease did not "
-                        f"complete 'delivered'")
-            else:  # REDELIVERY_JOB_FAILED
-                if j_lease_id is None or binding is None \
-                        or binding[0] != j_device_id \
-                        or completion is None \
-                        or completion[1] != "failed":
+                        f"{rec_where}.lease_id must be null or a "
+                        f"non-empty string")
+                # The live entry point forbids recovery_id == this job's id
+                # unconditionally (it would collide with the dispatch
+                # lease), so no recovery record may reuse its own job_id.
+                if rec_id == j_job_id:
                     raise ValueError(
-                        f"{where} is failed but its lease did not "
-                        f"complete 'failed'")
+                        f"{rec_where}.recovery_id must not equal the "
+                        f"job's own dispatch lease id (job_id) {j_job_id}")
+                # A non-empty recovery always leases under its own
+                # recovery_id; an empty one records null.
+                if rec_lease_id is not None \
+                        and rec_lease_id != rec_id:
+                    raise ValueError(
+                        f"{rec_where}.lease_id must equal its recovery_id")
+                if rec_id in recovery_ids_seen:
+                    raise ValueError(
+                        f"recovery_id repeats across redelivery jobs: "
+                        f"{rec_id}")
+                recovery_ids_seen.add(rec_id)
+                recoveries.append(RedeliveryJobRecovery(
+                    recovery_id=rec_id, lease_id=rec_lease_id))
+
+            dispatch_binding = lease_index.get(j_job_id)
+            dispatch_completion = dispatch_binding[5] \
+                if dispatch_binding is not None else None
+            if not recoveries:
+                # No recoveries: the original four-state rules against the
+                # dispatch lease (whose id is the job_id).
+                if j_state == REDELIVERY_JOB_PENDING:
+                    if j_lease_id is not None:
+                        raise ValueError(
+                            f"{where} is pending but carries a lease_id")
+                elif j_state == REDELIVERY_JOB_RUNNING:
+                    if j_lease_id != j_job_id or dispatch_binding is None \
+                            or dispatch_binding[0] != j_device_id \
+                            or dispatch_completion is not None:
+                        raise ValueError(
+                            f"{where} is running but has no matching "
+                            f"uncompleted dispatch lease owned by "
+                            f"{j_device_id}")
+                elif j_state == REDELIVERY_JOB_SUCCEEDED:
+                    if j_lease_id is not None and (
+                            dispatch_binding is None
+                            or dispatch_binding[0] != j_device_id
+                            or dispatch_completion is None
+                            or dispatch_completion[1] != "delivered"):
+                        raise ValueError(
+                            f"{where} is succeeded but its lease did not "
+                            f"complete 'delivered'")
+                else:  # REDELIVERY_JOB_FAILED
+                    if j_lease_id is None or dispatch_binding is None \
+                            or dispatch_binding[0] != j_device_id \
+                            or dispatch_completion is None \
+                            or dispatch_completion[1] != "failed":
+                        raise ValueError(
+                            f"{where} is failed but its lease did not "
+                            f"complete 'failed'")
+            else:
+                # A recovery history implies the job was dispatched: the
+                # dispatch lease exists, belongs to this device and was
+                # never completed (completing it would have terminated the
+                # job before any recovery; a recovery only follows an
+                # expired or released lease).
+                if dispatch_binding is None \
+                        or dispatch_binding[0] != j_device_id \
+                        or dispatch_completion is not None:
+                    raise ValueError(
+                        f"{where} carries recoveries but has no matching "
+                        f"uncompleted dispatch lease owned by "
+                        f"{j_device_id}")
+                if j_state == REDELIVERY_JOB_PENDING:
+                    raise ValueError(
+                        f"{where} is pending but carries recoveries")
+                # A null-leased (empty) recovery ends the job succeeded;
+                # only the last record may be null and then the job must be
+                # succeeded with no current lease. Every non-null record
+                # names a lease that exists and belongs to this device, and
+                # every record but the last must be uncompleted (an
+                # expired/released lease, never one that terminated the
+                # job).
+                for rec_position, record in enumerate(recoveries):
+                    is_last = rec_position == len(recoveries) - 1
+                    if record.lease_id is None:
+                        if not (is_last
+                                and j_state == REDELIVERY_JOB_SUCCEEDED):
+                            raise ValueError(
+                                f"{where}.recoveries[{rec_position}] is an "
+                                f"empty recovery that may only end the job "
+                                f"as its final record")
+                        continue
+                    rec_binding = lease_index.get(record.lease_id)
+                    if rec_binding is None \
+                            or rec_binding[0] != j_device_id:
+                        raise ValueError(
+                            f"{where}.recoveries[{rec_position}] names an "
+                            f"unknown lease not owned by {j_device_id}: "
+                            f"{record.lease_id}")
+                    rec_completion = rec_binding[5]
+                    if not is_last and rec_completion is not None:
+                        raise ValueError(
+                            f"{where}.recoveries[{rec_position}] completed "
+                            f"before a later recovery")
+                last_record = recoveries[-1]
+                if j_state == REDELIVERY_JOB_RUNNING:
+                    if last_record.lease_id is None \
+                            or j_lease_id != last_record.lease_id:
+                        raise ValueError(
+                            f"{where} is running but its lease_id does not "
+                            f"match its latest recovery lease")
+                    last_binding = lease_index.get(j_lease_id)
+                    if last_binding is None or last_binding[5] is not None:
+                        raise ValueError(
+                            f"{where} is running but its current recovery "
+                            f"lease is missing or already completed")
+                elif j_state == REDELIVERY_JOB_SUCCEEDED:
+                    if last_record.lease_id is None:
+                        if j_lease_id is not None:
+                            raise ValueError(
+                                f"{where} is succeeded after an empty "
+                                f"recovery but still carries a lease_id")
+                    else:
+                        if j_lease_id != last_record.lease_id:
+                            raise ValueError(
+                                f"{where} is succeeded but its lease_id "
+                                f"does not match its latest recovery lease")
+                        last_binding = lease_index.get(j_lease_id)
+                        if last_binding is None \
+                                or last_binding[5] is None \
+                                or last_binding[5][1] != "delivered":
+                            raise ValueError(
+                                f"{where} is succeeded but its recovery "
+                                f"lease did not complete 'delivered'")
+                else:  # REDELIVERY_JOB_FAILED
+                    if last_record.lease_id is None \
+                            or j_lease_id != last_record.lease_id:
+                        raise ValueError(
+                            f"{where} is failed but its lease_id does not "
+                            f"match its latest recovery lease")
+                    last_binding = lease_index.get(j_lease_id)
+                    if last_binding is None \
+                            or last_binding[5] is None \
+                            or last_binding[5][1] != "failed":
+                        raise ValueError(
+                            f"{where} is failed but its recovery lease did "
+                            f"not complete 'failed'")
             redelivery_jobs[j_job_id] = RedeliveryJob(
                 job_id=j_job_id, device_id=j_device_id, state=j_state,
-                lease_id=j_lease_id)
+                lease_id=j_lease_id, recoveries=recoveries)
 
         # Per-device group-session delivery records. Older version-1 files
         # predate the section: it is absent and treated as empty. A present
