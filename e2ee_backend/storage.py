@@ -147,11 +147,32 @@ INBOX_LEASE_DEVICE_INACTIVE = "device_inactive"
 #: limit (or a mismatched deadline); replay is only allowed for the exact
 #: same device and limit.
 INBOX_LEASE_CONFLICT = "lease_id_conflict"
+#: No lease was ever committed under the lease_id a release names.
+INBOX_LEASE_NOT_FOUND = "lease_not_found"
 
 #: Lifetime of one inbox redelivery lease, in seconds. A message leased by a
 #: claim is withheld from later claims until this deadline passes, after
 #: which a fresh ``lease_id`` may claim it again.
 INBOX_LEASE_SECONDS = 30
+
+
+def _is_utc_microsecond_iso(value: Any) -> bool:
+    """Whether *value* is a canonical UTC ISO-8601 timestamp.
+
+    The only form this server ever writes: six microsecond digits and a
+    ``+00:00`` offset, exactly as ``isoformat(timespec="microseconds")``
+    emits. The round-trip comparison also rejects unparseable or
+    non-canonical (but ISO-valid) renderings.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        return False
+    return parsed.isoformat(timespec="microseconds") == value
 
 #: Outcome codes for group-session rotation.
 ROTATION_SESSION_UNKNOWN = "session_unknown"
@@ -2111,10 +2132,13 @@ class DeviceStore:
                                 now: datetime) -> bool:
         """Whether *lease* has not passed its deadline at *now*.
 
+        A released lease is never active again, whatever its deadline says.
         Deadlines written by this server always parse as timezone-aware ISO
         timestamps; an unparseable (legacy/tampered) value is treated as
         expired rather than withholding the message forever.
         """
+        if lease.released_at is not None:
+            return False
         try:
             deadline = datetime.fromisoformat(lease.leased_until)
         except (TypeError, ValueError):
@@ -2131,18 +2155,20 @@ class DeviceStore:
 
     def _find_inbox_lease_locked(
             self, lease_id: str
-    ) -> Optional[Tuple[str, int, str, List[Tuple[str, str]]]]:
+    ) -> Optional[Tuple[str, int, str, Optional[str], List[Tuple[str, str]]]]:
         """Look up an occupied inbox lease across the 1:1 delivery records.
 
-        Returns ``(device_id, limit, leased_until, keys)`` where ``keys`` are
-        the ``(session_id, message_id)`` pairs the lease was taken on, in
-        inbox order — or ``None`` when the id has never been committed.
-        Restore validation guarantees one id always binds one device, limit
-        and deadline, so the first record found is authoritative.
+        Returns ``(device_id, limit, leased_until, released_at, keys)`` where
+        ``keys`` are the ``(session_id, message_id)`` pairs the lease was
+        taken on, in inbox order — or ``None`` when the id has never been
+        committed. Restore validation guarantees one id always binds one
+        device, limit, deadline and release timestamp, so the first record
+        found is authoritative.
         """
         owner = ""
         owner_limit = 0
         leased_until = ""
+        released_at: Optional[str] = None
         keys: List[Tuple[str, str]] = []
         for (session_id, message_id), state in self._delivery.items():
             for lease in state.leases:
@@ -2154,6 +2180,7 @@ class DeviceStore:
                         is not None else ""
                     owner_limit = lease.limit
                     leased_until = lease.leased_until
+                    released_at = lease.released_at
                 keys.append((session_id, message_id))
         if not keys:
             return None
@@ -2164,7 +2191,7 @@ class DeviceStore:
             key=lambda key: (self._sessions[key[0]].created_at, key[0],
                              next(m.sequence for m in self._messages[key[0]]
                                   if m.message_id == key[1])))
-        return (owner, owner_limit, leased_until, ordered)
+        return (owner, owner_limit, leased_until, released_at, ordered)
 
     def device_inbox(self, device_id: str, limit: int) -> Dict[str, Any]:
         """Atomically read one device's aggregated 1:1 offline inbox.
@@ -2230,7 +2257,8 @@ class DeviceStore:
 
             existing = self._find_inbox_lease_locked(lease_id)
             if existing is not None:
-                owner, owner_limit, leased_until, leased_keys = existing
+                owner, owner_limit, leased_until, _released, leased_keys = \
+                    existing
                 # A cross-device replay or a changed limit is a conflict
                 # regardless of the path device's current state; an exact
                 # replay returns the first response (200) even if the device
@@ -2305,6 +2333,70 @@ class DeviceStore:
                              for _key, message in picked],
             }
             return body, 201, True
+
+    def inbox_release(
+            self, device_id: str, lease_id: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Release one occupied 1:1-inbox lease before its deadline.
+
+        ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/release``.
+        Under the one store lock (shared with claims, acks, retries and
+        revocation), the lease is resolved first: a never-committed
+        *lease_id* raises ``lease_not_found`` (404/lease_id) and one owned
+        by another device raises ``lease_id_conflict`` (409/lease_id),
+        regardless of the path device's state. A lease that was already
+        released is an exact replay: the first response is rebuilt from the
+        persisted release timestamp with status 200 and nothing is written —
+        even if the device has since been revoked. Only a first release
+        resolves the device (unknown/revoked -> :class:`InboxLeaseError`
+        ``device_unknown``/``device_inactive``, 409/device_id).
+
+        The release stamps the same UTC ``released_at`` (six microsecond
+        digits, ``+00:00``) onto every delivery record the lease was taken
+        on; the lease stays as history but no longer withholds its messages
+        from new claims, and replaying the original claim still returns the
+        frozen claim response without reactivating anything. The whole
+        release commits as one persistence notification (201, commit_seq +
+        1); a durable write failure rolls every record back. Returns
+        ``(body, status_code)`` with ``released_count`` the number of
+        messages the lease had claimed.
+        """
+        with self._lock:
+            existing = self._find_inbox_lease_locked(lease_id)
+            if existing is None:
+                raise InboxLeaseError(INBOX_LEASE_NOT_FOUND)
+            owner, _limit, _deadline, released_at, keys = existing
+            # A cross-device release is a conflict regardless of the path
+            # device's current state, mirroring the claim replay rules.
+            if owner != device_id:
+                raise InboxLeaseError(INBOX_LEASE_CONFLICT)
+            if released_at is not None:
+                # Exact replay: the frozen first response, byte-identical,
+                # even if the device has since been revoked.
+                return ({"device_id": device_id, "lease_id": lease_id,
+                         "released_at": released_at,
+                         "released_count": len(keys)}, 200)
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            released_at = datetime.now(timezone.utc) \
+                .isoformat(timespec="microseconds")
+            for key in keys:
+                state = self._delivery.get(key)
+                if state is None:
+                    continue
+                for lease in state.leases:
+                    if lease.lease_id == lease_id:
+                        lease.released_at = released_at
+            # One persistence notification for the whole lease set: every
+            # per-message release commits (or rolls back) together and the
+            # generation advances at most once.
+            self._notify_change()
+            return ({"device_id": device_id, "lease_id": lease_id,
+                     "released_at": released_at,
+                     "released_count": len(keys)}, 201)
 
     def inbox_retry_batch(
             self, device_id: str, attempt_id: str,
@@ -2835,6 +2927,7 @@ class DeviceStore:
                     "lease_id": lease.lease_id,
                     "limit": lease.limit,
                     "leased_until": lease.leased_until,
+                    "released_at": lease.released_at,
                 } for lease in state.leases],
             } for (sid, mid), state in self._delivery.items()]
             group_delivery = [{
@@ -3993,11 +4086,12 @@ class DeviceStore:
 
         delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         # Global inbox-lease index, keyed by lease_id. One id is durably
-        # bound to exactly one device, one limit and one deadline across
-        # every delivery record it appears on; a contradiction refuses
-        # startup. Built while delivery records are parsed and cross-checked
-        # below (sessions are already restored, so the owner device is known).
-        lease_index: Dict[str, Tuple[str, int, str]] = {}
+        # bound to exactly one device, one limit, one deadline and one
+        # release timestamp across every delivery record it appears on; a
+        # contradiction refuses startup. Built while delivery records are
+        # parsed and cross-checked below (sessions are already restored, so
+        # the owner device is known).
+        lease_index: Dict[str, Tuple[str, int, str, Optional[str]]] = {}
         for index, raw in enumerate(raw_delivery):
             where = f"delivery[{index}]"
             if not isinstance(raw, dict):
@@ -4051,8 +4145,10 @@ class DeviceStore:
             # Inbox redelivery leases. Older version-1 files predate the
             # field: it is absent and treated as empty. A present field must
             # be a list of well-formed objects, one lease_id must not repeat
-            # within a record, and each id binds one device/limit/deadline
-            # globally.
+            # within a record, and each id binds one device/limit/deadline/
+            # release timestamp globally. The per-lease ``released_at`` key
+            # is itself a later extension: absent means null (never
+            # released); a non-null value must be a canonical UTC timestamp.
             leases: List[MessageLease] = []
             if "leases" in raw:
                 raw_leases = raw["leases"]
@@ -4092,20 +4188,29 @@ class DeviceStore:
                         raise ValueError(
                             f"{l_where}.leased_until must be a non-empty "
                             f"string")
+                    released_at = raw_lease.get("released_at")
+                    if released_at is not None \
+                            and not _is_utc_microsecond_iso(released_at):
+                        raise ValueError(
+                            f"{l_where}.released_at must be null or a UTC "
+                            f"ISO-8601 timestamp with six microsecond "
+                            f"digits and a +00:00 offset")
                     if lease_id in seen_lease_ids:
                         raise ValueError(
                             f"{l_where} repeats lease_id {lease_id}")
                     seen_lease_ids.add(lease_id)
-                    binding = (owner_device, lease_limit, leased_until)
+                    binding = (owner_device, lease_limit, leased_until,
+                               released_at)
                     prior = lease_index.get(lease_id)
                     if prior is not None and prior != binding:
                         raise ValueError(
                             f"inbox lease {lease_id} is bound inconsistently "
-                            f"across records (device/limit/leased_until)")
+                            f"across records (device/limit/leased_until/"
+                            f"released_at)")
                     lease_index[lease_id] = binding
                     leases.append(MessageLease(
                         lease_id=lease_id, limit=lease_limit,
-                        leased_until=leased_until))
+                        leased_until=leased_until, released_at=released_at))
             # The ack cursor mirrors the message once acked and is 0 before.
             if acked:
                 if ack_sequence != target.sequence:

@@ -72,6 +72,7 @@ from .storage import (
     INBOX_LEASE_CONFLICT,
     INBOX_LEASE_DEVICE_INACTIVE,
     INBOX_LEASE_DEVICE_UNKNOWN,
+    INBOX_LEASE_NOT_FOUND,
     PREKEY_CONFLICT,
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
@@ -1463,6 +1464,44 @@ class DeviceService:
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
         return body, status_code
+
+    def inbox_release(self, device_id: str,
+                      lease_id: str) -> Tuple[Dict[str, Any], int]:
+        """Release one occupied 1:1-inbox lease before its deadline.
+
+        ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/release``
+        (no request body; the HTTP layer rejects a non-empty one with
+        400/field ``request_body``). A never-committed ``lease_id`` is
+        404/field ``lease_id``; a lease owned by another device is
+        409/field ``lease_id``; both are decided in the store under the
+        lock, ahead of the path device's state. A first release on a
+        revoked device is 409/field ``device_id``.
+
+        A first release returns 201 with ``device_id``, ``lease_id``,
+        ``released_at`` (UTC ISO-8601, six microsecond digits, ``+00:00``)
+        and ``released_count`` (the number of messages the lease had
+        claimed) in that key order, and persists one generation; a repeat
+        release returns 200 with the first response byte-identically, even
+        if the device has since been revoked. The released lease stops
+        withholding its messages from new claims; replaying the original
+        claim still returns its frozen first response and reactivates
+        nothing.
+        """
+        try:
+            return self.store.inbox_release(device_id, lease_id)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
 
     # -- messages ----------------------------------------------------------
 

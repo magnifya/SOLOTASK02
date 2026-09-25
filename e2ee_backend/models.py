@@ -235,11 +235,17 @@ class MessageLease:
     same ``lease_id`` — globally unique — is durably bound to exactly one
     device, one limit and one ``leased_until`` timestamp. Only identifiers,
     the small integer limit and the UTC deadline are retained.
+
+    ``released_at`` is ``None`` while the lease is held and the UTC release
+    timestamp once ``POST .../inbox/leases/{lease_id}/release`` committed:
+    a released lease stays on the record as history (the release replays
+    from it) but no longer withholds the message from new claims.
     """
 
     lease_id: str
     limit: int
     leased_until: str
+    released_at: Optional[str] = None
 
 
 @dataclass
