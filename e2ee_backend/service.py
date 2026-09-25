@@ -11,6 +11,10 @@ from .crypto import is_nonempty_string, load_public_key
 from .models import Device, SignedPreKey
 from .persistence import IntegrityCheckError
 from .storage import (
+    BATCH_ACK_DEVICE_INACTIVE,
+    BATCH_ACK_DEVICE_UNKNOWN,
+    BATCH_ACK_SESSION_NOT_RECEIVABLE,
+    BATCH_ACK_SESSION_UNKNOWN,
     BATCH_CLAIM_NO_ACTIVE_DEVICE,
     BATCH_CLAIM_NO_PREKEY,
     BATCH_CLAIM_USER_UNKNOWN,
@@ -95,6 +99,7 @@ from .storage import (
     GroupSyncError,
     MessageCreateError,
     MessageListError,
+    MessageSyncAckBatchError,
     MessageSyncError,
     PreKeyClaimError,
     PreKeyBatchClaimError,
@@ -1168,6 +1173,104 @@ class DeviceService:
         except MessageSyncError as error:
             raise self._message_sync_error(error, session_id)
         return view, 201 if advanced else 200
+
+    def sync_session_ack_batch(self, device_id: str,
+                               payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply a device-centric multi-session batch ack.
+
+        The body carries a non-empty ``items`` array whose elements each pair
+        a non-empty ``session_id`` with an integer non-negative non-bool
+        ``cursor``; session ids must not repeat. Body, array, element and
+        field violations are 400 naming ``request_body``, ``items``,
+        ``items[i]`` and ``items[i].session_id``/``items[i].cursor``
+        respectively. An unknown or revoked device is 409/device_id. The
+        items are then checked in array order and the first failure aborts
+        the batch with nothing written: an unknown session is
+        404/items[i].session_id, a group session or a session the device does
+        not receive is 409/items[i].session_id, and a cursor below the stored
+        cursor (0 when none) or above the session's max sequence is
+        409/items[i].cursor. On success the body is ``device_id`` then
+        ``results`` — one ``session_id``/``cursor``/``updated_at`` entry per
+        item in request order; every advancing entry shares one fresh UTC
+        timestamp, an equal entry keeps its stored timestamp (a
+        never-advanced zero cursor reports the session's ``created_at``).
+        The whole batch commits once: 201 when any cursor advanced, 200 when
+        none did. Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError("field must be a non-empty array: items",
+                               "items")
+        ordered: List[Tuple[str, int]] = []
+        seen_sessions: set = set()
+        for index, element in enumerate(raw_items):
+            prefix = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {prefix}", prefix)
+            session_path = f"{prefix}.session_id"
+            if "session_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {session_path}", session_path)
+            if not is_nonempty_string(element["session_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {session_path}",
+                    session_path)
+            cursor_path = f"{prefix}.cursor"
+            if "cursor" not in element:
+                raise ServiceError(
+                    f"missing required field: {cursor_path}", cursor_path)
+            cursor = element["cursor"]
+            # bool is a subclass of int; reject it explicitly.
+            if not isinstance(cursor, int) or isinstance(cursor, bool):
+                raise ServiceError(
+                    f"field must be an integer: {cursor_path}", cursor_path)
+            if cursor < 0:
+                raise ServiceError(
+                    f"field must be a non-negative integer: {cursor_path}",
+                    cursor_path)
+            if element["session_id"] in seen_sessions:
+                raise ServiceError(
+                    f"duplicate session_id in items: {element['session_id']}",
+                    session_path)
+            seen_sessions.add(element["session_id"])
+            ordered.append((element["session_id"], cursor))
+
+        try:
+            results, advanced = self.store.message_sync_ack_batch(
+                device_id, ordered)
+        except MessageSyncAckBatchError as error:
+            raise self._ack_batch_error(error, ordered)
+        return {"device_id": device_id, "results": results}, \
+            201 if advanced else 200
+
+    @staticmethod
+    def _ack_batch_error(error: MessageSyncAckBatchError,
+                         ordered: List[Tuple[str, int]]) -> ServiceError:
+        """Translate a storage batch-ack failure into a ServiceError."""
+        if error.reason == BATCH_ACK_DEVICE_UNKNOWN:
+            return ServiceError("device_id is not a registered device",
+                                "device_id", status_code=409)
+        if error.reason == BATCH_ACK_DEVICE_INACTIVE:
+            return ServiceError("device_id is revoked",
+                                "device_id", status_code=409)
+        prefix = f"items[{error.index}]"
+        if error.reason == BATCH_ACK_SESSION_UNKNOWN:
+            return ServiceError(
+                f"session not found: {ordered[error.index][0]}",
+                f"{prefix}.session_id", status_code=404)
+        if error.reason == BATCH_ACK_SESSION_NOT_RECEIVABLE:
+            return ServiceError(
+                "session is a group session or device_id is not its "
+                "recipient", f"{prefix}.session_id", status_code=409)
+        # BATCH_ACK_CURSOR_CONFLICT
+        return ServiceError("cursor is out of range or moved backwards",
+                            f"{prefix}.cursor", status_code=409)
 
     # -- messages ----------------------------------------------------------
 

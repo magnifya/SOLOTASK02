@@ -132,6 +132,16 @@ MESSAGE_SYNC_DEVICE_INACTIVE = "device_inactive"
 MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT = "device_not_participant"
 MESSAGE_SYNC_CURSOR_CONFLICT = "cursor_conflict"
 
+#: Outcome codes for a device-centric batch sync acknowledgement. The
+#: device-level reasons map to 409/device_id; the per-item reasons carry the
+#: offending item's index and map to 404/409 naming ``items[i].session_id``
+#: or ``items[i].cursor``.
+BATCH_ACK_DEVICE_UNKNOWN = "device_unknown"
+BATCH_ACK_DEVICE_INACTIVE = "device_inactive"
+BATCH_ACK_SESSION_UNKNOWN = "session_unknown"
+BATCH_ACK_SESSION_NOT_RECEIVABLE = "session_not_receivable"
+BATCH_ACK_CURSOR_CONFLICT = "cursor_conflict"
+
 #: Outcome codes for group-session rotation.
 ROTATION_SESSION_UNKNOWN = "session_unknown"
 ROTATION_ACTOR_UNKNOWN = "actor_unknown"
@@ -288,6 +298,19 @@ class GroupSessionRotationError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class MessageSyncAckBatchError(Exception):
+    """An atomic device-level batch sync-ack failed; nothing was written.
+
+    Carries the offending item's index in the request's ``items`` array for
+    the per-item reasons; the device-level reasons leave it at -1.
+    """
+
+    def __init__(self, reason: str, index: int = -1) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
 
 
 #: Business-state sections covered by a persistence-integrity snapshot, in
@@ -1880,6 +1903,115 @@ class DeviceStore:
                                            updated_at=anchor_created_at)
             return self._message_sync_cursor_view(
                 session_id, device_id, record), advanced
+
+    def message_sync_ack_batch(self, device_id: str,
+                               items: List[Tuple[str, int]]
+                               ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Atomically batch-acknowledge 1:1 sessions for one recipient device.
+
+        *items* is the request-ordered list of ``(session_id, cursor)`` pairs
+        (session ids already deduplicated by the caller). The whole batch runs
+        under the store lock — the same lock device revocations take — and
+        commits as one transaction: every per-item check is validated first in
+        request order and the first failure raises with nothing written. An
+        unknown or revoked device raises ``device_unknown``/``device_inactive``
+        (both 409/device_id at the service layer). Per item, an unknown
+        session raises ``session_unknown`` (404), a group session or a session
+        whose recipient is not *device_id* raises ``session_not_receivable``
+        (409), and a cursor below the device's stored cursor (0 when none) or
+        above the session's largest stored sequence raises
+        ``cursor_conflict`` (409).
+
+        On success every item with ``cursor > stored`` advances: each
+        receivable message in ``(stored, cursor]`` is acked one by one
+        (``delivery`` records created on demand, ``attempts``/attempt ids
+        untouched) and the unified sync cursor moves to *cursor*. All
+        advancing items share one fresh UTC ``updated_at``; the whole batch
+        emits exactly one persistence notification, so a durable write
+        failure rolls back every ack, cursor and timestamp as one. An equal
+        cursor writes nothing and reports the record's existing
+        ``updated_at`` — or the session's ``created_at`` when no cursor was
+        ever advanced. Returns ``(results, advanced_any)`` with one
+        ``{session_id, cursor, updated_at}`` view per item, in request order.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncAckBatchError(BATCH_ACK_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncAckBatchError(BATCH_ACK_DEVICE_INACTIVE)
+            # Validate the whole batch before writing anything: the first
+            # failing item aborts the request with no state change.
+            plans: List[Tuple[Session, Optional[MessageSyncCursor], int]] = []
+            for index, (session_id, cursor) in enumerate(items):
+                session = self._sessions.get(session_id)
+                if session is None:
+                    if session_id in self._group_sessions:
+                        raise MessageSyncAckBatchError(
+                            BATCH_ACK_SESSION_NOT_RECEIVABLE, index)
+                    raise MessageSyncAckBatchError(
+                        BATCH_ACK_SESSION_UNKNOWN, index)
+                if device_id != session.recipient_device_id:
+                    raise MessageSyncAckBatchError(
+                        BATCH_ACK_SESSION_NOT_RECEIVABLE, index)
+                stream = self._messages.get(session_id, [])
+                max_sequence = stream[-1].sequence if stream else 0
+                if cursor > max_sequence:
+                    raise MessageSyncAckBatchError(
+                        BATCH_ACK_CURSOR_CONFLICT, index)
+                record = self._message_sync_cursors.get(
+                    (session_id, device_id))
+                current = record.cursor if record is not None else 0
+                if cursor < current:
+                    raise MessageSyncAckBatchError(
+                        BATCH_ACK_CURSOR_CONFLICT, index)
+                plans.append((session, record, current))
+            # One shared timestamp for every cursor this batch advances.
+            now = utc_now_iso()
+            advanced_any = False
+            results: List[Dict[str, Any]] = []
+            for (session_id, cursor), (session, record, current) in \
+                    zip(items, plans):
+                if cursor > current:
+                    advanced_any = True
+                    for message in self._messages.get(session_id, []):
+                        if not (current < message.sequence <= cursor):
+                            continue
+                        key = (session_id, message.message_id)
+                        state = self._delivery.get(key)
+                        if state is None:
+                            state = MessageDelivery()
+                            self._delivery[key] = state
+                        if not state.acked:
+                            state.acked = True
+                            state.ack_sequence = message.sequence
+                    if record is None:
+                        record = MessageSyncCursor(cursor=cursor,
+                                                   updated_at=now)
+                        self._message_sync_cursors[
+                            (session_id, device_id)] = record
+                    else:
+                        record.cursor = cursor
+                        record.updated_at = now
+                    updated_at = now
+                elif record is not None:
+                    # An equal cursor leaves the stored record untouched.
+                    updated_at = record.updated_at
+                else:
+                    # A never-advanced zero cursor is a state-free no-op
+                    # anchored at the session's creation time.
+                    updated_at = session.created_at
+                results.append({
+                    "session_id": session_id,
+                    "cursor": cursor,
+                    "updated_at": updated_at,
+                })
+            if advanced_any:
+                # Acks and cursor advances commit together: exactly one
+                # persistence notification, so a durable write failure rolls
+                # back all the delivery flags, cursors and timestamps as one.
+                self._notify_change()
+            return results, advanced_any
 
     # -- messages ----------------------------------------------------------
 
