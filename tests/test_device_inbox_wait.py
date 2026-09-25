@@ -300,7 +300,12 @@ class InboxWaitHTTPTest(InboxMixin, unittest.TestCase):
     def test_limit_param_validation(self) -> None:
         for query in ("limit=", "limit=abc", "limit=0", "limit=101",
                       "limit=-1", "limit=+1", "limit=1.5", "limit=%201",
-                      "limit=1&limit=2"):
+                      "limit=1&limit=2",
+                      # After stripping leading zeroes the value may carry at
+                      # most three digits (100); long zero-padded runs are
+                      # refused before int() ever runs.
+                      "limit=000101", "limit=1000",
+                      "limit=" + "9" * 400):
             status, raw = self._request(
                 f"/v1/devices/bob/inbox/wait?{query}")
             body = json.loads(raw.decode("utf-8"))
@@ -312,12 +317,28 @@ class InboxWaitHTTPTest(InboxMixin, unittest.TestCase):
         for query in ("timeout_ms=", "timeout_ms=abc", "timeout_ms=-1",
                       "timeout_ms=30001", "timeout_ms=+1",
                       "timeout_ms=1.5", "timeout_ms=%200",
-                      "timeout_ms=1&timeout_ms=2"):
+                      "timeout_ms=1&timeout_ms=2",
+                      # At most five digits once leading zeroes are removed.
+                      "timeout_ms=0030001",
+                      "timeout_ms=" + "9" * 400):
             status, raw = self._request(
                 f"/v1/devices/bob/inbox/wait?{query}")
             body = json.loads(raw.decode("utf-8"))
             self.assertEqual(status, 400, query)
             self.assertEqual(body["field"], "timeout_ms", query)
+
+    def test_leading_zeroes_within_digit_cap_accepted(self) -> None:
+        # 0100 -> "100" (three digits) and 030000 -> "30000" (five digits);
+        # only ASCII digits are accepted, fullwidth numerals are not.
+        status, _ = self._request(
+            "/v1/devices/bob/inbox/wait?limit=0100&timeout_ms=030000")
+        self.assertEqual(status, 200)
+        status, raw = self._request(
+            "/v1/devices/bob/inbox/wait?timeout_ms=" +
+            "%EF%BC%90%EF%BC%93%EF%BC%90%EF%BC%90%EF%BC%90%EF%BC%90")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(raw.decode("utf-8"))["field"],
+                         "timeout_ms")
 
     def test_validation_order_limit_before_timeout(self) -> None:
         status, raw = self._request(

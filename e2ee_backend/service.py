@@ -76,6 +76,10 @@ from .storage import (
     INBOX_LEASE_NOT_DELIVERED,
     INBOX_LEASE_NOT_FOUND,
     INBOX_LEASE_UNAVAILABLE,
+    INBOX_JOB_CONFLICT,
+    INBOX_JOB_DEVICE_INACTIVE,
+    INBOX_JOB_DEVICE_UNKNOWN,
+    INBOX_JOB_NOT_FOUND,
     PREKEY_CONFLICT,
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
@@ -108,6 +112,7 @@ from .storage import (
     MessageListError,
     InboxRetryBatchError,
     InboxLeaseError,
+    InboxJobError,
     MessageSyncAckBatchError,
     MessageSyncError,
     PreKeyClaimError,
@@ -1793,6 +1798,56 @@ class DeviceService:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
         return page
+
+    def inbox_job(self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one ``POST /v1/inbox-jobs`` operation.
+
+        The body must be a JSON object carrying non-empty strings
+        ``device_id``, ``job_id`` and ``op``, with ``op`` one of
+        ``queue`` / ``dispatch`` / ``status``. A bad or non-object body is
+        400/field ``request_body``; a missing, empty or non-string field is
+        400 with that field's own name; a non-allowed ``op`` is likewise
+        400/op.
+
+        See :meth:`DeviceStore.inbox_job` for the operational semantics
+        (pending/running/succeeded/failed states, claim-order dispatch of
+        up to 100 messages with the job_id as lease_id, replays, and the
+        lease-completion coupling). Error mapping: unknown job ->
+        404/job_id, job id reused across devices -> 409/job_id, unknown or
+        revoked device -> 409/device_id. A ``status`` is read-only (200);
+        queue/dispatch first-time successes answer 201 and an exact replay
+        answers 200.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("device_id", "job_id", "op"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        op = payload["op"]
+        if op not in ("queue", "dispatch", "status"):
+            raise ServiceError(
+                "field must be one of 'queue', 'dispatch' or 'status': op",
+                "op")
+        try:
+            return self.store.inbox_job(
+                payload["device_id"], payload["job_id"], op)
+        except InboxJobError as error:
+            if error.reason == INBOX_JOB_NOT_FOUND:
+                raise ServiceError(f"job not found: {payload['job_id']}",
+                                   "job_id", status_code=404)
+            if error.reason == INBOX_JOB_CONFLICT:
+                raise ServiceError(
+                    "job_id is already used by another device or as a "
+                    "lease_id", "job_id", status_code=409)
+            if error.reason == INBOX_JOB_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
 
     # -- messages ----------------------------------------------------------
 

@@ -35,6 +35,7 @@ from .models import (
     MessageSyncCursor,
     PreKeyBatchClaim,
     PreKeyClaim,
+    RedeliveryJob,
     Session,
     SignedPreKey,
     utc_now_iso,
@@ -163,10 +164,22 @@ INBOX_LEASE_COMPLETION_CONFLICT = "completion_id_conflict"
 #: ``outcome`` is not ``delivered``; only a delivered lease may be acked.
 INBOX_LEASE_NOT_DELIVERED = "lease_not_delivered"
 
+#: Outcome codes for a 1:1-inbox redelivery job (POST /v1/inbox-jobs).
+INBOX_JOB_DEVICE_UNKNOWN = "device_unknown"
+INBOX_JOB_DEVICE_INACTIVE = "device_inactive"
+#: The job_id was already queued for another device; an exact replay (same
+#: device) answers idempotently instead.
+INBOX_JOB_CONFLICT = "job_id_conflict"
+#: A dispatch/status named a job_id that was never queued.
+INBOX_JOB_NOT_FOUND = "job_not_found"
+
 #: Lifetime of one inbox redelivery lease, in seconds. A message leased by a
 #: claim is withheld from later claims until this deadline passes, after
 #: which a fresh ``lease_id`` may claim it again.
 INBOX_LEASE_SECONDS = 30
+
+#: Fixed number of messages one redelivery-job dispatch may claim at once.
+INBOX_JOB_CLAIM_LIMIT = 100
 
 
 def _is_utc_microsecond_iso(value: Any) -> bool:
@@ -378,6 +391,20 @@ class InboxLeaseError(Exception):
         self.reason = reason
 
 
+class InboxJobError(Exception):
+    """A 1:1-inbox redelivery job operation failed; nothing was written.
+
+    ``job_not_found`` maps to 404/field=job_id; ``job_id_conflict`` (a job
+    id replayed for another device) maps to 409/field=job_id; the
+    device-level reasons (``device_unknown`` / ``device_inactive``) map to
+    409/field=device_id.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class GroupSessionRotationError(Exception):
     """An atomic group-session rotation failed; nothing was written."""
 
@@ -398,6 +425,7 @@ INTEGRITY_SECTION_KEYS = (
     "group_sessions",
     "messages",
     "delivery",
+    "redelivery_jobs",
     "prekey_claims",
     "prekey_batch_claims",
     "claim_session_bindings",
@@ -421,7 +449,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 17 canonical
+    """Project a store snapshot/document payload onto the 18 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -507,6 +535,10 @@ class DeviceStore:
         self._message_submissions: Dict[str, MessageSubmission] = {}
         # Delivery state keyed by (session_id, message_id).
         self._delivery: Dict[Tuple[str, str], MessageDelivery] = {}
+        # 1:1-inbox redelivery jobs queued via POST /v1/inbox-jobs, keyed by
+        # the client-chosen job_id and kept in claim (queue) order: a
+        # dispatch claims pending jobs in that order.
+        self._redelivery_jobs: Dict[str, RedeliveryJob] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -2386,6 +2418,14 @@ class DeviceStore:
             if device.revoked:
                 raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
 
+            # The redelivery-job route uses the job_id as lease_id; keep the
+            # two namespaces disjoint even for an otherwise empty claim (a
+            # dispatch would otherwise have to reject the fused id as a
+            # conflict). Exact replays returned earlier, so this only guards
+            # fresh claims.
+            if lease_id in self._redelivery_jobs:
+                raise InboxLeaseError(INBOX_LEASE_CONFLICT)
+
             picked: List[Tuple[Tuple[str, str], Message]] = []
             for _, session_id, message in self._inbox_entries_locked(
                     device_id):
@@ -2404,6 +2444,7 @@ class DeviceStore:
                 # persistence or advance commit_seq.
                 return ({"device_id": device_id, "lease_id": lease_id,
                          "leased_until": None, "messages": []}, 200, False)
+
 
             # timespec="microseconds" always emits six fractional digits;
             # isoformat() on a whole-microsecond value would otherwise drop
@@ -2688,6 +2729,13 @@ class DeviceStore:
                 completed_at=completed_at)
             for _key, lease in hits:
                 lease.completion = completion
+            # Couple a redelivery job whose lease this is: a dispatch used
+            # the job_id as lease_id, so its terminal completion settles the
+            # job, delivered -> succeeded, failed -> failed, in the very same
+            # locked commit (and rollback) as the completion.
+            job = self._redelivery_jobs.get(lease_id)
+            if job is not None and job.state == "running":
+                job.state = "succeeded" if outcome == "delivered" else "failed"
             # One persistence notification for the whole lease set: every
             # per-message completion commits (or rolls back) together and
             # the generation advances at most once.
@@ -2965,6 +3013,146 @@ class DeviceStore:
                 "next_after": next_after,
                 "has_more": after + limit < len(filtered),
             }
+
+    @staticmethod
+    def _redelivery_job_view_locked(
+            job: RedeliveryJob) -> Dict[str, Any]:
+        """The fixed four-key view of one redelivery job (job_id first)."""
+        return {"job_id": job.job_id, "device_id": job.device_id,
+                "state": job.state, "lease_id": job.lease_id}
+
+    def inbox_job(self, device_id: str, job_id: str, op: str
+                  ) -> Tuple[Dict[str, Any], int]:
+        """Apply one ``POST /v1/inbox-jobs`` operation under the store lock.
+
+        *op* is one of ``queue`` / ``dispatch`` / ``status``, already
+        validated by the service together with the non-empty body strings
+        *device_id* and *job_id*.
+
+        ``queue`` creates the job as ``pending`` (201, one generation); the
+        same job id replayed for the same device answers 200 with the job's
+        current record and writes nothing, while the id on another device
+        raises ``job_id_conflict`` (409/job_id). An unknown or revoked
+        device at first queue time raises ``device_unknown`` /
+        ``device_inactive`` (409/device_id).
+
+        ``dispatch`` on a never-queued id raises ``job_not_found``
+        (404/job_id); one owned by another device raises
+        ``job_id_conflict``; a replay on a job that has left ``pending``
+        answers 200 with the current record and writes nothing. A first
+        dispatch requires the device to still be registered and unrevoked,
+        then scans the inbox in the same message order ``inbox/claim``
+        uses (``(session.created_at, session_id, sequence)``) for up to
+        :data:`INBOX_JOB_CLAIM_LIMIT` unacked messages without a
+        currently-valid lease and grants one ordinary 30-second lease on
+        them, using the ``job_id`` as the ``lease_id``: a non-empty claim
+        sets the job ``running`` (``lease_id`` equals ``job_id``), an empty
+        one settles it directly as ``succeeded`` with ``lease_id`` null;
+        both persist one generation and answer 201. The job afterwards only
+        moves when that lease is completed (delivered -> succeeded,
+        failed -> failed), in :meth:`inbox_lease_complete`.
+
+        ``status`` is read-only: 404/job_id for an unknown id,
+        409/job_id for another device's job, else 200 with the current
+        record and no write. Returns ``(body, status_code)``.
+        """
+        with self._lock:
+            if op == "status":
+                job = self._redelivery_jobs.get(job_id)
+                if job is None:
+                    raise InboxJobError(INBOX_JOB_NOT_FOUND)
+                if job.device_id != device_id:
+                    raise InboxJobError(INBOX_JOB_CONFLICT)
+                return self._redelivery_job_view_locked(job), 200
+
+            if op == "queue":
+                job = self._redelivery_jobs.get(job_id)
+                if job is not None:
+                    if job.device_id != device_id:
+                        raise InboxJobError(INBOX_JOB_CONFLICT)
+                    # Same-device replay: the (possibly advanced since)
+                    # record, 200, no write.
+                    return self._redelivery_job_view_locked(job), 200
+                # The job id doubles as a lease_id at dispatch time; refuse
+                # to queue an id the regular inbox-claim namespace already
+                # occupies rather than fuse the two at dispatch.
+                if self._find_inbox_lease_locked(job_id) is not None:
+                    raise InboxJobError(INBOX_JOB_CONFLICT)
+                device = self._find_device(device_id)
+                if device is None:
+                    raise InboxJobError(INBOX_JOB_DEVICE_UNKNOWN)
+                if device.revoked:
+                    raise InboxJobError(INBOX_JOB_DEVICE_INACTIVE)
+                job = RedeliveryJob(job_id=job_id, device_id=device_id,
+                                    state="pending")
+                self._redelivery_jobs[job_id] = job
+                self._notify_change()
+                return self._redelivery_job_view_locked(job), 201
+
+            # op == "dispatch"
+            job = self._redelivery_jobs.get(job_id)
+            if job is None:
+                raise InboxJobError(INBOX_JOB_NOT_FOUND)
+            if job.device_id != device_id:
+                raise InboxJobError(INBOX_JOB_CONFLICT)
+            if job.state != "pending":
+                # Replay on a running/settled job: current record, 200, no
+                # write (even if the lease has since expired/been released
+                # or the device revoked).
+                return self._redelivery_job_view_locked(job), 200
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxJobError(INBOX_JOB_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxJobError(INBOX_JOB_DEVICE_INACTIVE)
+
+            now = datetime.now(timezone.utc)
+            # The job_id becomes the lease_id; the queue and claim routes
+            # mutually reject an id the other namespace already occupies, and
+            # restore validation rejects a file that fuses them wrongly, so a
+            # live pending job never already has a lease. Defend the
+            # invariant anyway rather than mint a contradicting binding.
+            if self._find_inbox_lease_locked(job_id) is not None:
+                raise InboxJobError(INBOX_JOB_CONFLICT)
+            picked: List[Tuple[Tuple[str, str], Message]] = []
+            for _created_at, session_id, message in \
+                    self._inbox_entries_locked(device_id):
+                key = (session_id, message.message_id)
+                state = self._delivery.get(key)
+                if state is not None \
+                        and self._has_active_lease_locked(state, now):
+                    continue
+                picked.append((key, message))
+                if len(picked) >= INBOX_JOB_CLAIM_LIMIT:
+                    break
+
+            if not picked:
+                # Nothing (re)deliverable: settle directly. No lease is
+                # created, the id stays absent from the delivery records.
+                job.state = "succeeded"
+                job.lease_id = None
+                self._notify_change()
+                return self._redelivery_job_view_locked(job), 201
+
+            # The dispatch is one ordinary inbox lease across the picked
+            # messages: same 30-second lifetime, the job_id as lease_id and
+            # the fixed job claim limit as the frozen lease limit.
+            leased_until = (now + timedelta(seconds=INBOX_LEASE_SECONDS)) \
+                .isoformat(timespec="microseconds")
+            for key, _message in picked:
+                state = self._delivery.get(key)
+                if state is None:
+                    state = MessageDelivery()
+                    self._delivery[key] = state
+                state.leases.append(MessageLease(
+                    lease_id=job_id, limit=INBOX_JOB_CLAIM_LIMIT,
+                    leased_until=leased_until))
+            job.state = "running"
+            job.lease_id = job_id
+            # Job record and the whole lease set commit (or roll back)
+            # together as one generation.
+            self._notify_change()
+            return self._redelivery_job_view_locked(job), 201
 
     def inbox_retry_batch(
             self, device_id: str, attempt_id: str,
@@ -3508,6 +3696,12 @@ class DeviceStore:
                     },
                 } for lease in state.leases],
             } for (sid, mid), state in self._delivery.items()]
+            redelivery_jobs = [{
+                "job_id": job.job_id,
+                "device_id": job.device_id,
+                "state": job.state,
+                "lease_id": job.lease_id,
+            } for job in self._redelivery_jobs.values()]
             group_delivery = [{
                 "session_id": sid,
                 "message_id": mid,
@@ -3556,6 +3750,7 @@ class DeviceStore:
                         "groups": groups, "group_sessions": group_sessions,
                         "group_session_rotations": group_session_rotations,
                         "messages": messages, "delivery": delivery,
+                        "redelivery_jobs": redelivery_jobs,
                         "group_delivery": group_delivery,
                         "used_nonces": used_nonces,
                         "group_sync_cursors": group_sync_cursors,
@@ -3732,6 +3927,7 @@ class DeviceStore:
             "group_session_rotations", [])
         raw_messages = state.get("messages", {})
         raw_delivery = state.get("delivery", [])
+        raw_redelivery_jobs = state.get("redelivery_jobs", [])
         raw_group_delivery = state.get("group_delivery", [])
         raw_used_nonces = state.get("used_nonces")
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
@@ -3748,6 +3944,7 @@ class DeviceStore:
                 and isinstance(raw_group_session_rotations, list)
                 and isinstance(raw_messages, dict)
                 and isinstance(raw_delivery, list)
+                and isinstance(raw_redelivery_jobs, list)
                 and isinstance(raw_group_delivery, list)
                 and isinstance(raw_group_sync_cursors, list)
                 and isinstance(raw_message_sync_cursors, list)
@@ -4670,7 +4867,8 @@ class DeviceStore:
         # while delivery records are parsed and cross-checked below
         # (sessions are already restored, so the owner device is known).
         lease_index: Dict[str, Tuple[str, int, str, Optional[str],
-                                     Tuple[Tuple[str, str], ...]]] = {}
+                                     Tuple[Tuple[str, str], ...],
+                                     Optional[Tuple[str, str, str]]]] = {}
         for index, raw in enumerate(raw_delivery):
             where = f"delivery[{index}]"
             if not isinstance(raw, dict):
@@ -5013,6 +5211,109 @@ class DeviceStore:
                 attempts=attempts, attempt_ids=set(attempt_ids), acked=acked,
                 ack_sequence=ack_sequence)
 
+        # 1:1-inbox redelivery jobs (POST /v1/inbox-jobs). Older version-1
+        # files predate the section: it is absent and treated as empty. A
+        # present section must be a list of well-formed records in claim
+        # (queue) order, with no repeated job_id, each naming a registered
+        # device and carrying one of the four states. A pending job has no
+        # lease yet (lease_id null); an empty-dispatch success also keeps
+        # lease_id null and must have no lease under the job id; a running
+        # job, a failed job and a delivered-success all use the job_id as
+        # lease_id, and that lease must exist in the delivery records bound
+        # to the same device with the fixed job claim limit, its completion
+        # absent (running), outcome failed or delivered accordingly. Any
+        # contradiction refuses startup and leaves the on-disk file alone.
+        redelivery_jobs: Dict[str, RedeliveryJob] = {}
+        for j_index, raw_job in enumerate(raw_redelivery_jobs):
+            j_where = f"redelivery_jobs[{j_index}]"
+            if not isinstance(raw_job, dict):
+                raise ValueError(f"{j_where} must be an object")
+            if list(raw_job) != ["job_id", "device_id", "state", "lease_id"]:
+                raise ValueError(
+                    f"{j_where} must have exactly the keys 'job_id', "
+                    f"'device_id', 'state', 'lease_id' in order")
+            job_id = raw_job["job_id"]
+            job_device = raw_job["device_id"]
+            job_state = raw_job["state"]
+            job_lease_id = raw_job["lease_id"]
+            if not (isinstance(job_id, str) and job_id):
+                raise ValueError(
+                    f"{j_where}.job_id must be a non-empty string")
+            if not (isinstance(job_device, str) and job_device):
+                raise ValueError(
+                    f"{j_where}.device_id must be a non-empty string")
+            if job_device not in device_index:
+                raise ValueError(
+                    f"{j_where} references an unknown device: {job_device}")
+            if job_state not in ("pending", "running", "succeeded", "failed"):
+                raise ValueError(
+                    f"{j_where}.state must be one of 'pending', 'running', "
+                    f"'succeeded' or 'failed'")
+            if job_lease_id is not None and not (
+                    isinstance(job_lease_id, str) and job_lease_id):
+                raise ValueError(
+                    f"{j_where}.lease_id must be null or a non-empty string")
+            if job_id in redelivery_jobs:
+                raise ValueError(
+                    f"duplicate redelivery job in state: {job_id}")
+            binding = lease_index.get(job_id)
+            if job_state == "pending":
+                if job_lease_id is not None:
+                    raise ValueError(
+                        f"{j_where} pending job must have lease_id null")
+                if binding is not None:
+                    raise ValueError(
+                        f"{j_where} pending job already has a lease under "
+                        f"its job_id")
+            else:
+                if job_state == "succeeded" and job_lease_id is None:
+                    # Empty-dispatch success: no lease may exist under the id.
+                    if binding is not None:
+                        raise ValueError(
+                            f"{j_where} settled-without-lease job must not "
+                            f"have a lease under its job_id")
+                else:
+                    if job_lease_id != job_id:
+                        raise ValueError(
+                            f"{j_where}.lease_id must equal the job_id once "
+                            f"a dispatch has leased messages")
+                    if binding is None:
+                        raise ValueError(
+                            f"{j_where} references an unknown lease: "
+                            f"{job_id}")
+                    bound_device, bound_limit, _until, _released, _renewals, \
+                        bound_completion = binding
+                    if bound_device != job_device:
+                        raise ValueError(
+                            f"{j_where} lease is bound to another device")
+                    if bound_limit != INBOX_JOB_CLAIM_LIMIT:
+                        raise ValueError(
+                            f"{j_where} lease limit must equal the fixed job "
+                            f"claim limit {INBOX_JOB_CLAIM_LIMIT}")
+                    if job_state == "running":
+                        if bound_completion is not None:
+                            raise ValueError(
+                                f"{j_where} running job's lease is already "
+                                f"completed")
+                    elif job_state == "failed":
+                        if bound_completion is None \
+                                or bound_completion[1] != "failed":
+                            raise ValueError(
+                                f"{j_where} failed job's lease is not "
+                                f"completed with outcome failed")
+                    else:  # succeeded with a lease
+                        if bound_completion is None \
+                                or bound_completion[1] != "delivered":
+                            raise ValueError(
+                                f"{j_where} succeeded job's lease is not "
+                                f"completed with outcome delivered")
+            redelivery_jobs[job_id] = RedeliveryJob(
+                job_id=job_id, device_id=job_device, state=job_state,
+                lease_id=job_lease_id)
+        # Conversely, a lease under a pending job's id is already rejected
+        # above; a lease whose id matches any job but with a different
+        # binding (device/limit) is likewise covered by the per-state checks.
+
         # Per-device group-session sync cursors. Older version-1 files predate
         # the section: it is absent and treated as empty (every device starts
         # at cursor 0). A present section must be a list of well-formed
@@ -5256,6 +5557,7 @@ class DeviceStore:
                 for rotation in group_session_rotations.values()}
             self._messages = messages
             self._delivery = delivery
+            self._redelivery_jobs = redelivery_jobs
             self._group_delivery = group_delivery
             self._used_nonces = used_nonces
             self._group_sync_cursors = group_sync_cursors

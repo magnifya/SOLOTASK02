@@ -16,6 +16,7 @@ _SESSIONS_FROM_CLAIM_PATH = "/v1/sessions/from-claim"
 _SESSIONS_FROM_BATCH_CLAIM_PATH = "/v1/sessions/from-batch-claim"
 _MESSAGES_PATH = "/v1/messages"
 _MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
+_INBOX_JOBS_PATH = "/v1/inbox-jobs"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 _PERSISTENCE_INTEGRITY_PATH = "/v1/persistence/integrity"
@@ -71,6 +72,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_post_message()
         elif path == _MESSAGES_SUBMIT_PATH:
             self._handle_submit_message()
+        elif path == _INBOX_JOBS_PATH:
+            self._handle_inbox_job()
         elif path == _GROUPS_PATH:
             self._handle_create_group()
         elif path == _GROUP_SESSIONS_PATH:
@@ -533,12 +536,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                   "field": "query"})
             return
         limit = self._decimal_nonneg_param(query, "limit", default=100,
-                                           minimum=1, maximum=100)
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
         if limit is None:
             return  # a 400 response was already sent
         timeout_ms = self._decimal_nonneg_param(query, "timeout_ms",
                                                 default=30000, minimum=0,
-                                                maximum=30000)
+                                                maximum=30000,
+                                                max_digits=5)
         if timeout_ms is None:
             return  # a 400 response was already sent
         try:
@@ -814,6 +819,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.inbox_claim(device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_inbox_job(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.inbox_job(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
@@ -1148,15 +1164,21 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
 
     def _decimal_nonneg_param(self, query: Dict[str, list], name: str,
                               default: int, minimum: int = 0,
-                              maximum: Optional[int] = None) -> Optional[int]:
+                              maximum: Optional[int] = None,
+                              max_digits: Optional[int] = None
+                              ) -> Optional[int]:
         """Parse one strict decimal non-negative integer query parameter.
 
         Unlike :meth:`_int_param`, the value must be one or more ASCII
         decimal digits and nothing else — no sign, whitespace, leading
         ``+``/``-``, decimal point or hex prefix — so strings Python's
         ``int()`` would otherwise accept (``" 1"``, ``"+1"``, ``"01 "``) are
-        refused. Sends a 400 and returns ``None`` when the parameter is
-        repeated, empty, not a strict decimal integer, or outside
+        refused. When *max_digits* is given, the digit string with its
+        leading zeroes removed may not exceed that many digits (an all-zero
+        value reduces to the single digit ``0`` and is then range-checked),
+        bounding the value before ``int()`` is ever called. Sends a 400 and
+        returns ``None`` when the parameter is repeated, empty, not a strict
+        decimal integer, too long after zero stripping, or outside
         *minimum*..*maximum*; an absent parameter yields *default*.
         """
         values = query.get(name)
@@ -1171,6 +1193,13 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"message": f"{name} must be a decimal integer",
                                   "field": name})
             return None
+        if max_digits is not None:
+            stripped = text.lstrip("0") or "0"
+            if len(stripped) > max_digits:
+                self._send_json(400, {
+                    "message": f"{name} must be a decimal integer",
+                    "field": name})
+                return None
         value = int(text)
         if value < minimum or (maximum is not None and value > maximum):
             self._send_json(400, {"message": f"{name} is out of range",

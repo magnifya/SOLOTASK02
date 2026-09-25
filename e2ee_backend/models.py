@@ -301,6 +301,28 @@ class MessageLease:
 
 
 @dataclass
+class RedeliveryJob:
+    """One durable 1:1-inbox redelivery job (``POST /v1/inbox-jobs``).
+
+    A job is queued for one device as ``pending`` and stays in claim (queue)
+    order until a ``dispatch`` claims up to 100 of the device's unacked
+    messages that have no valid lease. A non-empty claim puts the job in
+    ``running`` with ``lease_id`` equal to its own ``job_id`` — the claim is
+    an ordinary inbox redelivery lease on the picked messages; an empty
+    selection settles the job directly as ``succeeded`` with ``lease_id``
+    ``None``. The job afterwards only moves when that lease is completed:
+    ``delivered`` -> ``succeeded``, ``failed`` -> ``failed``. Release and
+    expiry leave a ``running`` job untouched. Only identifiers and the small
+    state string are retained.
+    """
+
+    job_id: str
+    device_id: str
+    state: str
+    lease_id: Optional[str] = None
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 
