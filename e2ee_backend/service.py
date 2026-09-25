@@ -73,6 +73,7 @@ from .storage import (
     INBOX_LEASE_DEVICE_INACTIVE,
     INBOX_LEASE_DEVICE_UNKNOWN,
     INBOX_LEASE_NOT_FOUND,
+    INBOX_LEASE_UNAVAILABLE,
     PREKEY_CONFLICT,
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
@@ -1496,6 +1497,61 @@ class DeviceService:
             if error.reason == INBOX_LEASE_CONFLICT:
                 raise ServiceError(
                     "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
+    def inbox_lease_renew(self, device_id: str, lease_id: str,
+                          payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one 1:1-inbox lease renewal.
+
+        ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/renew``.
+        The body must be a JSON object carrying a non-empty string
+        ``renewal_id``. A bad/non-object body is 400/field
+        ``request_body``; a missing, empty or wrongly typed field is
+        400/field ``renewal_id``.
+
+        The lease is resolved in the store under the lock, ahead of the
+        path device's state: a never-committed ``lease_id`` is 404/field
+        ``lease_id`` and a lease owned by another device is 409/field
+        ``lease_id``. Replaying the same ``renewal_id`` on the same lease
+        returns the frozen first response with 200 (ids may recur on
+        other leases). Only a first renewal checks the device (unknown or
+        revoked -> 409/field ``device_id``) and the lease state (already
+        released or expired -> 409/field ``lease_id``). A first renewal
+        returns 201 with ``device_id``, ``lease_id``, ``renewal_id`` and
+        the new ``leased_until`` (the previous effective deadline plus
+        exactly 30 seconds, UTC ISO-8601 with six microsecond digits and
+        ``+00:00``), and persists one generation.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "renewal_id" not in payload:
+            raise ServiceError("missing required field: renewal_id",
+                               "renewal_id")
+        if not is_nonempty_string(payload["renewal_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: renewal_id",
+                "renewal_id")
+
+        try:
+            return self.store.inbox_lease_renew(
+                device_id, lease_id, payload["renewal_id"])
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_UNAVAILABLE:
+                raise ServiceError(
+                    "lease is released or expired and cannot be renewed",
                     "lease_id", status_code=409)
             if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
                 raise ServiceError("device_id is not a registered device",

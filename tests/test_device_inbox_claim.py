@@ -294,8 +294,9 @@ class LeasePersistenceTest(LeaseMixin, unittest.TestCase):
             self.assertEqual(len(record["leases"]), 1)
             self.assertEqual(list(record["leases"][0]),
                              ["lease_id", "limit", "leased_until",
-                              "released_at"])
+                              "released_at", "renewals"])
             self.assertIsNone(record["leases"][0]["released_at"])
+            self.assertEqual(record["leases"][0]["renewals"], [])
             self.assertEqual(record["leases"][0]["lease_id"], "L1")
             self.assertEqual(record["leases"][0]["limit"], 2)
 

@@ -98,6 +98,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 and path.endswith("/inbox/claim"):
             self._route_device_inbox_claim(path)
         elif path.startswith(_DEVICES_PATH + "/") \
+                and "/inbox/leases/" in path and path.endswith("/renew"):
+            self._route_device_inbox_lease_renew(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
                 and "/inbox/leases/" in path and path.endswith("/release"):
             self._route_device_inbox_lease_release(path)
         elif path.startswith(_DEVICES_PATH + "/"):
@@ -219,6 +222,19 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         suffix = path[len(_DEVICES_PATH) + 1:-len("/inbox/claim")]
         if suffix and "/" not in suffix:
             self._handle_device_inbox_claim(unquote(suffix))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_device_inbox_lease_renew(self, path: str) -> None:
+        # {device_id}/inbox/leases/{lease_id}/renew — split on raw slashes
+        # only; a percent-encoded slash inside an id segment is part of it.
+        suffix = path[len(_DEVICES_PATH) + 1:-len("/renew")]
+        parts = suffix.split("/")
+        if (len(parts) == 4 and parts[0] and parts[1] == "inbox"
+                and parts[2] == "leases" and parts[3]):
+            self._handle_device_inbox_lease_renew(
+                unquote(parts[0]), unquote(parts[3]))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -693,6 +709,19 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.inbox_claim(device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_device_inbox_lease_renew(
+            self, device_id: str, lease_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.inbox_lease_renew(
+                device_id, lease_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

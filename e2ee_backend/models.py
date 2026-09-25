@@ -225,6 +225,24 @@ class MessageSubmission:
 
 
 @dataclass
+class MessageLeaseRenewal:
+    """One committed renewal of a 1:1-inbox redelivery lease.
+
+    ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/renew`` extends
+    the lease's effective deadline by exactly 30 seconds per renewal. The
+    record freezes the client-chosen ``renewal_id`` (unique within one
+    lease, but reusable across different leases) together with the new
+    effective ``leased_until`` deadline produced by that renewal, so a
+    replayed renewal returns its first response byte-identically. Every
+    delivery record the lease appears on carries an item-by-item identical
+    copy of the renewal list.
+    """
+
+    renewal_id: str
+    leased_until: str
+
+
+@dataclass
 class MessageLease:
     """One 1:1-inbox redelivery lease held on a message.
 
@@ -233,19 +251,26 @@ class MessageLease:
     seconds. The lease is recorded on every leased message's
     :class:`MessageDelivery` record (inside ``delivery[].leases``), so the
     same ``lease_id`` — globally unique — is durably bound to exactly one
-    device, one limit and one ``leased_until`` timestamp. Only identifiers,
-    the small integer limit and the UTC deadline are retained.
+    device, one limit and one claim ``leased_until`` timestamp. Only
+    identifiers, the small integer limit and UTC deadlines are retained.
 
     ``released_at`` is ``None`` while the lease is held and the UTC release
     timestamp once ``POST .../inbox/leases/{lease_id}/release`` committed:
     a released lease stays on the record as history (the release replays
     from it) but no longer withholds the message from new claims.
+
+    ``renewals`` records each committed ``.../renew`` in order; the lease's
+    effective deadline is its claim ``leased_until`` plus one 30-second
+    extension per renewal (i.e. the last renewal's ``leased_until``). The
+    claim deadline itself stays frozen, so replaying the original claim
+    still returns its first response.
     """
 
     lease_id: str
     limit: int
     leased_until: str
     released_at: Optional[str] = None
+    renewals: List[MessageLeaseRenewal] = field(default_factory=list)
 
 
 @dataclass

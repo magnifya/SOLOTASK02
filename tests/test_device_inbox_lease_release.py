@@ -208,9 +208,10 @@ class ReleasePersistenceTest(ReleaseMixin, unittest.TestCase):
         for record in leased:
             self.assertEqual(list(record["leases"][0]),
                              ["lease_id", "limit", "leased_until",
-                              "released_at"])
+                              "released_at", "renewals"])
             self.assertEqual(record["leases"][0]["released_at"],
                              body["released_at"])
+            self.assertEqual(record["leases"][0]["renewals"], [])
 
     def test_repeat_release_persists_nothing(self) -> None:
         self._claim("L1", 2)
