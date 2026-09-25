@@ -200,6 +200,10 @@ REDELIVERY_JOB_RECOVERY_CONFLICT = "recovery_id_conflict"
 #: 409/job_id for the other states).
 REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE = "lease_active"
 REDELIVERY_JOB_RECOVERY_STATE = "job_not_recoverable"
+#: A recover-batch item replayed its own committed recovery while other
+#: items were new: the batch was partially applied before, so it conflicts
+#: (409/items[i].recovery_id) rather than replaying or committing.
+REDELIVERY_JOB_RECOVERY_REPLAY = "recovery_replay"
 
 #: Number of inbox messages one redelivery-job dispatch leases at most.
 REDELIVERY_JOB_DISPATCH_LIMIT = 100
@@ -428,6 +432,21 @@ class RedeliveryJobError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class RedeliveryJobRecoverBatchError(Exception):
+    """A 1:1-inbox redelivery recover-batch failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the whole batch
+    writes nothing. The reasons are the single-job recover reasons plus
+    ``recovery_replay`` for a partially replayed batch.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
 
 
 class GroupSessionRotationError(Exception):
@@ -3036,6 +3055,19 @@ class DeviceStore:
             "lease_id": job.lease_id,
         }
 
+    @staticmethod
+    def redelivery_job_recover_batch_view(job: RedeliveryJob) -> Dict[str, Any]:
+        """One recover-batch result item, keys in response order.
+
+        The batch response already names the device at the top level, so an
+        item carries only ``job_id``, ``state`` and ``lease_id``.
+        """
+        return {
+            "job_id": job.job_id,
+            "state": job.state,
+            "lease_id": job.lease_id,
+        }
+
     def redelivery_job_submit(
             self, device_id: str, job_id: str, op: str
     ) -> Tuple[Dict[str, Any], int]:
@@ -3263,6 +3295,155 @@ class DeviceStore:
                     recovery_id=recovery_id, lease_id=None))
             self._notify_change()
             return self.redelivery_job_view(job), 201
+
+    def redelivery_job_recover_batch(
+            self, device_id: str, items: List[Tuple[str, str]]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Atomically recover many running redelivery jobs of one device.
+
+        ``POST /v1/inbox-jobs/recover-batch``; *items* are ``(job_id,
+        recovery_id)`` pairs already validated for shape and per-field
+        uniqueness by the service. Under the one store lock — shared with
+        leases, completions, acks and revocation — the device is resolved
+        first (unknown/revoked -> :class:`RedeliveryJobError`
+        ``device_unknown``/``device_inactive``, 409/device_id).
+
+        Every item is then prechecked in array order with exactly the
+        single-job ``recover`` rules (see :meth:`redelivery_job_recover`),
+        the first failure raising :class:`RedeliveryJobRecoverBatchError`
+        carrying that item's index — the batch writes nothing. An item
+        whose *recovery_id* is already committed on its own job is a
+        replay: it passes the precheck untouched (mirroring the single-job
+        short-circuit) and is collected instead. After the precheck, a
+        batch whose items are *all* replays returns the jobs' current views
+        with ``any_new`` false and writes nothing; a batch mixing replays
+        with fresh items raises ``recovery_replay`` at the first replayed
+        index (409/items[i].recovery_id) — the earlier request was only
+        partially applied, which the atomic batch cannot reproduce.
+
+        Only when every item is fresh does the commit run, claiming in
+        input order: each job re-leases up to
+        :data:`REDELIVERY_JOB_DISPATCH_LIMIT` unacked, currently unleased
+        inbox messages (messages leased by an earlier item of the same
+        batch are already withheld from the next) under an ordinary
+        :data:`INBOX_LEASE_SECONDS` lease named by its *recovery_id*, or
+        ends ``succeeded`` with ``lease_id`` null on an empty selection —
+        exactly the single-job state transitions. One persistence
+        notification commits the whole batch (commit_seq + 1); a durable
+        write failure rolls every job and lease back. Returns
+        ``(results, any_new)`` with one ``job_id``/``state``/``lease_id``
+        view per item, in input order.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_INACTIVE)
+            now = datetime.now(timezone.utc)
+            jobs: List[RedeliveryJob] = []
+            replay_indices: List[int] = []
+            # Precheck in array order; only after every item passes (or is
+            # a replay) is anything touched below.
+            for index, (job_id, recovery_id) in enumerate(items):
+                job = self._redelivery_jobs.get(job_id)
+                if job is not None and job.device_id != device_id:
+                    raise RedeliveryJobRecoverBatchError(
+                        REDELIVERY_JOB_CONFLICT, index)
+                if job is None:
+                    raise RedeliveryJobRecoverBatchError(
+                        REDELIVERY_JOB_NOT_FOUND, index)
+                jobs.append(job)
+                if any(record.recovery_id == recovery_id
+                       for record in job.recoveries):
+                    # An exact replay of this item's own recovery: it
+                    # short-circuits every further check, as the
+                    # single-job entry does.
+                    replay_indices.append(index)
+                    continue
+                # The recovery_id shares one namespace with every job_id,
+                # every job's recovery history and the ordinary inbox
+                # lease ids (see the single-job recover).
+                if any(other.job_id == recovery_id
+                       for other in self._redelivery_jobs.values()):
+                    raise RedeliveryJobRecoverBatchError(
+                        REDELIVERY_JOB_RECOVERY_CONFLICT, index)
+                if any(any(record.recovery_id == recovery_id
+                           for record in other.recoveries)
+                       for other in self._redelivery_jobs.values()
+                       if other is not job):
+                    raise RedeliveryJobRecoverBatchError(
+                        REDELIVERY_JOB_RECOVERY_CONFLICT, index)
+                if self._find_inbox_lease_locked(recovery_id) is not None:
+                    raise RedeliveryJobRecoverBatchError(
+                        REDELIVERY_JOB_RECOVERY_CONFLICT, index)
+                if job.state != REDELIVERY_JOB_RUNNING:
+                    raise RedeliveryJobRecoverBatchError(
+                        REDELIVERY_JOB_RECOVERY_STATE, index)
+                current_lease: Optional[MessageLease] = None
+                for state in self._delivery.values():
+                    for lease in state.leases:
+                        if lease.lease_id == job.lease_id:
+                            current_lease = lease
+                            break
+                    if current_lease is not None:
+                        break
+                if current_lease is not None \
+                        and self._lease_is_active_locked(current_lease, now):
+                    raise RedeliveryJobRecoverBatchError(
+                        REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE, index)
+            if replay_indices:
+                if len(replay_indices) == len(items):
+                    # A full replay of a previously committed batch: the
+                    # current views, in input order, and nothing written.
+                    return [self.redelivery_job_recover_batch_view(job)
+                            for job in jobs], False
+                # A partial replay can neither commit (the replayed items
+                # would be re-applied) nor replay (the fresh items never
+                # ran): the batch conflicts at its first replayed item.
+                raise RedeliveryJobRecoverBatchError(
+                    REDELIVERY_JOB_RECOVERY_REPLAY, replay_indices[0])
+            leased_until = (now + timedelta(
+                seconds=INBOX_LEASE_SECONDS)).isoformat(
+                    timespec="microseconds")
+            for job, (_job_id, recovery_id) in zip(jobs, items):
+                picked: List[Tuple[str, str]] = []
+                for _, session_id, message in self._inbox_entries_locked(
+                        device_id):
+                    key = (session_id, message.message_id)
+                    state = self._delivery.get(key)
+                    if state is not None \
+                            and self._has_active_lease_locked(state, now):
+                        continue
+                    picked.append(key)
+                    if len(picked) >= REDELIVERY_JOB_DISPATCH_LIMIT:
+                        break
+                if picked:
+                    # An ordinary inbox lease named by the recovery_id; a
+                    # message leased here is immediately withheld from the
+                    # next item's selection.
+                    for key in picked:
+                        state = self._delivery.get(key)
+                        if state is None:
+                            state = MessageDelivery()
+                            self._delivery[key] = state
+                        state.leases.append(MessageLease(
+                            lease_id=recovery_id,
+                            limit=REDELIVERY_JOB_DISPATCH_LIMIT,
+                            leased_until=leased_until))
+                    job.lease_id = recovery_id
+                    job.recoveries.append(RedeliveryJobRecovery(
+                        recovery_id=recovery_id, lease_id=recovery_id))
+                else:
+                    # Nothing left to redeliver: the job finishes
+                    # succeeded and keeps no current lease.
+                    job.state = REDELIVERY_JOB_SUCCEEDED
+                    job.lease_id = None
+                    job.recoveries.append(RedeliveryJobRecovery(
+                        recovery_id=recovery_id, lease_id=None))
+            self._notify_change()
+            return [self.redelivery_job_recover_batch_view(job)
+                    for job in jobs], True
 
     def _redelivery_job_completed_locked(self, lease_id: str,
                                          outcome: str) -> None:
@@ -3864,22 +4045,20 @@ class DeviceStore:
             } for r in self._message_submissions.values()]
             redelivery_jobs = []
             for job in self._redelivery_jobs.values():
-                item = {
+                # The item always carries the five keys in this fixed
+                # order; an empty recovery history serializes as ``[]``.
+                # Older four-key documents (the key predates recovery
+                # history) still load, treated as an empty list.
+                redelivery_jobs.append({
                     "job_id": job.job_id,
                     "device_id": job.device_id,
                     "state": job.state,
                     "lease_id": job.lease_id,
-                }
-                # Older items predate the fifth key: an empty recovery
-                # history stays omitted (loading treats the missing key as
-                # an empty list), which also keeps the canonical snapshot
-                # hash of pre-recovery documents identical.
-                if job.recoveries:
-                    item["recoveries"] = [{
+                    "recoveries": [{
                         "recovery_id": record.recovery_id,
                         "lease_id": record.lease_id,
-                    } for record in job.recoveries]
-                redelivery_jobs.append(item)
+                    } for record in job.recoveries],
+                })
             key_events = [
                 self.key_event_view(event)
                 for chain in self._key_events.values() for event in chain

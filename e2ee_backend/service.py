@@ -84,6 +84,7 @@ from .storage import (
     REDELIVERY_JOB_NOT_FOUND,
     REDELIVERY_JOB_RECOVERY_CONFLICT,
     REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE,
+    REDELIVERY_JOB_RECOVERY_REPLAY,
     REDELIVERY_JOB_RECOVERY_STATE,
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
@@ -121,6 +122,7 @@ from .storage import (
     PreKeyClaimError,
     PreKeyBatchClaimError,
     RedeliveryJobError,
+    RedeliveryJobRecoverBatchError,
     SessionCreateError,
 )
 
@@ -1904,6 +1906,131 @@ class DeviceService:
                                    "device_id", status_code=409)
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
+
+    def inbox_job_recover_batch(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and atomically apply a batch of redelivery-job recovers.
+
+        ``POST /v1/inbox-jobs/recover-batch``. The body must be a JSON
+        object carrying a non-empty string ``device_id`` and a non-empty
+        ``items`` array of objects, each with a non-empty string ``job_id``
+        and ``recovery_id``, neither field repeating across items. Shape
+        errors are reported, in order, as 400/field ``request_body``
+        (bad/non-object body), ``device_id`` (missing/empty/non-string),
+        ``items`` (missing/not-a-non-empty-array), ``items[i]`` (non-object
+        element) or ``items[i].job_id`` / ``items[i].recovery_id`` for the
+        offending field — a repeated value included.
+
+        The device is then resolved (unknown/revoked -> 409/field
+        ``device_id``) and every item is prechecked in array order under
+        the single-job ``op=recover`` rules, the first error aborting the
+        whole batch with nothing written and its field prefixed to
+        ``items[i].``: an unknown job is 404/``items[i].job_id``, a job of
+        another device or a non-recoverable state is
+        409/``items[i].job_id``, a recovery_id colliding with another job,
+        recovery or lease is 409/``items[i].recovery_id`` and a still-valid
+        lease is 409/``items[i].lease_id``. A batch whose items all replay
+        their own committed recoveries answers 200 and writes nothing; a
+        partially replayed batch is 409/``items[i].recovery_id`` at the
+        first replayed item. Otherwise every job is recovered in input
+        order under one locked commit (201). On success the body is
+        ``device_id`` then ``results``; results keep input order and each
+        item is ``job_id``/``state``/``lease_id``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id",
+                               "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+
+        items: List[Tuple[str, str]] = []
+        seen_job_ids: set = set()
+        seen_recovery_ids: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            job_field = f"{item_field}.job_id"
+            if "job_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {job_field}", job_field)
+            if not is_nonempty_string(element["job_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {job_field}",
+                    job_field)
+            recovery_field = f"{item_field}.recovery_id"
+            if "recovery_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {recovery_field}",
+                    recovery_field)
+            if not is_nonempty_string(element["recovery_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {recovery_field}",
+                    recovery_field)
+            if element["job_id"] in seen_job_ids:
+                raise ServiceError(
+                    "duplicate job_id in items: "
+                    f"{element['job_id']}", job_field)
+            if element["recovery_id"] in seen_recovery_ids:
+                raise ServiceError(
+                    "duplicate recovery_id in items: "
+                    f"{element['recovery_id']}", recovery_field)
+            seen_job_ids.add(element["job_id"])
+            seen_recovery_ids.add(element["recovery_id"])
+            items.append((element["job_id"], element["recovery_id"]))
+
+        device_id = payload["device_id"]
+        try:
+            results, any_new = self.store.redelivery_job_recover_batch(
+                device_id, items)
+        except RedeliveryJobError as error:
+            # Batch-level device failure (unknown/revoked): 409/device_id.
+            if error.reason == REDELIVERY_JOB_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+        except RedeliveryJobRecoverBatchError as error:
+            item_field = f"items[{error.index}]"
+            job_id, recovery_id = items[error.index]
+            if error.reason == REDELIVERY_JOB_NOT_FOUND:
+                raise ServiceError(f"job not found: {job_id}",
+                                   f"{item_field}.job_id", status_code=404)
+            if error.reason == REDELIVERY_JOB_CONFLICT:
+                raise ServiceError(
+                    "job_id is already used by another device",
+                    f"{item_field}.job_id", status_code=409)
+            if error.reason == REDELIVERY_JOB_RECOVERY_CONFLICT:
+                raise ServiceError(
+                    "recovery_id is already used by another job or "
+                    "occupied as a lease id",
+                    f"{item_field}.recovery_id", status_code=409)
+            if error.reason == REDELIVERY_JOB_RECOVERY_REPLAY:
+                raise ServiceError(
+                    "recovery_id replays a recovery this batch already "
+                    "committed while other items are new",
+                    f"{item_field}.recovery_id", status_code=409)
+            if error.reason == REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE:
+                raise ServiceError(
+                    "the job's lease is still valid and cannot be "
+                    "recovered", f"{item_field}.lease_id", status_code=409)
+            raise ServiceError(
+                "only a running job with an expired or released lease "
+                "can be recovered", f"{item_field}.job_id", status_code=409)
+        body = {"device_id": device_id, "results": results}
+        return body, 201 if any_new else 200
 
     # -- messages ----------------------------------------------------------
 

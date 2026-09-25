@@ -236,7 +236,7 @@ class InboxJobPersistenceTest(InboxMixin, unittest.TestCase):
             document = json.load(handle)
         self.assertEqual(document["redelivery_jobs"], [
             {"job_id": "j1", "device_id": "bob", "state": "running",
-             "lease_id": "j1"}])
+             "lease_id": "j1", "recoveries": []}])
 
     def test_replays_and_status_consume_no_generation(self) -> None:
         self._job()

@@ -302,8 +302,8 @@ class InboxJobRecoverPersistenceTest(InboxMixin, unittest.TestCase):
         self.assertEqual(self.state_store.commit_seq, before + 1)
 
     def test_state_file_shape(self) -> None:
-        # A job without recoveries keeps the four-key item (the fifth key
-        # is omitted while empty).
+        # Every item carries the five keys in fixed order; an empty
+        # recovery history serializes as an empty array.
         self._job(job_id="pending")
         self._dispatch(job_id="j1")
         self._expire("j1")
@@ -315,7 +315,9 @@ class InboxJobRecoverPersistenceTest(InboxMixin, unittest.TestCase):
         items = {item["job_id"]: item
                  for item in document["redelivery_jobs"]}
         self.assertEqual(list(items["pending"]),
-                         ["job_id", "device_id", "state", "lease_id"])
+                         ["job_id", "device_id", "state", "lease_id",
+                          "recoveries"])
+        self.assertEqual(items["pending"]["recoveries"], [])
         j1 = items["j1"]
         self.assertEqual(list(j1),
                          ["job_id", "device_id", "state", "lease_id",
@@ -449,9 +451,16 @@ class InboxJobRecoverPersistenceTest(InboxMixin, unittest.TestCase):
         self._dispatch()
         with open(self.path, encoding="utf-8") as handle:
             document = json.load(handle)
-        self.assertNotIn("recoveries", document["redelivery_jobs"][0])
+        # A legacy four-key item (the recoveries key predates recovery
+        # history) loads as an empty history.
+        self.assertEqual(document["redelivery_jobs"][0]["recoveries"], [])
+        del document["redelivery_jobs"][0]["recoveries"]
+        document.pop("integrity_log_version", None)
+        legacy_path = os.path.join(self.directory, "legacy.json")
+        with open(legacy_path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
         restarted = DeviceService()
-        attach_persistence(restarted, self.path)  # must not raise
+        attach_persistence(restarted, legacy_path)  # must not raise
         body, status = restarted.inbox_job(
             {"device_id": "bob", "job_id": "j1", "op": "status"})
         self.assertEqual(status, 200)

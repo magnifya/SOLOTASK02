@@ -17,6 +17,7 @@ _SESSIONS_FROM_BATCH_CLAIM_PATH = "/v1/sessions/from-batch-claim"
 _MESSAGES_PATH = "/v1/messages"
 _MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
 _INBOX_JOBS_PATH = "/v1/inbox-jobs"
+_INBOX_JOBS_RECOVER_BATCH_PATH = "/v1/inbox-jobs/recover-batch"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 _PERSISTENCE_INTEGRITY_PATH = "/v1/persistence/integrity"
@@ -74,6 +75,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_submit_message()
         elif path == _INBOX_JOBS_PATH:
             self._handle_inbox_job()
+        elif path == _INBOX_JOBS_RECOVER_BATCH_PATH:
+            self._handle_inbox_job_recover_batch()
         elif path == _GROUPS_PATH:
             self._handle_create_group()
         elif path == _GROUP_SESSIONS_PATH:
@@ -1047,6 +1050,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.inbox_job(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_inbox_job_recover_batch(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.inbox_job_recover_batch(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
