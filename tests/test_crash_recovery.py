@@ -171,20 +171,41 @@ class MissingFormalRecoveryTest(unittest.TestCase):
         self.assertEqual([m["sequence"] for m in body["messages"]], [3])
 
     def test_newest_mtime_valid_snapshot_is_chosen(self) -> None:
-        _service_b, path_b, sid_b, bytes_b = build_fixture(
-            tempfile.mkdtemp(), cursor=0)
-        os.unlink(self.path)
-        # Older valid snapshot (no cursor) and newer valid snapshot (cursor 2).
-        write_tmp(self.directory, ".state-old.tmp", bytes_b, mtime_ns=1000)
-        write_tmp(self.directory, ".state-new.tmp", self.formal_bytes,
-                  mtime_ns=2000)
-        service = DeviceService()
-        attach_persistence(service, self.path)
-        self.assertEqual(open(self.path, "rb").read(), self.formal_bytes)
-        self.assertEqual(tmp_names(self.directory), [])
-        self.assertEqual(
-            service.store._group_sync_cursors[(self.sid, "alice")].cursor, 2)
-        shutil.rmtree(os.path.dirname(path_b), ignore_errors=True)
+        # The newest-mtime rule survives only for genuinely pre-integrity-log
+        # files: marker-less, generation-less version=1 snapshots with no
+        # sidecar at all. Between two such legacy leftovers the newer mtime
+        # snapshot is chosen (modern stamped states are paired by sidecar and
+        # ranked by commit_seq instead, never by mtime).
+        other_dir = tempfile.mkdtemp()
+        try:
+            _service_b, path_b, sid_b, bytes_b = build_fixture(
+                other_dir, cursor=0)
+
+            def legacy_bytes(modern: bytes) -> bytes:
+                document = json.loads(modern.decode("utf-8"))
+                document.pop("integrity_log_version", None)
+                document.pop("commit_seq", None)
+                return json.dumps(document).encode("utf-8")
+
+            os.unlink(self.path)
+            os.unlink(self.path + ".integrity")
+            # Older valid snapshot (no cursor) and newer valid snapshot (cursor
+            # 2), both marker-less legacy files with no sidecar beside them.
+            write_tmp(self.directory, ".state-old.tmp",
+                      legacy_bytes(bytes_b), mtime_ns=1000)
+            write_tmp(self.directory, ".state-new.tmp",
+                      legacy_bytes(self.formal_bytes), mtime_ns=2000)
+            service = DeviceService()
+            attach_persistence(service, self.path)
+            self.assertEqual(
+                open(self.path, "rb").read(),
+                legacy_bytes(self.formal_bytes))
+            self.assertEqual(tmp_names(self.directory), [])
+            self.assertEqual(
+                service.store._group_sync_cursors[(self.sid, "alice")].cursor,
+                2)
+        finally:
+            shutil.rmtree(other_dir, ignore_errors=True)
 
     def test_invalid_newer_snapshot_falls_back_to_older_valid(self) -> None:
         os.unlink(self.path)

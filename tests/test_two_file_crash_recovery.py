@@ -197,27 +197,30 @@ class PairedCrashRecoveryTest(unittest.TestCase):
         finally:
             shutil.rmtree(low_dir, ignore_errors=True)
 
-    def test_unpaired_modern_state_candidate_is_not_recovered(self) -> None:
+    def test_unpaired_modern_state_candidate_refuses_and_touches_nothing(
+            self) -> None:
         # A marker-stamped state leftover with NO sidecar candidate cannot be
-        # verified as a committed pair, so it is not promoted: no verifiable
-        # candidate exists, the leftovers are swept and an empty state is
-        # created (no sidecar until its first real commit).
+        # verified as a committed pair. A verifiable modern state without its
+        # unique sidecar is an ambiguity: startup refuses (never sweeps it to
+        # create an empty state, never falls back to a lower pair), leaves
+        # the candidate name/bytes/inode intact, and creates neither formal
+        # file.
         self._remove_formal_pair()
-        write_tmp(self.directory, ".state-orphan.tmp", self.state_bytes)
-        service = DeviceService()
-        attach_persistence(service, self.path)
-        document = json.load(open(self.path, encoding="utf-8"))
-        self.assertEqual(document["commit_seq"], 0)
-        self.assertEqual(document["devices"], [])
+        orphan = write_tmp(self.directory, ".state-orphan.tmp",
+                           self.state_bytes)
+        orphan_ino = os.stat(orphan).st_ino
+        with self.assertRaises(StateFileError):
+            attach_persistence(DeviceService(), self.path)
+        self.assertFalse(os.path.exists(self.path))
         self.assertFalse(os.path.exists(self.sidecar))
-        self.assertEqual(_sidecar_names(self.directory), [])
-        self.assertEqual(
-            [n for n in os.listdir(self.directory)
-             if n.startswith(".state-")], [])
+        self.assertEqual(open(orphan, "rb").read(), self.state_bytes)
+        self.assertEqual(os.stat(orphan).st_ino, orphan_ino)
 
-    def test_unmatched_sidecar_candidate_does_not_recover_state(self) -> None:
+    def test_unmatched_sidecar_candidate_refuses_and_touches_nothing(
+            self) -> None:
         # The state leftover's tail does not bind the only sidecar leftover:
-        # no verifiable pair -> empty state, both leftovers swept.
+        # the verifiable modern state has no unique binding sidecar, so
+        # startup refuses and moves neither file (never an empty state).
         self._remove_formal_pair()
         other_dir = tempfile.mkdtemp()
         try:
@@ -228,14 +231,21 @@ class PairedCrashRecoveryTest(unittest.TestCase):
             _svc.store.add_device(Device("u", "extra", "ik"))
             with open(other_path + ".integrity", "rb") as handle:
                 other_log = handle.read()
-            write_tmp(self.directory, ".state-a.tmp", self.state_bytes)
-            write_tmp(self.directory, ".integrity-a.tmp", other_log)
-            service = DeviceService()
-            attach_persistence(service, self.path)
-            self.assertEqual(
-                json.load(open(self.path, encoding="utf-8"))["commit_seq"], 0)
+            state_cand = write_tmp(self.directory, ".state-a.tmp",
+                                   self.state_bytes)
+            log_cand = write_tmp(self.directory, ".integrity-a.tmp",
+                                 other_log)
+            state_ino = os.stat(state_cand).st_ino
+            log_ino = os.stat(log_cand).st_ino
+            with self.assertRaises(StateFileError):
+                attach_persistence(DeviceService(), self.path)
+            self.assertFalse(os.path.exists(self.path))
             self.assertFalse(os.path.exists(self.sidecar))
-            self.assertEqual(_sidecar_names(self.directory), [])
+            self.assertEqual(open(state_cand, "rb").read(),
+                             self.state_bytes)
+            self.assertEqual(open(log_cand, "rb").read(), other_log)
+            self.assertEqual(os.stat(state_cand).st_ino, state_ino)
+            self.assertEqual(os.stat(log_cand).st_ino, log_ino)
         finally:
             shutil.rmtree(other_dir, ignore_errors=True)
 
@@ -276,6 +286,106 @@ class PairedCrashRecoveryTest(unittest.TestCase):
         self.assertEqual(json.loads(lines[0])["field"], "data_file")
         # Still nothing promoted or deleted.
         self.assertFalse(os.path.exists(self.path))
+
+    def test_higher_modern_orphan_beside_lower_pair_refuses_no_downgrade(
+            self) -> None:
+        # A complete lower-generation pair plus a *higher*-generation modern
+        # state whose sidecar never landed. The modern state is verifiable
+        # but has no unique sidecar: startup must refuse rather than silently
+        # recover the lower-generation pair, and touches nothing.
+        low_dir = tempfile.mkdtemp()
+        try:
+            _svc, low_path, _sid, low_state = build_fixture(low_dir, cursor=0)
+            with open(low_path + ".integrity", "rb") as handle:
+                low_log = handle.read()
+            self._remove_formal_pair()
+            low_s = write_tmp(self.directory, ".state-low.bak", low_state)
+            low_l = write_tmp(self.directory, ".integrity-low.bak", low_log)
+            high_s = write_tmp(self.directory, ".state-high.tmp",
+                               self.state_bytes)
+            lows_ino = os.stat(low_s).st_ino
+            lowl_ino = os.stat(low_l).st_ino
+            highs_ino = os.stat(high_s).st_ino
+            with self.assertRaises(StateFileError):
+                attach_persistence(DeviceService(), self.path)
+            self.assertFalse(os.path.exists(self.path))
+            self.assertFalse(os.path.exists(self.sidecar))
+            # No downgrade: the complete lower pair was not promoted, and no
+            # candidate was deleted, renamed or overwritten.
+            self.assertEqual(open(low_s, "rb").read(), low_state)
+            self.assertEqual(open(low_l, "rb").read(), low_log)
+            self.assertEqual(open(high_s, "rb").read(), self.state_bytes)
+            self.assertEqual(os.stat(low_s).st_ino, lows_ino)
+            self.assertEqual(os.stat(low_l).st_ino, lowl_ino)
+            self.assertEqual(os.stat(high_s).st_ino, highs_ino)
+        finally:
+            shutil.rmtree(low_dir, ignore_errors=True)
+
+    def test_lower_modern_orphan_beside_higher_pair_refuses(self) -> None:
+        # The verifiable higher pair is intact, but a second verifiable
+        # modern state at a lower generation has no sidecar: the modern
+        # candidate set is not fully paired, so startup refuses instead of
+        # recovering the higher pair, deleting/overwriting nothing.
+        low_dir = tempfile.mkdtemp()
+        try:
+            _svc, low_path, _sid, low_state = build_fixture(low_dir, cursor=0)
+            self._remove_formal_pair()
+            high_s = write_tmp(self.directory, ".state-high.tmp",
+                               self.state_bytes)
+            high_l = write_tmp(self.directory, ".integrity-high.tmp",
+                               self.sidecar_bytes)
+            low_s = write_tmp(self.directory, ".state-low.bak", low_state)
+            with self.assertRaises(StateFileError):
+                attach_persistence(DeviceService(), self.path)
+            self.assertFalse(os.path.exists(self.path))
+            self.assertFalse(os.path.exists(self.sidecar))
+            self.assertEqual(open(high_s, "rb").read(), self.state_bytes)
+            self.assertEqual(open(high_l, "rb").read(),
+                             self.sidecar_bytes)
+            self.assertTrue(os.path.exists(low_s))
+        finally:
+            shutil.rmtree(low_dir, ignore_errors=True)
+
+    def test_one_state_two_binding_sidecars_refuses_and_touches_nothing(
+            self) -> None:
+        # One verifiable modern state bound by two distinct sidecar files
+        # (one .tmp, one .bak): the state maps to two sidecars, so startup
+        # refuses without promoting or deleting either file.
+        self._remove_formal_pair()
+        state_c = write_tmp(self.directory, ".state-a.tmp", self.state_bytes)
+        log_tmp = write_tmp(self.directory, ".integrity-a.tmp",
+                            self.sidecar_bytes)
+        log_bak = write_tmp(self.directory, ".integrity-a.bak",
+                            self.sidecar_bytes)
+        with self.assertRaises(StateFileError):
+            attach_persistence(DeviceService(), self.path)
+        self.assertFalse(os.path.exists(self.path))
+        self.assertFalse(os.path.exists(self.sidecar))
+        for path, content in ((state_c, self.state_bytes),
+                              (log_tmp, self.sidecar_bytes),
+                              (log_bak, self.sidecar_bytes)):
+            self.assertEqual(open(path, "rb").read(), content)
+
+    def test_modern_pair_wins_beside_marker_less_legacy_leftover(self) -> None:
+        # A fully paired modern state plus a marker-less, sidecar-less legacy
+        # leftover is not a modern ambiguity: the unique modern pair is
+        # recovered and the legacy leftover is swept as crash garbage.
+        document = json.loads(self.state_bytes.decode("utf-8"))
+        document.pop("integrity_log_version", None)
+        document.pop("commit_seq", None)
+        legacy_bytes = json.dumps(document).encode("utf-8")
+        self._remove_formal_pair()
+        write_tmp(self.directory, ".state-modern.tmp", self.state_bytes)
+        write_tmp(self.directory, ".integrity-modern.tmp",
+                  self.sidecar_bytes)
+        write_tmp(self.directory, ".state-legacy.tmp", legacy_bytes)
+        service = DeviceService()
+        attach_persistence(service, self.path)
+        self.assertEqual(open(self.path, "rb").read(), self.state_bytes)
+        self.assertEqual(open(self.sidecar, "rb").read(),
+                         self.sidecar_bytes)
+        self.assertEqual(_sidecar_names(self.directory), [])
+        self.assertEqual(_state_bak_names(self.directory), [])
 
     def test_no_verifiable_pair_sweeps_both_files_and_creates_empty(
             self) -> None:
