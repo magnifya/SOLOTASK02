@@ -35,6 +35,7 @@ from .models import (
     MessageSyncCursor,
     PreKeyBatchClaim,
     PreKeyClaim,
+    RedeliveryJob,
     Session,
     SignedPreKey,
     utc_now_iso,
@@ -167,6 +168,32 @@ INBOX_LEASE_NOT_DELIVERED = "lease_not_delivered"
 #: claim is withheld from later claims until this deadline passes, after
 #: which a fresh ``lease_id`` may claim it again.
 INBOX_LEASE_SECONDS = 30
+
+#: States of a 1:1-inbox redelivery job (``POST /v1/inbox-jobs``).
+REDELIVERY_JOB_PENDING = "pending"
+REDELIVERY_JOB_RUNNING = "running"
+REDELIVERY_JOB_SUCCEEDED = "succeeded"
+REDELIVERY_JOB_FAILED = "failed"
+REDELIVERY_JOB_STATES = frozenset({
+    REDELIVERY_JOB_PENDING,
+    REDELIVERY_JOB_RUNNING,
+    REDELIVERY_JOB_SUCCEEDED,
+    REDELIVERY_JOB_FAILED,
+})
+
+#: Outcome codes for a 1:1-inbox redelivery job submission.
+REDELIVERY_JOB_DEVICE_UNKNOWN = "device_unknown"
+REDELIVERY_JOB_DEVICE_INACTIVE = "device_inactive"
+#: The job_id was already committed for another device.
+REDELIVERY_JOB_CONFLICT = "job_id_conflict"
+#: A dispatch/status named a job_id that was never queued.
+REDELIVERY_JOB_NOT_FOUND = "job_not_found"
+#: A dispatch could not take the job's lease because the job_id is already
+#: occupied as an inbox lease id by an unrelated claim.
+REDELIVERY_JOB_LEASE_OCCUPIED = "lease_occupied"
+
+#: Number of inbox messages one redelivery-job dispatch leases at most.
+REDELIVERY_JOB_DISPATCH_LIMIT = 100
 
 
 def _is_utc_microsecond_iso(value: Any) -> bool:
@@ -378,6 +405,19 @@ class InboxLeaseError(Exception):
         self.reason = reason
 
 
+class RedeliveryJobError(Exception):
+    """A 1:1-inbox redelivery job operation failed; nothing was written.
+
+    The device-level reasons (``device_unknown`` / ``device_inactive``) map
+    to 409/field=device_id; ``job_not_found`` maps to 404/field=job_id and
+    ``job_id_conflict`` to 409/field=job_id.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class GroupSessionRotationError(Exception):
     """An atomic group-session rotation failed; nothing was written."""
 
@@ -409,6 +449,7 @@ INTEGRITY_SECTION_KEYS = (
     "message_sync_cursors",
     "message_submissions",
     "key_events",
+    "redelivery_jobs",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -421,7 +462,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 17 canonical
+    """Project a store snapshot/document payload onto the 18 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -507,6 +548,10 @@ class DeviceStore:
         self._message_submissions: Dict[str, MessageSubmission] = {}
         # Delivery state keyed by (session_id, message_id).
         self._delivery: Dict[Tuple[str, str], MessageDelivery] = {}
+        # 1:1-inbox redelivery jobs, keyed by the client-chosen job_id
+        # (globally unique). A dispatched job's lease lives on the leased
+        # messages' delivery records under a lease_id equal to the job_id.
+        self._redelivery_jobs: Dict[str, RedeliveryJob] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -2688,6 +2733,9 @@ class DeviceStore:
                 completed_at=completed_at)
             for _key, lease in hits:
                 lease.completion = completion
+            # A lease taken by a redelivery-job dispatch moves its job to
+            # the matching terminal state in the same locked transaction.
+            self._redelivery_job_completed_locked(lease_id, outcome)
             # One persistence notification for the whole lease set: every
             # per-message completion commits (or rolls back) together and
             # the generation advances at most once.
@@ -2965,6 +3013,127 @@ class DeviceStore:
                 "next_after": next_after,
                 "has_more": after + limit < len(filtered),
             }
+
+    @staticmethod
+    def redelivery_job_view(job: RedeliveryJob) -> Dict[str, Any]:
+        """The wire view of one redelivery job, keys in response order."""
+        return {
+            "job_id": job.job_id,
+            "device_id": job.device_id,
+            "state": job.state,
+            "lease_id": job.lease_id,
+        }
+
+    def redelivery_job_submit(
+            self, device_id: str, job_id: str, op: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Apply one 1:1-inbox redelivery job operation.
+
+        ``POST /v1/inbox-jobs``; *op* is ``queue``, ``dispatch`` or
+        ``status`` (already validated by the service, as are the non-empty
+        string ids). Under the one store lock (shared with claims,
+        completions, acks and revocation) the device is resolved first —
+        unknown or revoked raises :class:`RedeliveryJobError`
+        ``device_unknown``/``device_inactive`` (409/device_id) for every
+        op. A ``job_id`` committed for another device raises
+        ``job_id_conflict`` (409/job_id) whatever the op.
+
+        ``queue`` creates the job ``pending`` (201, one persistence
+        notification); replaying it on the same device returns the job's
+        current view with 200 and writes nothing. ``dispatch``/``status``
+        on a never-queued id raise ``job_not_found`` (404/job_id).
+        ``status`` is purely read-only (200, no write). ``dispatch`` on a
+        non-pending job is a replay (200, no write); on a pending job it
+        leases up to :data:`REDELIVERY_JOB_DISPATCH_LIMIT` unacked inbox
+        messages that carry no still-active lease, in the inbox's fixed
+        ``(session.created_at, session_id, sequence)`` order, recording a
+        lease whose ``lease_id`` is the *job_id* itself on every leased
+        message's delivery record: a non-empty selection moves the job to
+        ``running`` with ``lease_id`` set, an empty one straight to
+        ``succeeded`` with ``lease_id`` null — both 201 and one
+        notification. Returns ``(body, status_code)`` with the body keys
+        ``job_id``, ``device_id``, ``state``, ``lease_id`` in that order.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_INACTIVE)
+            job = self._redelivery_jobs.get(job_id)
+            if job is not None and job.device_id != device_id:
+                raise RedeliveryJobError(REDELIVERY_JOB_CONFLICT)
+            if op == "queue":
+                if job is not None:
+                    return self.redelivery_job_view(job), 200
+                job = RedeliveryJob(job_id=job_id, device_id=device_id)
+                self._redelivery_jobs[job_id] = job
+                self._notify_change()
+                return self.redelivery_job_view(job), 201
+            if job is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_NOT_FOUND)
+            if op == "status" or job.state != REDELIVERY_JOB_PENDING:
+                # A status query is read-only; a dispatch replayed on a
+                # non-pending job returns the current view and writes
+                # nothing.
+                return self.redelivery_job_view(job), 200
+
+            now = datetime.now(timezone.utc)
+            # The dispatch lease takes the job_id as its lease_id; an
+            # unrelated claim that already occupies the id blocks the
+            # dispatch rather than corrupting the lease namespace.
+            if self._find_inbox_lease_locked(job_id) is not None:
+                raise RedeliveryJobError(REDELIVERY_JOB_LEASE_OCCUPIED)
+            picked: List[Tuple[Tuple[str, str], Message]] = []
+            for _, session_id, message in self._inbox_entries_locked(
+                    device_id):
+                key = (session_id, message.message_id)
+                state = self._delivery.get(key)
+                if state is not None \
+                        and self._has_active_lease_locked(state, now):
+                    continue
+                picked.append((key, message))
+                if len(picked) >= REDELIVERY_JOB_DISPATCH_LIMIT:
+                    break
+            if picked:
+                # timespec="microseconds" always emits six fractional
+                # digits, mirroring the claim endpoint's deadlines.
+                leased_until = (now + timedelta(
+                    seconds=INBOX_LEASE_SECONDS)) \
+                    .isoformat(timespec="microseconds")
+                for key, _message in picked:
+                    state = self._delivery.get(key)
+                    if state is None:
+                        state = MessageDelivery()
+                        self._delivery[key] = state
+                    state.leases.append(MessageLease(
+                        lease_id=job_id,
+                        limit=REDELIVERY_JOB_DISPATCH_LIMIT,
+                        leased_until=leased_until))
+                job.state = REDELIVERY_JOB_RUNNING
+                job.lease_id = job_id
+            else:
+                # Nothing to redeliver: the job succeeds immediately and
+                # never takes a lease.
+                job.state = REDELIVERY_JOB_SUCCEEDED
+            self._notify_change()
+            return self.redelivery_job_view(job), 201
+
+    def _redelivery_job_completed_locked(self, lease_id: str,
+                                         outcome: str) -> None:
+        """Move a dispatched redelivery job to its terminal state.
+
+        Called under the store lock when the inbox lease whose id is
+        *lease_id* is completed with *outcome*: a running job that took
+        that lease becomes ``succeeded`` on ``delivered`` and ``failed``
+        on ``failed``, inside the same locked transaction as the
+        completion itself. Leases not taken by a job change nothing.
+        """
+        job = self._redelivery_jobs.get(lease_id)
+        if job is not None and job.state == REDELIVERY_JOB_RUNNING \
+                and job.lease_id == lease_id:
+            job.state = REDELIVERY_JOB_SUCCEEDED \
+                if outcome == "delivered" else REDELIVERY_JOB_FAILED
 
     def inbox_retry_batch(
             self, device_id: str, attempt_id: str,
@@ -3543,6 +3712,12 @@ class DeviceStore:
                 "ciphertext": r.ciphertext,
                 "created_at": r.created_at,
             } for r in self._message_submissions.values()]
+            redelivery_jobs = [{
+                "job_id": job.job_id,
+                "device_id": job.device_id,
+                "state": job.state,
+                "lease_id": job.lease_id,
+            } for job in self._redelivery_jobs.values()]
             key_events = [
                 self.key_event_view(event)
                 for chain in self._key_events.values() for event in chain
@@ -3560,7 +3735,8 @@ class DeviceStore:
                         "used_nonces": used_nonces,
                         "group_sync_cursors": group_sync_cursors,
                         "message_sync_cursors": message_sync_cursors,
-                        "message_submissions": message_submissions}
+                        "message_submissions": message_submissions,
+                        "redelivery_jobs": redelivery_jobs}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -3737,6 +3913,7 @@ class DeviceStore:
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
         raw_message_sync_cursors = state.get("message_sync_cursors", [])
         raw_message_submissions = state.get("message_submissions", [])
+        raw_redelivery_jobs = state.get("redelivery_jobs", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -3751,7 +3928,8 @@ class DeviceStore:
                 and isinstance(raw_group_delivery, list)
                 and isinstance(raw_group_sync_cursors, list)
                 and isinstance(raw_message_sync_cursors, list)
-                and isinstance(raw_message_submissions, list)):
+                and isinstance(raw_message_submissions, list)
+                and isinstance(raw_redelivery_jobs, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -4919,6 +5097,86 @@ class DeviceStore:
                 attempts=attempts, attempt_ids=set(attempt_ids), acked=acked,
                 ack_sequence=ack_sequence, leases=leases)
 
+        # 1:1-inbox redelivery jobs. Older version-1 files predate the
+        # section: it is absent and treated as empty. A present section is
+        # fully validated — job_id unique, device_id a registered device,
+        # state one of the four wire values, lease_id null or the job_id
+        # itself — and the state machine must agree with the lease records
+        # restored above: a pending job has no lease; a running job's lease
+        # exists, belongs to the job's device and is uncompleted; a
+        # succeeded job either never took a lease (empty dispatch) or its
+        # lease completed ``delivered``; a failed job's lease completed
+        # ``failed``. Any contradiction refuses startup rather than
+        # silently dropping the job state machine.
+        redelivery_jobs: Dict[str, RedeliveryJob] = {}
+        for index, raw in enumerate(raw_redelivery_jobs):
+            where = f"redelivery_jobs[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            try:
+                j_job_id = raw["job_id"]
+                j_device_id = raw["device_id"]
+                j_state = raw["state"]
+                j_lease_id = raw["lease_id"]
+            except KeyError as error:
+                raise ValueError(
+                    f"{where} missing field: {error.args[0]}") from None
+            if not (isinstance(j_job_id, str) and j_job_id):
+                raise ValueError(
+                    f"{where}.job_id must be a non-empty string")
+            if not (isinstance(j_device_id, str) and j_device_id):
+                raise ValueError(
+                    f"{where}.device_id must be a non-empty string")
+            if j_state not in REDELIVERY_JOB_STATES:
+                raise ValueError(
+                    f"{where}.state must be one of "
+                    f"{sorted(REDELIVERY_JOB_STATES)}")
+            if j_lease_id is not None and not (
+                    isinstance(j_lease_id, str) and j_lease_id):
+                raise ValueError(
+                    f"{where}.lease_id must be null or a non-empty string")
+            if j_lease_id is not None and j_lease_id != j_job_id:
+                raise ValueError(
+                    f"{where}.lease_id must be null or equal the job_id")
+            if j_job_id in redelivery_jobs:
+                raise ValueError(
+                    f"duplicate redelivery job in state: {j_job_id}")
+            if j_device_id not in device_index:
+                raise ValueError(
+                    f"{where} references an unknown device: {j_device_id}")
+            binding = lease_index.get(j_job_id)
+            completion = binding[5] if binding is not None else None
+            if j_state == REDELIVERY_JOB_PENDING:
+                if j_lease_id is not None:
+                    raise ValueError(
+                        f"{where} is pending but carries a lease_id")
+            elif j_state == REDELIVERY_JOB_RUNNING:
+                if j_lease_id is None or binding is None \
+                        or binding[0] != j_device_id \
+                        or completion is not None:
+                    raise ValueError(
+                        f"{where} is running but has no matching "
+                        f"uncompleted lease owned by {j_device_id}")
+            elif j_state == REDELIVERY_JOB_SUCCEEDED:
+                if j_lease_id is not None and (
+                        binding is None or binding[0] != j_device_id
+                        or completion is None
+                        or completion[1] != "delivered"):
+                    raise ValueError(
+                        f"{where} is succeeded but its lease did not "
+                        f"complete 'delivered'")
+            else:  # REDELIVERY_JOB_FAILED
+                if j_lease_id is None or binding is None \
+                        or binding[0] != j_device_id \
+                        or completion is None \
+                        or completion[1] != "failed":
+                    raise ValueError(
+                        f"{where} is failed but its lease did not "
+                        f"complete 'failed'")
+            redelivery_jobs[j_job_id] = RedeliveryJob(
+                job_id=j_job_id, device_id=j_device_id, state=j_state,
+                lease_id=j_lease_id)
+
         # Per-device group-session delivery records. Older version-1 files
         # predate the section: it is absent and treated as empty. A present
         # section holds one record per (session, message, device); every
@@ -5261,6 +5519,7 @@ class DeviceStore:
             self._group_sync_cursors = group_sync_cursors
             self._message_sync_cursors = message_sync_cursors
             self._message_submissions = message_submissions
+            self._redelivery_jobs = redelivery_jobs
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor

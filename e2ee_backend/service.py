@@ -77,6 +77,11 @@ from .storage import (
     INBOX_LEASE_NOT_FOUND,
     INBOX_LEASE_UNAVAILABLE,
     PREKEY_CONFLICT,
+    REDELIVERY_JOB_CONFLICT,
+    REDELIVERY_JOB_DEVICE_INACTIVE,
+    REDELIVERY_JOB_DEVICE_UNKNOWN,
+    REDELIVERY_JOB_LEASE_OCCUPIED,
+    REDELIVERY_JOB_NOT_FOUND,
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
     ROTATION_ACTOR_UNKNOWN,
@@ -112,6 +117,7 @@ from .storage import (
     MessageSyncError,
     PreKeyClaimError,
     PreKeyBatchClaimError,
+    RedeliveryJobError,
     SessionCreateError,
 )
 
@@ -1793,6 +1799,66 @@ class DeviceService:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
         return page
+
+    def inbox_job(self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one 1:1-inbox redelivery job operation.
+
+        ``POST /v1/inbox-jobs``. The body must be a JSON object carrying
+        non-empty strings ``device_id``, ``job_id`` and ``op``, with ``op``
+        one of ``queue``, ``dispatch`` or ``status``. A bad/non-object body
+        is 400/field ``request_body``; a missing, empty or wrongly typed
+        field is 400 with the corresponding ``field`` (``device_id`` /
+        ``job_id`` / ``op``), as is an ``op`` outside the three verbs.
+
+        The device must be registered and not revoked, else 409/field
+        ``device_id`` (checked in the store under the lock, ahead of the
+        job lookup, so it is linearized against revocation). ``queue``
+        creates the job ``pending`` (201); replaying the same ``job_id``
+        on the same device returns its current view (200); the same
+        ``job_id`` on another device is 409/field ``job_id``.
+        ``dispatch``/``status`` on a never-queued id are 404/field
+        ``job_id``; ``status`` is read-only (200) and ``dispatch`` on a
+        non-pending job is a replay (200). A first ``dispatch`` on a
+        pending job leases up to 100 unacked, currently unleased inbox
+        messages under a ``lease_id`` equal to the ``job_id``: a non-empty
+        selection moves the job to ``running``, an empty one to
+        ``succeeded`` — both 201. Completing that lease ``delivered`` /
+        ``failed`` moves the job to ``succeeded`` / ``failed`` in the same
+        locked transaction. The response keys are ``job_id``,
+        ``device_id``, ``state``, ``lease_id`` in that order.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("device_id", "job_id", "op"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        op = payload["op"]
+        if op not in ("queue", "dispatch", "status"):
+            raise ServiceError(
+                "field must be one of 'queue', 'dispatch' or 'status': op",
+                "op")
+        try:
+            return self.store.redelivery_job_submit(
+                payload["device_id"], payload["job_id"], op)
+        except RedeliveryJobError as error:
+            if error.reason == REDELIVERY_JOB_NOT_FOUND:
+                raise ServiceError(
+                    f"job not found: {payload['job_id']}",
+                    "job_id", status_code=404)
+            if error.reason in (REDELIVERY_JOB_CONFLICT,
+                                REDELIVERY_JOB_LEASE_OCCUPIED):
+                raise ServiceError(
+                    "job_id is already used by another device or its lease "
+                    "is occupied", "job_id", status_code=409)
+            if error.reason == REDELIVERY_JOB_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
 
     # -- messages ----------------------------------------------------------
 

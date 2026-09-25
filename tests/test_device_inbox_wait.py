@@ -308,6 +308,29 @@ class InboxWaitHTTPTest(InboxMixin, unittest.TestCase):
             self.assertEqual(list(body), ["message", "field"], query)
             self.assertEqual(body["field"], "limit", query)
 
+    def test_huge_numerals_rejected_before_conversion(self) -> None:
+        # Absurdly long digit strings are refused with a clean 400 (field
+        # names the parameter) instead of tripping the int() conversion
+        # limit; leading zeros are stripped before the digit count, so a
+        # zero-padded in-range value still parses.
+        for query, field in (("limit=" + "9" * 5000, "limit"),
+                             ("limit=1000", "limit"),
+                             ("timeout_ms=" + "9" * 5000, "timeout_ms"),
+                             ("timeout_ms=100000", "timeout_ms")):
+            status, raw = self._request(
+                f"/v1/devices/bob/inbox/wait?{query}")
+            body = json.loads(raw.decode("utf-8"))
+            self.assertEqual(status, 400, query[:40])
+            self.assertEqual(list(body), ["message", "field"], query[:40])
+            self.assertEqual(body["field"], field, query[:40])
+        status, _ = self._request(
+            "/v1/devices/bob/inbox/wait?limit=0100&timeout_ms=00000")
+        self.assertEqual(status, 200)
+        status, _ = self._request(
+            "/v1/devices/bob/inbox/wait?limit=" + "0" * 5000 + "1"
+            + "&timeout_ms=0")
+        self.assertEqual(status, 200)
+
     def test_timeout_param_validation(self) -> None:
         for query in ("timeout_ms=", "timeout_ms=abc", "timeout_ms=-1",
                       "timeout_ms=30001", "timeout_ms=+1",

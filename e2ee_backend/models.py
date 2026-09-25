@@ -301,6 +301,28 @@ class MessageLease:
 
 
 @dataclass
+class RedeliveryJob:
+    """One 1:1-inbox redelivery job, keyed by the client-chosen ``job_id``.
+
+    ``POST /v1/inbox-jobs`` with ``op=queue`` creates the job in the
+    ``pending`` state; a later ``op=dispatch`` on a pending job leases up to
+    100 still-unleased unacked inbox messages under a lease whose
+    ``lease_id`` is the ``job_id`` itself — a non-empty selection moves the
+    job to ``running`` (``lease_id`` set), an empty one straight to
+    ``succeeded`` (``lease_id`` stays ``None``). When that lease is later
+    completed, the job takes the terminal state matching the completion
+    outcome (``delivered`` -> ``succeeded``, ``failed`` -> ``failed``) in the
+    same locked transaction. Only identifiers and the state machine are
+    retained.
+    """
+
+    job_id: str
+    device_id: str
+    state: str = "pending"
+    lease_id: Optional[str] = None
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 
