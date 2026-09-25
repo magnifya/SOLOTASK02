@@ -101,6 +101,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 and "/inbox/leases/" in path and path.endswith("/renew"):
             self._route_device_inbox_lease_renew(path)
         elif path.startswith(_DEVICES_PATH + "/") \
+                and "/inbox/leases/" in path and path.endswith("/complete"):
+            self._route_device_inbox_lease_complete(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
                 and "/inbox/leases/" in path and path.endswith("/release"):
             self._route_device_inbox_lease_release(path)
         elif path.startswith(_DEVICES_PATH + "/"):
@@ -247,6 +250,19 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         if (len(parts) == 4 and parts[0] and parts[1] == "inbox"
                 and parts[2] == "leases" and parts[3]):
             self._handle_device_inbox_lease_release(
+                unquote(parts[0]), unquote(parts[3]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_device_inbox_lease_complete(self, path: str) -> None:
+        # {device_id}/inbox/leases/{lease_id}/complete — split on raw slashes
+        # only; a percent-encoded slash inside an id segment is part of it.
+        suffix = path[len(_DEVICES_PATH) + 1:-len("/complete")]
+        parts = suffix.split("/")
+        if (len(parts) == 4 and parts[0] and parts[1] == "inbox"
+                and parts[2] == "leases" and parts[3]):
+            self._handle_device_inbox_lease_complete(
                 unquote(parts[0]), unquote(parts[3]))
         else:
             self._send_json(404, {"message": "device not found",
@@ -721,6 +737,19 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.inbox_lease_renew(
+                device_id, lease_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_device_inbox_lease_complete(
+            self, device_id: str, lease_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.inbox_lease_complete(
                 device_id, lease_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())

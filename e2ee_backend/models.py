@@ -243,6 +243,25 @@ class MessageLeaseRenewal:
 
 
 @dataclass
+class MessageLeaseCompletion:
+    """The one committed completion of a 1:1-inbox redelivery lease.
+
+    ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/complete`` is
+    the terminal lease operation: it records whether the client finished
+    the redelivery as ``delivered`` or ``failed``. The record freezes the
+    client-chosen ``completion_id`` (unique within one lease, but reusable
+    across different leases), the ``outcome`` and the UTC
+    ``completed_at`` timestamp, so a replayed completion returns its first
+    response byte-identically. Every delivery record the lease appears on
+    carries an item-by-item identical copy of the completion.
+    """
+
+    completion_id: str
+    outcome: str
+    completed_at: str
+
+
+@dataclass
 class MessageLease:
     """One 1:1-inbox redelivery lease held on a message.
 
@@ -264,6 +283,13 @@ class MessageLease:
     extension per renewal (i.e. the last renewal's ``leased_until``). The
     claim deadline itself stays frozen, so replaying the original claim
     still returns its first response.
+
+    ``completion`` is ``None`` until
+    ``POST .../inbox/leases/{lease_id}/complete`` commits; afterwards it is
+    the single :class:`MessageLeaseCompletion` that ends the lease's
+    lifecycle. A completed lease stays on the record as history (the
+    completion, renewal and claim replays all answer from it) but no longer
+    withholds its messages, and it can neither be renewed nor released.
     """
 
     lease_id: str
@@ -271,6 +297,7 @@ class MessageLease:
     leased_until: str
     released_at: Optional[str] = None
     renewals: List[MessageLeaseRenewal] = field(default_factory=list)
+    completion: Optional[MessageLeaseCompletion] = None
 
 
 @dataclass

@@ -69,6 +69,7 @@ from .storage import (
     INBOX_RETRY_MESSAGE_UNKNOWN,
     INBOX_RETRY_NOT_RECIPIENT,
     INBOX_RETRY_SESSION_UNKNOWN,
+    INBOX_LEASE_COMPLETION_CONFLICT,
     INBOX_LEASE_CONFLICT,
     INBOX_LEASE_DEVICE_INACTIVE,
     INBOX_LEASE_DEVICE_UNKNOWN,
@@ -1498,6 +1499,10 @@ class DeviceService:
                 raise ServiceError(
                     "lease_id is owned by another device",
                     "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_UNAVAILABLE:
+                raise ServiceError(
+                    "lease is already completed and cannot be released",
+                    "lease_id", status_code=409)
             if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
                 raise ServiceError("device_id is not a registered device",
                                    "device_id", status_code=409)
@@ -1552,6 +1557,80 @@ class DeviceService:
             if error.reason == INBOX_LEASE_UNAVAILABLE:
                 raise ServiceError(
                     "lease is released or expired and cannot be renewed",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
+    def inbox_lease_complete(self, device_id: str, lease_id: str,
+                             payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one 1:1-inbox lease completion.
+
+        ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/complete``.
+        The body must be a JSON object carrying a non-empty string
+        ``completion_id`` and an ``outcome`` of exactly ``delivered`` or
+        ``failed``. A bad/non-object body is 400/field ``request_body``; a
+        missing, empty or wrongly typed ``completion_id`` is
+        400/completion_id and a missing or non-allowed ``outcome`` is
+        400/outcome.
+
+        The lease is resolved in the store under the lock, ahead of the
+        path device's state: a never-committed ``lease_id`` is 404/field
+        ``lease_id`` and a lease owned by another device is 409/field
+        ``lease_id``. Replaying the same ``completion_id`` on the same
+        lease returns the frozen first response with 200 (ids may recur on
+        other leases), winning over every later state; reusing the id with
+        a different outcome, or completing the lease again under another
+        id, is 409/field ``completion_id``. Only a first completion checks
+        the device (unknown or revoked -> 409/field ``device_id``) and the
+        lease state (already released or expired -> 409/field
+        ``lease_id``). A first completion returns 201 with ``device_id``,
+        ``lease_id``, ``completion_id``, ``outcome`` and ``completed_at``
+        (UTC ISO-8601 with six microsecond digits and ``+00:00``) in that
+        key order, and persists one generation. Completion ends the lease:
+        its still-unacked messages may be claimed again (``delivered`` is
+        not an acknowledgement) and no renewal or first release follows.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "completion_id" not in payload:
+            raise ServiceError("missing required field: completion_id",
+                               "completion_id")
+        if not is_nonempty_string(payload["completion_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: completion_id",
+                "completion_id")
+        if "outcome" not in payload:
+            raise ServiceError("missing required field: outcome", "outcome")
+        outcome = payload["outcome"]
+        if not isinstance(outcome, str) or outcome not in ("delivered",
+                                                           "failed"):
+            raise ServiceError(
+                "field must be one of 'delivered' or 'failed': outcome",
+                "outcome")
+
+        try:
+            return self.store.inbox_lease_complete(
+                device_id, lease_id, payload["completion_id"], outcome)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_COMPLETION_CONFLICT:
+                raise ServiceError(
+                    "completion_id is already used on this lease or the "
+                    "lease has already been completed",
+                    "completion_id", status_code=409)
+            if error.reason == INBOX_LEASE_UNAVAILABLE:
+                raise ServiceError(
+                    "lease is released or expired and cannot be completed",
                     "lease_id", status_code=409)
             if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
                 raise ServiceError("device_id is not a registered device",
