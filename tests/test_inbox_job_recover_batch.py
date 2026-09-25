@@ -116,6 +116,20 @@ class InboxJobRecoverBatchServiceTest(_BatchMixin, unittest.TestCase):
             self.assertEqual((error.status_code, error.field),
                              (400, field), items)
 
+    def test_item_extra_keys_rejected_at_item_level(self) -> None:
+        good = {"job_id": "j1", "recovery_id": "r1"}
+        cases = (
+            [{"job_id": "j1", "recovery_id": "r1", "cancellation_id": "c"}],
+            [{"job_id": "j1", "recovery_id": "r1", "extra": 1}],
+            [{"job_id": "j1", "recovery_id": "r1", "lease_id": "L"}],
+            [good, {"job_id": "j2", "recovery_id": "r2", "bogus": None}],
+        )
+        for items in cases:
+            index = 0 if len(items) == 1 else 1
+            error = self._error(lambda items=items: self._batch(items=items))
+            self.assertEqual((error.status_code, error.field),
+                             (400, f"items[{index}]"), items)
+
     def test_duplicate_job_id_or_recovery_id_rejected(self) -> None:
         items = [{"job_id": "j1", "recovery_id": "r1"},
                  {"job_id": "j1", "recovery_id": "r2"}]
@@ -381,8 +395,11 @@ class InboxJobRecoverBatchPersistenceTest(_BatchMixin, unittest.TestCase):
                  for item in document["redelivery_jobs"]}
         for item in items.values():
             self.assertEqual(list(item), ["job_id", "device_id", "state",
-                                          "lease_id", "recoveries"])
+                                          "lease_id", "recoveries",
+                                          "cancellation_id", "cancelled_at"])
         self.assertEqual(items["pending"]["recoveries"], [])
+        self.assertIsNone(items["pending"]["cancellation_id"])
+        self.assertIsNone(items["pending"]["cancelled_at"])
         self.assertEqual(items["j1"]["recoveries"], [
             {"recovery_id": "r1", "lease_id": "r1"}])
         self.assertEqual(items["j2"]["recoveries"], [
