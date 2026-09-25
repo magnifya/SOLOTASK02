@@ -1771,6 +1771,90 @@ class DeviceStore:
             return self._message_sync_cursor_view(
                 session_id, device_id, record), advanced
 
+    def message_sync_ack(self, session_id: str, device_id: str,
+                         cursor: int
+                         ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically batch-ack receivable messages and advance the cursor.
+
+        A forward move marks every message in ``(current, cursor]`` the
+        device may receive as acked — for a 1:1 session the single
+        (session, message) delivery record, for a group session the
+        per-device record of every frozen member's message except the ones
+        the device sent itself — and advances the unified sync cursor in the
+        same locked transaction (``attempts`` are never touched). A 1:1
+        session authorizes its recipient only; a group session any frozen
+        member. *cursor* must not exceed the session's largest stored
+        sequence nor move backwards (409/cursor); an equal cursor is an
+        idempotent no-op (200, nothing is acked, persisted or re-timestamped).
+        Returns ``(view, advanced)``.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            group_session = (self._group_sessions.get(session_id)
+                             if session is None else None)
+            if session is None and group_session is None:
+                raise MessageSyncError(MESSAGE_SYNC_SESSION_UNKNOWN)
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            if session is not None:
+                # A 1:1 session's only acking device is its recipient.
+                if device_id != session.recipient_device_id:
+                    raise MessageSyncError(MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT)
+                anchor_created_at = session.created_at
+            else:
+                if device_id not in group_session.members:
+                    raise MessageSyncError(MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT)
+                anchor_created_at = group_session.created_at
+            stream = self._messages.get(session_id, [])
+            max_sequence = stream[-1].sequence if stream else 0
+            if cursor > max_sequence:
+                raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
+            cursor_key = (session_id, device_id)
+            record = self._message_sync_cursors.get(cursor_key)
+            current = record.cursor if record is not None else 0
+            if cursor < current:
+                raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
+            advanced = cursor > current
+            if advanced:
+                for message in stream:
+                    if not current < message.sequence <= cursor:
+                        continue
+                    if group_session is not None:
+                        # A sender never acknowledges their own message.
+                        if message.sender_device_id == device_id:
+                            continue
+                        bucket: Dict[Tuple, MessageDelivery] = \
+                            self._group_delivery
+                        key: Tuple = (session_id, message.message_id,
+                                      device_id)
+                    else:
+                        bucket = self._delivery
+                        key = (session_id, message.message_id)
+                    state = bucket.get(key)
+                    if state is None:
+                        state = MessageDelivery()
+                        bucket[key] = state
+                    if not state.acked:
+                        state.acked = True
+                        state.ack_sequence = message.sequence
+                if record is None:
+                    record = MessageSyncCursor(cursor=cursor)
+                    self._message_sync_cursors[cursor_key] = record
+                else:
+                    record.cursor = cursor
+                    record.updated_at = utc_now_iso()
+                self._notify_change()
+            if record is None:
+                # No cursor has ever been advanced: the ack at 0 is an
+                # idempotent no-op anchored at the session's creation time.
+                record = MessageSyncCursor(cursor=0,
+                                           updated_at=anchor_created_at)
+            return self._message_sync_cursor_view(
+                session_id, device_id, record), advanced
+
     # -- messages ----------------------------------------------------------
 
     @staticmethod

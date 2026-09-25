@@ -1126,6 +1126,46 @@ class DeviceService:
             raise self._message_sync_error(error, session_id)
         return view, 201 if advanced else 200
 
+    def sync_session_ack(self, session_id: str,
+                         payload: object) -> Tuple[Dict[str, Any], int]:
+        """Batch-ack receivable messages and advance the sync cursor.
+
+        ``device_id`` must be a non-empty string and ``cursor`` an integer in
+        ``0..max_sequence``. A forward move acks every receivable message in
+        ``(current, cursor]`` (a 1:1 session's records for its recipient; a
+        group session's per-device records, skipping the device's own
+        messages) and advances the unified sync cursor in one transaction,
+        returning 201 with a refreshed ``updated_at``; an equal cursor
+        returns 200 unchanged. Unknown session is 404/session_id; an
+        unknown, revoked or non-authorized device is 409/device_id (a 1:1
+        session authorizes its recipient only, a group session its frozen
+        members); a backward or out-of-range cursor is 409/cursor.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id", "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        if "cursor" not in payload:
+            raise ServiceError("missing required field: cursor", "cursor")
+        cursor = payload["cursor"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(cursor, int) or isinstance(cursor, bool):
+            raise ServiceError("field must be an integer: cursor", "cursor")
+        if cursor < 0:
+            raise ServiceError("field must be a non-negative integer: cursor",
+                               "cursor")
+
+        try:
+            view, advanced = self.store.message_sync_ack(
+                session_id, payload["device_id"], cursor)
+        except MessageSyncError as error:
+            raise self._message_sync_error(error, session_id)
+        return view, 201 if advanced else 200
+
     # -- messages ----------------------------------------------------------
 
     def post_message(self, payload: object) -> Dict[str, Any]:
