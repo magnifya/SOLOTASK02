@@ -225,6 +225,22 @@ class MessageSubmission:
 
 
 @dataclass
+class LeaseRenewal:
+    """One committed renewal of a 1:1-inbox redelivery lease.
+
+    A successful ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/renew``
+    extends the lease's effective deadline by exactly 30 seconds and records
+    the client-chosen ``renewal_id`` together with the new UTC
+    ``leased_until`` it committed, so a replayed renewal returns its first
+    response byte-identically. The id is scoped to its lease: the same
+    ``renewal_id`` may be committed on different leases.
+    """
+
+    renewal_id: str
+    leased_until: str
+
+
+@dataclass
 class MessageLease:
     """One 1:1-inbox redelivery lease held on a message.
 
@@ -240,12 +256,17 @@ class MessageLease:
     timestamp once ``POST .../inbox/leases/{lease_id}/release`` committed:
     a released lease stays on the record as history (the release replays
     from it) but no longer withholds the message from new claims.
+
+    ``renewals`` holds the committed renewals in order; the lease's
+    effective deadline is the last renewal's ``leased_until`` (or the
+    claim's ``leased_until`` when never renewed).
     """
 
     lease_id: str
     limit: int
     leased_until: str
     released_at: Optional[str] = None
+    renewals: List[LeaseRenewal] = field(default_factory=list)
 
 
 @dataclass
