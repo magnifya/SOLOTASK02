@@ -1265,6 +1265,39 @@ class DeviceService:
         body = {"device_id": device_id, "results": results}
         return body, 201 if any_advanced else 200
 
+    def device_inbox(self, device_id: str, limit: int) -> Dict[str, Any]:
+        """Return one device's aggregated 1:1 offline-inbox page (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox``. ``limit`` must be an integer in
+        1..100 (the HTTP layer defaults it to 100 and rejects repeats,
+        non-decimals and out-of-range values with 400/field=limit). An
+        unknown or revoked device is 409/field=device_id. On success the body
+        is ``device_id``, ``messages``, ``has_more`` in that key order;
+        ``messages`` holds at most ``limit`` seven-field envelopes (the
+        ``message_view`` key order) of the unacked messages of every 1:1
+        session the device is the recipient of — group sessions and other
+        devices' sessions never contribute — ordered by
+        ``(session.created_at, session_id, sequence)``; ``has_more`` says
+        whether the locked snapshot had further entries. The query is purely
+        read-only: it shares the store lock with submission, ack and
+        revocation but writes nothing, advances no cursor or ``commit_seq``
+        and touches no ``attempts``, so an unchanged state answers
+        byte-identically and a restart rebuilds the same view from
+        ``messages`` and ``delivery``.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            return self.store.device_inbox(device_id, limit)
+        except MessageSyncError as error:
+            if error.reason == MESSAGE_SYNC_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
     # -- messages ----------------------------------------------------------
 
     def post_message(self, payload: object) -> Dict[str, Any]:

@@ -2033,6 +2033,50 @@ class DeviceStore:
             } for plan, record in zip(plans, records)]
             return results, any_advanced
 
+    def device_inbox(self, device_id: str, limit: int) -> Dict[str, Any]:
+        """Atomically read one device's aggregated 1:1 offline inbox.
+
+        Purely read-only: nothing is created, advanced or persisted, so an
+        unchanged state answers byte-identically and consumes no commit
+        generation. The whole snapshot is taken under the store lock (the
+        same lock message submission, sync-ack and revocation take), so the
+        page is linearized against them. The device must exist and not be
+        revoked (both mapped to 409/device_id by the service).
+
+        The inbox aggregates, across every **1:1** session whose
+        ``recipient_device_id`` is this device (group sessions never
+        contribute, and sessions addressed to other devices of the same user
+        never leak in), every message whose ``delivery`` record is missing or
+        not yet acked. Entries are ordered by ``(session.created_at,
+        session_id, sequence)`` — the session_id compared by code points —
+        and the page holds at most *limit* of them; ``has_more`` says whether
+        the locked snapshot still had further entries beyond the page.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            entries: List[Tuple[str, str, Message]] = []
+            for session_id, session in self._sessions.items():
+                if session.recipient_device_id != device_id:
+                    continue
+                for message in self._messages.get(session_id, []):
+                    state = self._delivery.get(
+                        (session_id, message.message_id))
+                    if state is not None and state.acked:
+                        continue
+                    entries.append(
+                        (session.created_at, session_id, message))
+            entries.sort(key=lambda entry: (entry[0], entry[1],
+                                            entry[2].sequence))
+            page = entries[:limit]
+            return {
+                "device_id": device_id,
+                "messages": [self.message_view(entry[2]) for entry in page],
+                "has_more": len(entries) > limit,
+            }
 
     # -- messages ----------------------------------------------------------
 
