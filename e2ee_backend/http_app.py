@@ -88,6 +88,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         elif path.startswith(_DEVICES_PATH + "/") \
                 and path.endswith("/identity-key/rotate"):
             self._route_rotate_identity(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/sync/ack-batch"):
+            self._route_device_sync_ack_batch(path)
         elif path.startswith(_DEVICES_PATH + "/"):
             self._route_add_prekey(path)
         elif path.startswith(_MESSAGES_PATH + "/") and path.endswith("/acks"):
@@ -183,6 +186,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         parts = suffix.split("/")
         if len(parts) == 1 and parts[0]:
             self._handle_rotate_identity(unquote(parts[0]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_device_sync_ack_batch(self, path: str) -> None:
+        suffix = path[len(_DEVICES_PATH) + 1:-len("/sync/ack-batch")]
+        if suffix and "/" not in suffix:
+            self._handle_device_sync_ack_batch(unquote(suffix))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -586,6 +597,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body, status_code = self.service.sync_session_ack(
                 session_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_device_sync_ack_batch(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.sync_device_ack_batch(
+                device_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

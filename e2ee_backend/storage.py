@@ -282,6 +282,19 @@ class MessageSyncError(Exception):
         self.reason = reason
 
 
+class MessageSyncAckBatchError(Exception):
+    """A device-scoped batch sync-ack failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported) offending
+    item; validation runs in array order and the whole batch writes nothing.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
 class GroupSessionRotationError(Exception):
     """An atomic group-session rotation failed; nothing was written."""
 
@@ -1806,6 +1819,106 @@ class DeviceStore:
             raise MessageSyncError(MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT)
         return group_session.created_at
 
+    def _plan_sync_ack_locked(self, session_id: str, device_id: str,
+                               cursor: int) -> Dict[str, Any]:
+        """Authorize and validate one sync-ack while holding the store lock.
+
+        Performs every check without mutating state, so a batch can validate
+        all of its items in array order before applying any of them. Returns a
+        plan consumed by :meth:`_commit_sync_ack_plans_locked`. Raises
+        :class:`MessageSyncError` on an unknown session, an
+        unknown/revoked/unauthorized device, or a cursor below the stored
+        cursor (0 when none) or above the session's largest sequence.
+        """
+        anchor_created_at = self._authorize_sync_ack_device(
+            session_id, device_id)
+        stream = self._messages.get(session_id, [])
+        max_sequence = stream[-1].sequence if stream else 0
+        if cursor > max_sequence:
+            raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
+        cursor_key = (session_id, device_id)
+        record = self._message_sync_cursors.get(cursor_key)
+        current = record.cursor if record is not None else 0
+        if cursor < current:
+            raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
+        return {
+            "session_id": session_id,
+            "device_id": device_id,
+            "cursor": cursor,
+            "current": current,
+            "record": record,
+            "stream": stream,
+            "is_group": self._group_sessions.get(session_id) is not None,
+            "anchor_created_at": anchor_created_at,
+            "advanced": cursor > current,
+        }
+
+    def _commit_sync_ack_plans_locked(self, plans: List[Dict[str, Any]],
+                                      timestamp: str) -> List[MessageSyncCursor]:
+        """Apply already-validated sync-ack plans in order under the lock.
+
+        Every advancing plan shares the single *timestamp*. Each forward move
+        marks the receivable messages in ``(current, cursor]`` acked one by one
+        (a 1:1 session via the recipient's ``delivery`` record, a group session
+        via the per-device ``group_delivery`` record while skipping the
+        device's own messages), leaving ``attempts``/attempt ids untouched, and
+        creates or advances the cursor record. An equal plan writes nothing and
+        keeps its timestamp (a never-written cursor reports the anchor
+        ``created_at``). No persistence notification is emitted; the caller
+        notifies exactly once for the whole batch. Returns the stored (or
+        transient) record per plan, in order.
+        """
+        records: List[MessageSyncCursor] = []
+        for plan in plans:
+            session_id = plan["session_id"]
+            device_id = plan["device_id"]
+            cursor = plan["cursor"]
+            current = plan["current"]
+            record = plan["record"]
+            if plan["advanced"]:
+                if plan["is_group"]:
+                    for message in plan["stream"]:
+                        if not (current < message.sequence <= cursor):
+                            continue
+                        # A device never acknowledges its own outgoing group
+                        # message; every other frozen member holds a record.
+                        if message.sender_device_id == device_id:
+                            continue
+                        key = (session_id, message.message_id, device_id)
+                        state = self._group_delivery.get(key)
+                        if state is None:
+                            state = MessageDelivery()
+                            self._group_delivery[key] = state
+                        if not state.acked:
+                            state.acked = True
+                            state.ack_sequence = message.sequence
+                else:
+                    for message in plan["stream"]:
+                        if not (current < message.sequence <= cursor):
+                            continue
+                        key = (session_id, message.message_id)
+                        state = self._delivery.get(key)
+                        if state is None:
+                            state = MessageDelivery()
+                            self._delivery[key] = state
+                        if not state.acked:
+                            state.acked = True
+                            state.ack_sequence = message.sequence
+                if record is None:
+                    record = MessageSyncCursor(cursor=cursor,
+                                               updated_at=timestamp)
+                    self._message_sync_cursors[(session_id, device_id)] = record
+                else:
+                    record.cursor = cursor
+                    record.updated_at = timestamp
+            elif record is None:
+                # An equal ack on a device that never advanced a cursor is a
+                # state-free no-op anchored at the session's creation time.
+                record = MessageSyncCursor(cursor=0,
+                                           updated_at=plan["anchor_created_at"])
+            records.append(record)
+        return records
+
     def message_sync_ack(self, session_id: str, device_id: str,
                          cursor: int) -> Tuple[Dict[str, Any], bool]:
         """Atomically batch-acknowledge receivable messages and advance the cursor.
@@ -1827,59 +1940,99 @@ class DeviceStore:
         ``created_at``. Returns ``(view, advanced)``.
         """
         with self._lock:
-            anchor_created_at = self._authorize_sync_ack_device(
-                session_id, device_id)
-            stream = self._messages.get(session_id, [])
-            max_sequence = stream[-1].sequence if stream else 0
-            if cursor > max_sequence:
-                raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
-            cursor_key = (session_id, device_id)
-            record = self._message_sync_cursors.get(cursor_key)
-            current = record.cursor if record is not None else 0
-            if cursor < current:
-                raise MessageSyncError(MESSAGE_SYNC_CURSOR_CONFLICT)
-            advanced = cursor > current
-            if advanced:
-                group_session = self._group_sessions.get(session_id)
-                for message in stream:
-                    if not (current < message.sequence <= cursor):
-                        continue
-                    if group_session is not None:
-                        # A device never acknowledges its own outgoing group
-                        # message; every other frozen member holds a record.
-                        if message.sender_device_id == device_id:
-                            continue
-                        key = (session_id, message.message_id, device_id)
-                        state = self._group_delivery.get(key)
-                        if state is None:
-                            state = MessageDelivery()
-                            self._group_delivery[key] = state
-                    else:
-                        key = (session_id, message.message_id)
-                        state = self._delivery.get(key)
-                        if state is None:
-                            state = MessageDelivery()
-                            self._delivery[key] = state
-                    if not state.acked:
-                        state.acked = True
-                        state.ack_sequence = message.sequence
-                if record is None:
-                    record = MessageSyncCursor(cursor=cursor)
-                    self._message_sync_cursors[cursor_key] = record
-                else:
-                    record.cursor = cursor
-                    record.updated_at = utc_now_iso()
+            plan = self._plan_sync_ack_locked(session_id, device_id, cursor)
+            record = self._commit_sync_ack_plans_locked(
+                [plan], utc_now_iso())[0]
+            if plan["advanced"]:
                 # Acks and the cursor commit together: exactly one persistence
                 # notification, so a durable write failure rolls back all the
                 # delivery flags, the cursor and its timestamp as one.
                 self._notify_change()
-            if record is None:
-                # An equal ack on a device that never advanced a cursor is a
-                # state-free no-op anchored at the session's creation time.
-                record = MessageSyncCursor(cursor=0,
-                                           updated_at=anchor_created_at)
             return self._message_sync_cursor_view(
-                session_id, device_id, record), advanced
+                session_id, device_id, record), plan["advanced"]
+
+    def message_sync_ack_batch(
+            self, device_id: str, items: List[Tuple[str, int]]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Apply many 1:1-session sync-acks for one device as one transaction.
+
+        *items* are ``(session_id, cursor)`` pairs already validated for shape
+        and unique sessions by the service. The device must exist and not be
+        revoked (a batch-level ``device_unknown``/``device_inactive``
+        :class:`MessageSyncError`). Items are then validated in array order;
+        the first failure raises :class:`MessageSyncAckBatchError` carrying
+        that item's index and the batch writes nothing:
+
+        * a session that is neither a 1:1 nor a group session ->
+          ``session_unknown`` (404);
+        * a group session, or a 1:1 session whose recipient is not this device
+          -> ``session_not_recipient`` (409);
+        * a cursor below the stored cursor (0 when none) or above the
+          session's largest sequence -> ``cursor_conflict`` (409).
+
+        On success every advancing item shares one UTC timestamp and all acks,
+        cursor advances and the single persistence notification commit under
+        the one store lock (so a durable write failure rolls the whole batch
+        back); equal items write nothing. Returns ``(results, any_advanced)``
+        with one three-field (``session_id``/``cursor``/``updated_at``) result
+        per item, in input order.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            plans: List[Dict[str, Any]] = []
+            for index, (session_id, cursor) in enumerate(items):
+                session = self._sessions.get(session_id)
+                if session is None:
+                    reason = MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT \
+                        if self._group_sessions.get(session_id) is not None \
+                        else MESSAGE_SYNC_SESSION_UNKNOWN
+                    raise MessageSyncAckBatchError(reason, index)
+                if device_id != session.recipient_device_id:
+                    raise MessageSyncAckBatchError(
+                        MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT, index)
+                stream = self._messages.get(session_id, [])
+                max_sequence = stream[-1].sequence if stream else 0
+                if cursor > max_sequence:
+                    raise MessageSyncAckBatchError(
+                        MESSAGE_SYNC_CURSOR_CONFLICT, index)
+                cursor_key = (session_id, device_id)
+                record = self._message_sync_cursors.get(cursor_key)
+                current = record.cursor if record is not None else 0
+                if cursor < current:
+                    raise MessageSyncAckBatchError(
+                        MESSAGE_SYNC_CURSOR_CONFLICT, index)
+                # Validate in array order; only after every item passes are
+                # any of them committed below.
+                plans.append({
+                    "session_id": session_id,
+                    "device_id": device_id,
+                    "cursor": cursor,
+                    "current": current,
+                    "record": record,
+                    "stream": stream,
+                    "is_group": False,
+                    "anchor_created_at": session.created_at,
+                    "advanced": cursor > current,
+                })
+            any_advanced = any(plan["advanced"] for plan in plans)
+            records = self._commit_sync_ack_plans_locked(
+                plans, utc_now_iso())
+            if any_advanced:
+                # One persistence notification for the whole batch: all the
+                # per-session acks and cursors commit (or roll back) together
+                # and the generation advances at most once.
+                self._notify_change()
+            results = [{
+                "session_id": plan["session_id"],
+                "cursor": record.cursor,
+                "updated_at": record.updated_at,
+            } for plan, record in zip(plans, records)]
+            return results, any_advanced
+
 
     # -- messages ----------------------------------------------------------
 
