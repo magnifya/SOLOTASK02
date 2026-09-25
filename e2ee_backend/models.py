@@ -301,6 +301,25 @@ class MessageLease:
 
 
 @dataclass
+class RedeliveryJobRecovery:
+    """One committed recovery of a running redelivery job's lapsed lease.
+
+    ``POST /v1/inbox-jobs`` with ``op=recover`` re-leases a running job
+    whose current lease has expired or been released. The record freezes
+    the client-chosen ``recovery_id`` (globally unique across jobs and
+    inbox lease ids) together with the lease the recovery took: a
+    non-empty selection creates an ordinary inbox lease whose
+    ``lease_id`` is the ``recovery_id`` itself, an empty selection takes
+    no lease (``lease_id`` stays ``None``) and succeeds the job. Records
+    are kept in commit order, so a replayed recovery returns its first
+    response and a restart rebuilds the same state machine.
+    """
+
+    recovery_id: str
+    lease_id: Optional[str] = None
+
+
+@dataclass
 class RedeliveryJob:
     """One 1:1-inbox redelivery job, keyed by the client-chosen ``job_id``.
 
@@ -312,14 +331,19 @@ class RedeliveryJob:
     ``succeeded`` (``lease_id`` stays ``None``). When that lease is later
     completed, the job takes the terminal state matching the completion
     outcome (``delivered`` -> ``succeeded``, ``failed`` -> ``failed``) in the
-    same locked transaction. Only identifiers and the state machine are
-    retained.
+    same locked transaction. A running job whose current lease has lapsed
+    (expired or released) can be recovered with ``op=recover``: the job
+    takes a fresh lease named by the ``recovery_id`` and stays ``running``
+    (or succeeds lease-less on an empty selection); each committed recovery
+    appends one :class:`RedeliveryJobRecovery` in commit order. Only
+    identifiers and the state machine are retained.
     """
 
     job_id: str
     device_id: str
     state: str = "pending"
     lease_id: Optional[str] = None
+    recoveries: List[RedeliveryJobRecovery] = field(default_factory=list)
 
 
 @dataclass

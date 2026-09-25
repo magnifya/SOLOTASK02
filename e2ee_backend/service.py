@@ -80,8 +80,11 @@ from .storage import (
     REDELIVERY_JOB_CONFLICT,
     REDELIVERY_JOB_DEVICE_INACTIVE,
     REDELIVERY_JOB_DEVICE_UNKNOWN,
+    REDELIVERY_JOB_LEASE_ACTIVE,
     REDELIVERY_JOB_LEASE_OCCUPIED,
     REDELIVERY_JOB_NOT_FOUND,
+    REDELIVERY_JOB_NOT_RUNNING,
+    REDELIVERY_JOB_RECOVERY_CONFLICT,
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
     ROTATION_ACTOR_UNKNOWN,
@@ -1805,10 +1808,12 @@ class DeviceService:
 
         ``POST /v1/inbox-jobs``. The body must be a JSON object carrying
         non-empty strings ``device_id``, ``job_id`` and ``op``, with ``op``
-        one of ``queue``, ``dispatch`` or ``status``. A bad/non-object body
-        is 400/field ``request_body``; a missing, empty or wrongly typed
-        field is 400 with the corresponding ``field`` (``device_id`` /
-        ``job_id`` / ``op``), as is an ``op`` outside the three verbs.
+        one of ``queue``, ``dispatch``, ``status`` or ``recover``; a
+        ``recover`` additionally requires a non-empty string
+        ``recovery_id``. A bad/non-object body is 400/field
+        ``request_body``; a missing, empty or wrongly typed field is 400
+        with the corresponding ``field`` (``device_id`` / ``job_id`` /
+        ``op`` / ``recovery_id``), as is an ``op`` outside the four verbs.
 
         The device must be registered and not revoked, else 409/field
         ``device_id`` (checked in the store under the lock, ahead of the
@@ -1816,16 +1821,29 @@ class DeviceService:
         creates the job ``pending`` (201); replaying the same ``job_id``
         on the same device returns its current view (200); the same
         ``job_id`` on another device is 409/field ``job_id``.
-        ``dispatch``/``status`` on a never-queued id are 404/field
-        ``job_id``; ``status`` is read-only (200) and ``dispatch`` on a
-        non-pending job is a replay (200). A first ``dispatch`` on a
-        pending job leases up to 100 unacked, currently unleased inbox
-        messages under a ``lease_id`` equal to the ``job_id``: a non-empty
-        selection moves the job to ``running``, an empty one to
-        ``succeeded`` — both 201. Completing that lease ``delivered`` /
-        ``failed`` moves the job to ``succeeded`` / ``failed`` in the same
-        locked transaction. The response keys are ``job_id``,
-        ``device_id``, ``state``, ``lease_id`` in that order.
+        ``dispatch``/``status``/``recover`` on a never-queued id are
+        404/field ``job_id``; ``status`` is read-only (200) and
+        ``dispatch`` on a non-pending job is a replay (200). A first
+        ``dispatch`` on a pending job leases up to 100 unacked, currently
+        unleased inbox messages under a ``lease_id`` equal to the
+        ``job_id``: a non-empty selection moves the job to ``running``,
+        an empty one to ``succeeded`` — both 201. Completing that lease
+        ``delivered`` / ``failed`` moves the job to ``succeeded`` /
+        ``failed`` in the same locked transaction.
+
+        ``recover`` re-leases a ``running`` job whose current lease has
+        expired or been released. Replaying the same ``recovery_id`` on
+        the same job returns the current view (200, no write); the id
+        already committed on another job's recovery or occupied as an
+        inbox lease id is 409/field ``recovery_id``. A job that is not
+        running is 409/field ``job_id``; a running job whose lease is
+        still active is 409/field ``lease_id``. Otherwise the recovery
+        leases up to 100 unacked, currently unleased inbox messages under
+        a ``lease_id`` equal to the ``recovery_id``: a non-empty
+        selection keeps the job ``running`` with the new ``lease_id``, an
+        empty one moves it to ``succeeded`` with ``lease_id`` null — both
+        201. The response keys are ``job_id``, ``device_id``, ``state``,
+        ``lease_id`` in that order.
         """
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object",
@@ -1837,13 +1855,23 @@ class DeviceService:
                 raise ServiceError(
                     f"field must be a non-empty string: {name}", name)
         op = payload["op"]
-        if op not in ("queue", "dispatch", "status"):
+        if op not in ("queue", "dispatch", "status", "recover"):
             raise ServiceError(
-                "field must be one of 'queue', 'dispatch' or 'status': op",
-                "op")
+                "field must be one of 'queue', 'dispatch', 'status' or "
+                "'recover': op", "op")
+        recovery_id: Optional[str] = None
+        if op == "recover":
+            if "recovery_id" not in payload:
+                raise ServiceError("missing required field: recovery_id",
+                                   "recovery_id")
+            if not is_nonempty_string(payload["recovery_id"]):
+                raise ServiceError(
+                    "field must be a non-empty string: recovery_id",
+                    "recovery_id")
+            recovery_id = payload["recovery_id"]
         try:
             return self.store.redelivery_job_submit(
-                payload["device_id"], payload["job_id"], op)
+                payload["device_id"], payload["job_id"], op, recovery_id)
         except RedeliveryJobError as error:
             if error.reason == REDELIVERY_JOB_NOT_FOUND:
                 raise ServiceError(
@@ -1854,6 +1882,19 @@ class DeviceService:
                 raise ServiceError(
                     "job_id is already used by another device or its lease "
                     "is occupied", "job_id", status_code=409)
+            if error.reason == REDELIVERY_JOB_RECOVERY_CONFLICT:
+                raise ServiceError(
+                    "recovery_id is already used by another job's recovery "
+                    "or as an inbox lease id", "recovery_id",
+                    status_code=409)
+            if error.reason == REDELIVERY_JOB_NOT_RUNNING:
+                raise ServiceError(
+                    "job is not running and cannot be recovered",
+                    "job_id", status_code=409)
+            if error.reason == REDELIVERY_JOB_LEASE_ACTIVE:
+                raise ServiceError(
+                    "the job's lease is still active and cannot be "
+                    "recovered yet", "lease_id", status_code=409)
             if error.reason == REDELIVERY_JOB_DEVICE_UNKNOWN:
                 raise ServiceError("device_id is not a registered device",
                                    "device_id", status_code=409)
