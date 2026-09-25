@@ -1668,6 +1668,50 @@ class DeviceService:
                     "lease_id", status_code=409)
             raise
 
+    def inbox_leases(self, device_id: str, state: str, after: int,
+                     limit: int) -> Dict[str, Any]:
+        """Return one page of a device's 1:1-inbox lease history (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox/leases``. The GET takes no
+        request body (the HTTP layer rejects a non-empty one with
+        400/field ``request_body``) and only the single-valued query
+        parameters ``state``, ``after`` and ``limit`` (any other parameter
+        is 400/field ``query``). ``state`` defaults to ``all`` and must be
+        one of ``all``/``active``/``expired``/``released``/``completed``;
+        ``after`` defaults to 0 and must be an unsigned decimal integer;
+        ``limit`` defaults to 100 and must be in 1..100 (the HTTP layer
+        enforces the decimal shape and single occurrence, answering
+        400 with the parameter name as ``field``).
+
+        Under the store lock the per-message lease copies are deduplicated
+        by ``lease_id``, ordered by the initial claim ``leased_until`` and
+        then the ``lease_id`` code points, filtered by current state and
+        paged (skip *after*, take *limit*). An unknown device is
+        404/field ``device_id``; a revoked device's history stays
+        readable. On success the body keys are ``device_id``, ``leases``,
+        ``next_after`` and ``has_more`` in that order; each lease item is
+        ``lease_id``, ``state``, ``leased_until`` and ``message_count``
+        with the state and effective deadline identical to the single-lease
+        query. The lookup writes nothing and advances no ``commit_seq``.
+        """
+        if state not in ("all", "active", "expired", "released",
+                         "completed"):
+            raise ServiceError(
+                "field must be one of 'all', 'active', 'expired', "
+                "'released' or 'completed': state", "state")
+        if not isinstance(after, int) or isinstance(after, bool) or after < 0:
+            raise ServiceError(
+                "field must be a non-negative integer: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        page = self.store.inbox_leases_page(device_id, state, after, limit)
+        if page is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return page
+
     # -- messages ----------------------------------------------------------
 
     def post_message(self, payload: object) -> Dict[str, Any]:
