@@ -2726,6 +2726,93 @@ class DeviceStore:
                 "messages": messages,
             }
 
+    def inbox_leases_page(
+            self, device_id: str, state: str, after: int, limit: int
+    ) -> Dict[str, Any]:
+        """Read one device's paginated 1:1-inbox lease history (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox/leases``. Under the one store
+        lock (shared with claims, renewals, releases, completions, acks,
+        retries and revocation), the device is resolved first: an unknown
+        *device_id* raises :class:`MessageSyncError` ``device_unknown``
+        (404/device_id), while a revoked device is still listed — its
+        leases stay inspectable after revocation, mirroring the
+        single-lease query.
+
+        The history collects every lease recorded on the delivery records
+        of the 1:1 sessions the device is the recipient of, deduplicating
+        the per-message copies by ``lease_id`` (restore validation
+        guarantees the copies are identical, so the first one found is
+        authoritative) and counting the messages each lease was taken on.
+        Entries are ordered by ``(claim leased_until, lease_id)`` — the
+        frozen claim deadline, not the renewed one, and the id compared by
+        code points — then filtered by the current ``state``
+        (``completed`` / ``released`` / ``expired`` / ``active``, computed
+        exactly as in :meth:`inbox_lease_get`; ``all`` skips the filter).
+        The page skips *after* filtered entries and holds at most *limit*
+        of them; each item is ``lease_id``, ``state``, ``leased_until``
+        (the current effective deadline) and ``message_count`` in that key
+        order. ``next_after`` is *after* on an empty page and otherwise
+        *after* plus the number of returned items; ``has_more`` says
+        whether the filtered list still had entries beyond the page. The
+        query writes nothing and advances no commit generation, so an
+        unchanged state answers byte-identically.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            now = datetime.now(timezone.utc)
+            # Dedupe the cross-message lease copies by lease_id, keeping
+            # the first copy and counting the messages the lease covers.
+            owned: Dict[str, Tuple[MessageLease, int]] = {}
+            for (session_id, _message_id), delivery in self._delivery.items():
+                if not delivery.leases:
+                    continue
+                session = self._sessions.get(session_id)
+                if session is None \
+                        or session.recipient_device_id != device_id:
+                    continue
+                for lease in delivery.leases:
+                    entry = owned.get(lease.lease_id)
+                    if entry is None:
+                        owned[lease.lease_id] = (lease, 1)
+                    else:
+                        owned[lease.lease_id] = (entry[0], entry[1] + 1)
+            # Order by the initial (claim) deadline, then the lease id in
+            # code-point order.
+            rows = sorted(owned.items(),
+                          key=lambda item: (item[1][0].leased_until, item[0]))
+            filtered: List[Tuple[str, MessageLease, str, int]] = []
+            for lease_id, (lease, message_count) in rows:
+                if lease.completion is not None:
+                    current = "completed"
+                elif lease.released_at is not None:
+                    current = "released"
+                elif self._lease_is_active_locked(lease, now):
+                    current = "active"
+                else:
+                    current = "expired"
+                if state != "all" and current != state:
+                    continue
+                filtered.append((lease_id, lease, current, message_count))
+            page = filtered[after:after + limit]
+            leases: List[Dict[str, Any]] = []
+            for lease_id, lease, current, message_count in page:
+                leases.append({
+                    "lease_id": lease_id,
+                    "state": current,
+                    "leased_until": lease.renewals[-1].leased_until
+                    if lease.renewals else lease.leased_until,
+                    "message_count": message_count,
+                })
+            return {
+                "device_id": device_id,
+                "leases": leases,
+                "next_after": after + len(page) if page else after,
+                "has_more": len(filtered) > after + len(page),
+            }
+
     def inbox_retry_batch(
             self, device_id: str, attempt_id: str,
             items: List[Tuple[str, str]]

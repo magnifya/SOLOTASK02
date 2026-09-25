@@ -120,6 +120,10 @@ _SESSION_SCALAR_FIELDS = (
 _MESSAGE_STRING_FIELDS = (
     "session_id", "sender_device_id", "message_id", "nonce", "ciphertext")
 
+#: States the inbox lease-history query accepts for its ``state`` filter.
+_INBOX_LEASE_HISTORY_STATES = (
+    "all", "active", "expired", "released", "completed")
+
 #: Maps a storage-level message-append failure reason to (HTTP status, field).
 _MESSAGE_CREATE_ERROR_MAP = {
     MESSAGE_SESSION_UNKNOWN: (404, "session_id"),
@@ -1666,6 +1670,44 @@ class DeviceService:
                 raise ServiceError(
                     "lease_id is owned by another device",
                     "lease_id", status_code=409)
+            raise
+
+    def inbox_leases_page(self, device_id: str, state: str, after: int,
+                          limit: int) -> Dict[str, Any]:
+        """Return one device's paginated 1:1-inbox lease history (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox/leases``. ``state`` must be one
+        of ``all`` (the default), ``active``, ``expired``, ``released`` or
+        ``completed``; ``after`` a non-negative integer (default 0) and
+        ``limit`` an integer in 1..100 (default 100) — the HTTP layer
+        applies the defaults and rejects repeated, non-decimal or
+        out-of-range values with 400 naming the field. An unknown
+        ``device_id`` is 404/field ``device_id``; a revoked device is
+        still listed. On success the body keys are ``device_id``,
+        ``leases``, ``next_after`` and ``has_more`` in that order, each
+        lease item being ``lease_id``, ``state``, ``leased_until`` and
+        ``message_count``. The query is purely read-only: it shares the
+        store lock with the mutating lease operations but writes nothing
+        and advances no ``commit_seq``.
+        """
+        if state not in _INBOX_LEASE_HISTORY_STATES:
+            raise ServiceError(
+                "field must be one of all|active|expired|released|"
+                "completed: state", "state")
+        if not isinstance(after, int) or isinstance(after, bool) or after < 0:
+            raise ServiceError(
+                "field must be a non-negative integer: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            return self.store.inbox_leases_page(device_id, state, after,
+                                                limit)
+        except MessageSyncError as error:
+            if error.reason == MESSAGE_SYNC_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=404)
             raise
 
     # -- messages ----------------------------------------------------------
