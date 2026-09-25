@@ -325,6 +325,21 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_key_events(unquote(device_id))
                 return
+            if "/inbox/leases/" in suffix:
+                # {device_id}/inbox/leases/{lease_id} — split on raw slashes
+                # only; a percent-encoded slash inside an id segment is part
+                # of it. This exact pattern has no sub-handler (renew/
+                # release/complete are POST-only), so a mismatch is simply
+                # not this route.
+                head, _, lease_segment = suffix.partition("/inbox/leases/")
+                if head and "/" not in head and lease_segment \
+                        and "/" not in lease_segment:
+                    self._handle_device_inbox_lease_get(
+                        unquote(head), unquote(lease_segment))
+                    return
+                self._send_json(404, {"message": "device not found",
+                                      "field": "device_id"})
+                return
             if suffix.endswith("/inbox"):
                 device_id = suffix[:-len("/inbox")]
                 if not device_id or "/" in device_id:
@@ -778,6 +793,39 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(status_code, body)
+
+    def _handle_device_inbox_lease_get(
+            self, device_id: str, lease_id: str) -> None:
+        # The lease query takes no request body and no query parameters:
+        # either one is a 400 (field request_body / query).
+        # keep_blank_values so a bare ``?foo`` flag is an actual (malformed)
+        # parameter rather than being silently dropped; a trailing ``?`` with
+        # no parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        try:
+            body = self.service.inbox_lease_get(device_id, lease_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
 
     def _sync_query_params(self) -> Optional[Tuple[str, Optional[int], int]]:
         """Validate the sync GET params: single ``device_id``, optional
