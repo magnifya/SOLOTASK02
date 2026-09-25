@@ -293,9 +293,11 @@ class LeasePersistenceTest(LeaseMixin, unittest.TestCase):
                 "acked", "ack_sequence", "leases"])
             self.assertEqual(len(record["leases"]), 1)
             self.assertEqual(list(record["leases"][0]),
-                             ["lease_id", "limit", "leased_until"])
+                             ["lease_id", "limit", "leased_until",
+                              "released_at"])
             self.assertEqual(record["leases"][0]["lease_id"], "L1")
             self.assertEqual(record["leases"][0]["limit"], 2)
+            self.assertIsNone(record["leases"][0]["released_at"])
 
     def test_empty_claim_persists_nothing_and_advances_no_generation(self) -> None:
         self.service.inbox_claim("bob", {"lease_id": "L1", "limit": 10})
