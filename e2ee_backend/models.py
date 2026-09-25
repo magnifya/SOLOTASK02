@@ -225,19 +225,41 @@ class MessageSubmission:
 
 
 @dataclass
+class MessageLease:
+    """One 1:1-inbox redelivery lease held on a message.
+
+    A successful ``POST /v1/devices/{device_id}/inbox/claim`` leases up to
+    ``limit`` still-unleased (or lease-expired) unacked messages for 30
+    seconds. The lease is recorded on every leased message's
+    :class:`MessageDelivery` record (inside ``delivery[].leases``), so the
+    same ``lease_id`` — globally unique — is durably bound to exactly one
+    device, one limit and one ``leased_until`` timestamp. Only identifiers,
+    the small integer limit and the UTC deadline are retained.
+    """
+
+    lease_id: str
+    limit: int
+    leased_until: str
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 
     Tracks the recipient-side retry attempts (keyed/deduped by the client's
     non-empty ``attempt_id``), whether the recipient has acknowledged the
-    message, and the per-recipient ack sequence cursor. Only identifiers and
-    counters are kept — never message plaintext or keys.
+    message, the per-recipient ack sequence cursor, and the inbox redelivery
+    leases currently or previously held on the message (active and expired
+    ones alike — an expired lease is history that a new ``lease_id`` may
+    supersede but never erase). Only identifiers and counters are kept —
+    never message plaintext or keys.
     """
 
     attempts: int = 0
     attempt_ids: Set[str] = field(default_factory=set)
     acked: bool = False
     ack_sequence: int = 0
+    leases: List[MessageLease] = field(default_factory=list)
 
 
 @dataclass
