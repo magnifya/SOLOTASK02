@@ -56,18 +56,35 @@ onto the formal path (a valid formal always wins). Two or more
 verifiable backups make promotion ambiguous and are likewise refused rather than picked by
 name or mtime.
 
-A crash between steps can leave ``.state-*.tmp`` (staged document) or
-``.state-*.bak`` (pinned previous inode) files beside the target. At the next
-:func:`attach_persistence` these are resolved by
-:func:`recover_crash_leftovers`: a valid formal file stays authoritative and
-the leftovers are removed; with the formal file missing the highest
-``commit_seq`` leftover that parses as version=1, carries the cursor and
-``key_events`` sections (the footprint of one complete durable transaction),
-and passes every semantic restore check is atomically recovered into place
-(modification time newest-first breaks equal generations, and files without
-the field keep the legacy newest-mtime rule); with none valid the leftovers
-are removed and an empty state is created. An existing-but-corrupt formal
-file still makes startup refuse rather than being silently overwritten.
+A crash (or an undecidable write failure) can leave, beside the two formal
+paths, ``.state-*.tmp``/``.state-*.bak`` and
+``.integrity-*.tmp``/``.integrity-*.bak`` staging and pin files, plus
+``*.quarantine`` snapshots and a ``.state-*.block`` marker. At the next
+:func:`attach_persistence` these are resolved together by
+:func:`recover_crash_leftovers` as one two-file transaction:
+
+* a valid formal *pair* (a restorable version=1 state whose sidecar, when the
+  document carries ``integrity_log_version``, verifies and binds its tail to
+  the state's generation and canonical hash — or a sidecar-less legacy
+  document with no sidecar) stays authoritative and every leftover is
+  removed;
+* with the state formal missing, a marked state leftover is recovered only
+  together with the sidecar whose whole chain verifies and whose tail entry
+  matches that state's generation and ``state_hash`` — the surviving formal
+  sidecar or a ``.integrity-*.bak`` pin. The unique highest-generation
+  matching pair is promoted (state and sidecar together); a verifiable marked
+  state with no provable unique mate, or two distinct matching pairs at the
+  top generation, makes startup raise :class:`StateFileError` (the CLI exits
+  1 with one stderr JSON line, ``field=data_file``) with nothing promoted,
+  deleted or overwritten;
+* only when every state leftover is a marker-less legacy file does the
+  sidecar-less rule apply (highest ``commit_seq``, newest mtime to break
+  ties); with no verifiable candidate at all all leftovers (state and
+  sidecar) are removed and an empty state is created.
+
+An existing-but-corrupt formal state file, or a marker/sidecar disagreement,
+still makes startup refuse rather than being silently overwritten.
+
 
 Every document carries a strictly-consecutive top-level ``commit_seq``: the
 first empty state is written at 0 and each successful durable transaction
@@ -123,7 +140,14 @@ _INTEGRITY_LOG_SUFFIX = ".integrity"
 #: (see :meth:`JsonStateStore.save`).
 _TMP_PREFIX = ".state-"
 _TMP_SUFFIX = ".tmp"
-#: Suffix of the pre-replace hard-link backup pinning the previous inode.
+#: Name parts of the staged integrity-sidecar temp file; its inode-backup
+#: pin carries the same ``.bak`` suffix as the state-file pin so one
+#: two-file transaction always leaves a *pair* of backups when rolled back.
+_INTEGRITY_TMP_PREFIX = ".integrity-"
+_INTEGRITY_BAK_SUFFIX = ".bak"
+#: Suffix of the pre-replace hard-link backup pinning the previous inode
+#: (the state file carries ``.state-*.bak``; its sidecar the matching
+#: ``.integrity-*.bak``).
 _BAK_SUFFIX = ".bak"
 #: Suffix of a new snapshot taken off the formal path when the rollback
 #: itself cannot be completed durably. Such a file is deliberately *not* a
@@ -354,19 +378,54 @@ def _serialize_integrity_log(entries: List[Dict[str, Any]]) -> bytes:
 
 
 def _integrity_tmp_paths(directory: str) -> List[str]:
-    """List staged sidecar temp files (``.integrity-*.tmp``) in *directory*.
+    """List sidecar staging/pin leftovers (``.integrity-*.tmp``) in *directory*.
 
-    These are pure transactional staging files: the authoritative sidecar is
-    named ``<state>.integrity`` and never matches this prefix, so every file
-    listed here is leftover garbage from a crashed commit and safe to remove
-    without examining it.
+    The ``.tmp`` files are pure transactional staging: the authoritative
+    sidecar is named ``<state>.integrity`` and never matches this prefix, so
+    every file listed here is leftover garbage from a crashed commit and safe
+    to remove without examining it. Paired ``.integrity-*.bak`` pins are
+    handled separately (they *are* recovery candidates) by
+    :func:`_sidecar_leftover_paths`.
     """
     try:
         names = os.listdir(directory)
     except OSError:
         return []
     return [os.path.join(directory, name) for name in names
-            if name.startswith(".integrity-") and name.endswith(".tmp")]
+            if name.startswith(_INTEGRITY_TMP_PREFIX)
+            and name.endswith(_TMP_SUFFIX)]
+
+
+def _sidecar_leftover_paths(directory: str) -> List[str]:
+    """List sidecar backup pins (``.integrity-*.bak``) in *directory*.
+
+    These are the sidecar mates of the state-file ``.state-*.bak`` pins: each
+    one holds the complete previous integrity chain of one committed
+    generation and is a recovery candidate, never garbage. A mate is paired
+    with a state candidate by generation and tail ``state_hash``.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return [os.path.join(directory, name) for name in names
+            if name.startswith(_INTEGRITY_TMP_PREFIX)
+            and name.endswith(_INTEGRITY_BAK_SUFFIX)]
+
+
+def _sidecar_quarantine_paths(directory: str) -> List[str]:
+    """List demoted new sidecar snapshots (``.integrity-*.quarantine``).
+
+    Like state quarantines these are never recovery candidates and are swept
+    once a valid pair is authoritative.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return [os.path.join(directory, name) for name in names
+            if name.startswith(_INTEGRITY_TMP_PREFIX)
+            and name.endswith(_QUARANTINE_SUFFIX)]
 
 
 def _gate_integrity_sidecar(
@@ -548,22 +607,27 @@ class JsonStateStore:
         real commit (generation 0's entry is written then).
 
         Before the replace a hard link to the current target is taken in the
-        same directory. If the replace itself succeeds but the following
-        directory fsync fails, that link is renamed back over the target,
-        restoring the previous document's exact bytes *and inode*, and the
-        rollback is flushed with a second directory fsync; every other
-        pre-replace failure simply removes the temporary file, leaving the
-        target untouched.
+        same directory — for the state file *and*, once the sidecar exists,
+        for the ``<state>.integrity`` sidecar — so the two files commit (and,
+        on failure, roll back) as one pair of pinned previous inodes. If the
+        state replace itself succeeds but the following directory fsync
+        fails, the pinned inodes are renamed back over both targets, restoring
+        the previous documents' exact bytes *and inodes*, and the rollback is
+        flushed with a second directory fsync; every other pre-replace
+        failure simply removes the temporary files, leaving both targets
+        untouched.
 
-        When the rollback itself cannot be completed durably — the rollback
+        When the rollback itself cannot be completed durably — a rollback
         rename fails, or the second directory fsync fails — the store falls
         back to a *decidable* crash state instead of risking an un-committed
-        snapshot at the formal path: the last committed inode is kept under a
-        ``.bak`` backup and the new snapshot is taken off the formal path
-        (renamed aside to a ``.quarantine`` name the recovery scan never
-        promotes, or deleted), so the formal path is missing and the next
-        write self-heals via :meth:`heal` (or, after a restart,
-        :func:`recover_crash_leftovers`). Any failure propagates the
+        pair at the formal paths: the last committed inodes are kept under a
+        matched pair of ``.state-*.bak`` / ``.integrity-*.bak`` backups and
+        both new snapshots are taken off their formal paths (renamed aside to
+        ``.quarantine`` names the recovery scan never promotes, or deleted),
+        so the formal paths are missing and the next write self-heals via
+        :meth:`heal` (or, after a restart,
+        :func:`recover_crash_leftovers`) by promoting the unique *pair* that
+        matches generation and ``state_hash``. Any failure propagates the
         underlying :class:`OSError` to the caller.
         """
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -611,7 +675,7 @@ class JsonStateStore:
                      "hash": _integrity_entry_hash(seq, state_hash, prev_hash)}
         tmp_handle = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=directory, delete=False,
-            prefix=".state-", suffix=".tmp")
+            prefix=_TMP_PREFIX, suffix=_TMP_SUFFIX)
         tmp_path = tmp_handle.name
         # The sidecar is rewritten whole (it stays small: one hash chain
         # entry per generation) through its own sibling temp file, staged
@@ -621,9 +685,14 @@ class JsonStateStore:
         if not bootstrap:
             log_tmp_handle = tempfile.NamedTemporaryFile(
                 mode="wb", dir=directory, delete=False,
-                prefix=".integrity-", suffix=".tmp")
+                prefix=_INTEGRITY_TMP_PREFIX, suffix=_TMP_SUFFIX)
             log_tmp_path = log_tmp_handle.name
-        backup_path: Optional[str] = None
+        # Pins of the two previous inodes, taken before either rename so a
+        # rolled-back transaction restores the exact committed pair. Either
+        # is None when that formal file does not exist yet (the very first
+        # state save; the sidecar on a legacy-enabling commit).
+        state_backup: Optional[str] = None
+        log_backup: Optional[str] = None
         replaced = False
         log_replaced = False
         try:
@@ -638,9 +707,14 @@ class JsonStateStore:
                 log_tmp_handle.flush()
                 os.fsync(log_tmp_handle.fileno())
                 log_tmp_handle.close()
-            # Pin the old inode before renaming over it. On the first save the
-            # target does not exist yet, so there is no old state to preserve.
-            backup_path = _hardlink_backup(directory, self.path)
+            # Pin both old inodes before renaming over them. On the first save
+            # a target does not exist yet, so there is no old file to preserve.
+            state_backup = _hardlink_backup(
+                directory, self.path, prefix=_TMP_PREFIX)
+            if not bootstrap:
+                log_backup = _hardlink_backup(
+                    directory, self.integrity_log_path,
+                    prefix=_INTEGRITY_TMP_PREFIX)
             os.replace(tmp_path, self.path)
             replaced = True
             # Publish the sidecar entry in the same transaction: atomic
@@ -663,76 +737,29 @@ class JsonStateStore:
                 _remove_quietly(log_tmp_path)
             if replaced:
                 # A state-file replacement landed (the sidecar may or may not
-                # have been renamed). The new sidecar entry belongs to this
-                # un-committed state, so whatever on-disk resolution follows
-                # below (rollback to the pinned inode, degraded formal-missing,
-                # or blocked), restore the sidecar to its pre-transaction
-                # contents whenever its rename landed — absent altogether when
-                # this was the enabling write. Best effort: a state/sidecar
-                # mismatch after a crash makes the next startup refuse.
-                if log_replaced:
-                    self._rollback_integrity_log(directory)
-                # Restore the pinned old inode atomically first (the rename
-                # itself also drops the new inode). On the very first save
-                # there was no prior target, hence no backup pin: the only
-                # rollback is to vacate the new snapshot so the formal path is
-                # missing again.
-                state_restored = False
-                if backup_path is not None:
-                    try:
-                        os.replace(backup_path, self.path)
-                        state_restored = True
-                    except OSError:
-                        state_restored = False
-                if state_restored:
-                    backup_path = None
-                    try:
-                        _fsync_directory(directory)
-                    except OSError:
-                        # The rollback rename restored the old inode but its
-                        # durability could not be flushed: this step failed
-                        # too, so the transaction is still failed, never
-                        # committed. Re-pin the restored inode as a .bak and
-                        # vacate the formal path again, leaving exactly the
-                        # "formal missing + old-inode .bak" state startup
-                        # recovery resolves. When the path could not be
-                        # vacated the old inode is still authoritative at it
-                        # (the safe outcome), so the store is not degraded.
-                        if _repin_old_inode(directory, self.path):
-                            self.degraded = True
-                else:
-                    # There was no backup (first save) or the rollback rename
-                    # itself failed. The formal path still holds the
-                    # un-committed new inode, which must never become
-                    # authoritative: move it off the path (the old inode
-                    # stays pinned in the .bak when one existed), so the next
-                    # startup sees a missing formal file and recovers it.
-                    _vacate_new_snapshot(directory, self.path)
-                    # Keep the backup: it is now the only copy of the last
-                    # committed inode, so it must not be cleaned up below.
-                    backup_path = None
-                    if os.path.exists(self.path):
-                        # The new snapshot could not be taken off the formal
-                        # path: its presence is un-decidable (it is not
-                        # the committed inode, yet occupies the authoritative name).
-                        # Enter the blocking state rather than ever serve it as
-                        # authoritative: persist a marker so a restart keeps
-                        # refusing until the path is missing with a unique backup.
-                        _write_block_marker(directory)
-                        self.blocked = True
-                    else:
-                        self.degraded = True
-            if backup_path is not None:
-                _remove_quietly(backup_path)
+                # have been renamed). Roll the whole two-file transaction back
+                # to its paired previous inodes; this decides the degraded /
+                # blocked outcome and consumes or retains both backup pins.
+                state_backup, log_backup = self._abort_paired_commit(
+                    directory, state_backup, log_backup, log_replaced)
+            # Pins still in hand are pure staging leftovers: a pre-replace
+            # failure left both targets untouched, or the abort consumed a
+            # pin and set it to None. Drop whatever remains.
+            if state_backup is not None:
+                _remove_quietly(state_backup)
+            if log_backup is not None:
+                _remove_quietly(log_backup)
             raise
-        # Commit is durable; drop the pinned old inode (best effort — a
-        # leftover backup is harmless and cleaned up at the next startup).
-        if backup_path is not None:
-            _remove_quietly(backup_path)
-            try:
-                _fsync_directory(directory)
-            except OSError:
-                pass
+        # Commit is durable; drop both pinned old inodes (best effort — a
+        # leftover backup pair is harmless and cleaned up at the next
+        # startup once the valid pair is authoritative).
+        for backup in (state_backup, log_backup):
+            if backup is not None:
+                _remove_quietly(backup)
+        try:
+            _fsync_directory(directory)
+        except OSError:
+            pass
         # The integrity entry is now durably committed alongside the state.
         if entry is not None:
             self.integrity_entries.append(entry)
@@ -740,49 +767,165 @@ class JsonStateStore:
         # The generation advances exactly once per durable commit.
         self.commit_seq = seq + 1
 
-    def _rollback_integrity_log(self, directory: str) -> None:
-        """Restore the pre-transaction sidecar after a state-file rollback.
+    def _abort_paired_commit(
+            self, directory: str, state_backup: Optional[str],
+            log_backup: Optional[str], log_replaced: bool
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Roll a post-replace failed transaction back to its paired inodes.
 
-        Rewrites the sidecar from the in-memory entries (which never include
-        the failed commit); when the failed transaction was the legacy-enable
-        one there were no entries and the sidecar did not previously exist,
-        so it is removed instead. Best effort only — a mismatch between the
-        state file and the sidecar after a crash makes the next startup
-        refuse rather than serve either as authoritative.
+        Called from :meth:`save`'s error path once the state replacement has
+        landed. It first restores the previous sidecar inode (removing the
+        just-published new sidecar on a legacy-enable commit), then restores
+        the previous state inode and flushes the directory. When that can be
+        completed durably the store keeps serving normally; when it cannot,
+        both formal paths are vacated with their matched ``.bak`` pins kept
+        (the *degraded* triage healed by :meth:`heal`), or — if the new state
+        snapshot cannot be taken off the formal path — the store enters the
+        *blocking* state with a durable marker.
+
+        The sidecar is normalized to the same triage as the state so a later
+        heal/restart always finds a *pair*: when the state formal is missing
+        with a ``.state-*.bak`` pin, the sidecar formal is missing with a
+        matching ``.integrity-*.bak`` pin of the previous chain (or absent
+        altogether for a legacy-enable rollback, whose state pin carries no
+        marker). A previous-inode sidecar that cannot be vacated is left on
+        the formal path — still the *old* chain, consistent with the recovered
+        state; a *new* sidecar can never be left beside an old/missing state.
+
+        Returns the ``(state_backup, log_backup)`` pins that remain in the
+        caller's hands (``None`` for a consumed pin); the caller removes them
+        on the full-success path and leaves them on disk for degraded/blocked.
         """
-        if self.integrity_entries:
-            tmp_handle = tempfile.NamedTemporaryFile(
-                mode="wb", dir=directory, delete=False,
-                prefix=".integrity-", suffix=".tmp")
-            tmp_path = tmp_handle.name
+        # --- 1. restore the sidecar to its previous inode (or absence) -----
+        sidecar_needs_vacate = False
+        if log_replaced:
+            if log_backup is not None:
+                try:
+                    os.replace(log_backup, self.integrity_log_path)
+                    log_backup = None
+                    # The old chain is back on the formal path but, like the
+                    # state rename below, its durability is not yet proven.
+                    sidecar_needs_vacate = True
+                except OSError:
+                    # Could not put the old inode back: take the new chain off
+                    # the formal path and keep the pinned old chain for the
+                    # recovery pair.
+                    _vacate_snapshot(
+                        directory, self.integrity_log_path,
+                        prefix=_INTEGRITY_TMP_PREFIX)
+                    sidecar_needs_vacate = False
+            else:
+                # Legacy-enable commit: no sidecar existed before, so the new
+                # chain must simply disappear (formal absent, no pin).
+                _vacate_snapshot(
+                    directory, self.integrity_log_path,
+                    prefix=_INTEGRITY_TMP_PREFIX)
+
+        # --- 2. restore the state inode exactly like the one-file path ------
+        state_restored = False
+        if state_backup is not None:
             try:
-                tmp_handle.write(
-                    _serialize_integrity_log(self.integrity_entries))
-                tmp_handle.flush()
-                os.fsync(tmp_handle.fileno())
-                tmp_handle.close()
-                os.replace(tmp_path, self.integrity_log_path)
+                os.replace(state_backup, self.path)
+                state_restored = True
             except OSError:
-                tmp_handle.close()
-                _remove_quietly(tmp_path)
+                state_restored = False
+
+        if state_restored:
+            state_backup = None
+            try:
+                _fsync_directory(directory)
+            except OSError:
+                # Both rollback renames restored the old inodes but their
+                # durability could not be flushed: re-pin and vacate them so a
+                # crash can never resurrect the un-committed pair.
+                state_vacated = _repin_inode(
+                    directory, self.path, prefix=_TMP_PREFIX)
+                if log_replaced:
+                    self._repin_or_keep_old_sidecar(
+                        directory, log_backup, sidecar_needs_vacate)
+                if state_vacated:
+                    self.degraded = True
+            # fsync landed: a fully durable rollback. Nothing is degraded; the
+            # sidecar rename-back (if any) is already durable too.
+            return state_backup, log_backup
+
+        # The state rollback rename failed (or there was no state backup on
+        # the very first save): move the un-committed new state snapshot off
+        # the formal path and keep the pinned committed inode.
+        _vacate_snapshot(directory, self.path, prefix=_TMP_PREFIX)
+        state_backup = None
+        # Bring the sidecar to the matching triage: a paired old-chain pin
+        # with the formal vacated (or absent on a legacy-enable rollback).
+        if log_replaced:
+            self._repin_or_keep_old_sidecar(
+                directory, log_backup, sidecar_needs_vacate)
+        elif log_backup is not None and not os.path.exists(
+                self.integrity_log_path):
+            # Defensive: the sidecar formal vanished out of band; its pin is
+            # the only copy of the old chain and already the recovery mate.
+            pass
+        if os.path.exists(self.path):
+            # The new state snapshot could not be taken off the formal path:
+            # its presence is un-decidable. Persist a marker so a restart
+            # keeps refusing until the path is missing with a unique
+            # verifiable paired backup.
+            _write_block_marker(directory)
+            self.blocked = True
         else:
-            _remove_quietly(self.integrity_log_path)
+            self.degraded = True
+        return state_backup, log_backup
+
+    def _repin_or_keep_old_sidecar(self, directory: str,
+                                   log_backup: Optional[str],
+                                   formal_holds_old: bool) -> None:
+        """Normalize the sidecar to the degraded state's paired triage.
+
+        After the state formal has been vacated with its ``.state-*.bak`` pin
+        kept, the sidecar must end either absent with exactly one
+        ``.integrity-*.bak`` pin of the previous chain, or — only when the
+        previous chain could not be re-pinned — left on the formal path
+        holding the *old* chain (which stays consistent with the recovered
+        old state). A formal new chain is always vacated first.
+
+        *log_backup* is the surviving pin from :meth:`save` (``None`` when the
+        rollback rename already moved it back onto the formal path);
+        *formal_holds_old* says that formal path currently holds the old
+        inode and therefore needs re-pinning/vacating to mirror the state.
+        """
+        if log_backup is not None:
+            # The old chain survives only under its pin; the formal path is
+            # either already vacated or still holds the new chain. Make sure
+            # the new chain is off it (best effort); leave exactly one pin.
+            if os.path.exists(self.integrity_log_path):
+                _vacate_snapshot(
+                    directory, self.integrity_log_path,
+                    prefix=_INTEGRITY_TMP_PREFIX)
+            return
+        if formal_holds_old and os.path.exists(self.integrity_log_path):
+            # The rollback rename put the old chain back; re-pin and vacate so
+            # the sidecar mirrors the missing state formal. Failure leaves the
+            # old chain authoritative on the formal path — still consistent.
+            _repin_inode(directory, self.integrity_log_path,
+                         prefix=_INTEGRITY_TMP_PREFIX)
 
     def heal(self, baseline: Dict[str, Any]) -> None:
-        """Self-heal the degraded formal path from the pinned ``.bak``.
+        """Self-heal the missing formal paths from a pinned *pair*.
 
         Called under the store lock by the persistence hook at the start of
         the next persist-able write after an undecidable write failure. The
-        pinned backup is verified in full — version=1, a valid commit
+        pinned state backup is verified in full — version=1, a valid commit
         generation exactly one below the next save's generation, the whole
         cross-entity/cursor/nonce/audit-chain semantic restore, and exact
-        equality with the process's last committed in-memory state — before
-        it is promoted. Promotion is a same-directory *hard link*: the backup
-        name keeps pinning the inode until the formal directory entry is
-        fsync-durable, so a crash at this instant leaves either a valid
-        formal file or the still-present backup, never neither. Only then are
-        the same-transaction leftovers (redundant backups, staged ``.tmp``
-        snapshots and the un-committed ``.quarantine``) removed.
+        equality with the process's last committed in-memory state — and a
+        *marked* state backup is only accepted together with the
+        ``.integrity-*.bak`` sidecar pin whose chain verifies and whose tail
+        entry carries that same generation and canonical ``state_hash``. An
+        unmarked (legacy) backup is accepted sidecar-less, as before the
+        integrity log existed. Both files of the chosen pair are promoted
+        with same-directory *hard links* (the backup names keep pinning the
+        inodes until the formal entries are fsync-durable), after which every
+        same-transaction leftover — staged ``.tmp``, redundant ``.bak`` pins
+        and un-committed ``.quarantine`` snapshots for both files — is swept.
 
         A later write commit still goes through the normal atomic
         :meth:`save`, so healing consumes no generation: the healed commit
@@ -790,35 +933,44 @@ class JsonStateStore:
         request — the earlier request that got 503 is never replayed.
 
         Raises :class:`OSError` (mapped to 503/field=data_file by the caller)
-        when no verifiable backup exists, two or more verifiable candidates
+        when no verifiable pair exists, two or more verifiable candidates
         exist (promotion is refused outright — choosing by name or mtime is
         forbidden), or the promotion cannot be made durable; in every such
-        case the formal path stays missing, no leftover and no generation
+        case both formal paths stay missing, no leftover and no generation
         moves, :attr:`degraded` (or :attr:`blocked`) stays set, and the next
-        write retries this heal. A formal file that reappeared valid and matching
-        always takes precedence over every backup — but only in the *degraded*
-        state. In the *blocking* state a residual formal file is never served as
-        authoritative: heal refuses while it occupies the path, and only leaves the
-        blocking state once the path is missing with exactly one verifiable backup to
-        promote (the durable ``.block`` marker is cleared at that point).
+        write retries this heal. A formal file that reappeared valid and
+        matching (with a matching sidecar, or none for a legacy document)
+        always takes precedence over every backup — but only in the
+        *degraded* state. In the *blocking* state a residual formal file is
+        never served as authoritative: heal refuses while it occupies the
+        path, and only leaves the blocking state once the path is missing
+        with exactly one verifiable pair to promote (the durable ``.block``
+        marker is cleared at that point).
         """
         if not (self.degraded or self.blocked):
             return
         directory = os.path.dirname(os.path.abspath(self.path))
         leftovers = _leftover_tmp_paths(directory, self.path)
         quarantined = _quarantined_paths(directory, self.path)
+        sidecar_pins = _sidecar_leftover_paths(directory)
+        sidecar_quarantined = _sidecar_quarantine_paths(directory)
+        sidecar_tmps = _integrity_tmp_paths(directory)
+        all_sidecar_leftovers = (sidecar_pins + sidecar_quarantined
+                                 + sidecar_tmps)
 
         if os.path.exists(self.path):
             # The formal path can only reappear (or, while blocked, never
-            # have been vacated) out of band. A *valid formal always
-            # takes precedence* — and that also resolves the blocked state
-            # safely: the blocked residual is the un-committed new snapshot,
-            # stamped with the NEXT generation (commit_seq == self.commit_seq), so
-            # it can never match the committed baseline; only a file exactly
-            # equal to the last committed state (generation one below, restores
-            # and equals baseline) wins. When it does, keep it, sweep
-            # every leftover/marker and resume normal saves. Anything else is
-            # left untouched and refused.
+            # have been vacated) out of band. A *valid formal always takes
+            # precedence* — and that also resolves the blocked state safely:
+            # the blocked residual is the un-committed new snapshot, stamped
+            # with the NEXT generation (commit_seq == self.commit_seq), so it
+            # can never match the committed baseline; only a file exactly
+            # equal to the last committed state (generation one below,
+            # restores and equals baseline) wins. A marked formal must
+            # additionally have a matching sidecar on its formal path (or a
+            # unique matching pin to promote onto it); a legacy unmarked
+            # formal must have no sidecar. When it all lines up, keep it,
+            # sweep every leftover/marker and resume normal saves.
             formal = _read_version1_document(self.path)
             formal_is_committed = (
                 formal is not None
@@ -827,10 +979,11 @@ class JsonStateStore:
                 and _commit_seq_of(formal) == self.commit_seq - 1
                 and _document_restores(formal)
                 and _document_payload_equals(formal, baseline))
-            if formal_is_committed:
+            if formal_is_committed and self._formal_pair_is_consistent(
+                    formal, sidecar_pins):
                 _sweep_leftovers(
                     directory,
-                    leftovers + quarantined
+                    leftovers + quarantined + all_sidecar_leftovers
                     + _block_marker_paths(directory, self.path))
                 self.degraded = False
                 self.blocked = False
@@ -843,14 +996,15 @@ class JsonStateStore:
                 f"cannot self-heal {self.path}: the formal file reappeared "
                 f"in an unexpected state")
 
-        # Verify every leftover against this process's last committed state.
-        # Equality with *baseline* is the anti-dangling gate in addition to
-        # the full semantic restore: a staged new snapshot (the transaction
-        # already reported 503 and rolled back in memory) parses and may even
-        # restore, but it can never equal the committed baseline and is
-        # therefore never eligible here; quarantine files are never even
-        # considered.
-        eligible: List[str] = []
+        # Verify every state leftover against this process's last committed
+        # state. Equality with *baseline* is the anti-dangling gate in
+        # addition to the full semantic restore: a staged new snapshot (the
+        # transaction already reported 503 and rolled back in memory) parses
+        # and may even restore, but it can never equal the committed baseline
+        # and is therefore never eligible here; quarantine files are never
+        # even considered.
+        marked: List[Tuple[str, Dict[str, Any]]] = []
+        legacy: List[str] = []
         for candidate in leftovers:
             try:
                 with open(candidate, "rb") as handle:
@@ -878,57 +1032,148 @@ class JsonStateStore:
                 continue
             if not _document_payload_equals(document, baseline):
                 continue
-            eligible.append(candidate)
+            if INTEGRITY_LOG_VERSION_KEY in document:
+                marked.append((candidate, document))
+            else:
+                legacy.append(candidate)
 
-        if not eligible:
-            raise OSError(
-                f"cannot self-heal {self.path}: no verifiable pinned backup "
-                f"of the last committed state")
-        # Two or more verifiable candidates are ambiguous even when their
-        # bytes are identical: the choice between pin names must never be made
-        # by name or mtime (both are forgeable and neither encodes which pin
-        # the crashed transaction actually committed). Refuse promotion and
-        # leave everything — formal path, leftovers, memory and generation —
-        # exactly as found, so an operator or a restart resolves the ambiguity;
-        # the next write retries the heal.
-        if len(eligible) > 1:
-            raise OSError(
-                f"cannot self-heal {self.path}: {len(eligible)} verifiable "
-                f"pinned backups of the last committed state; refusing to "
-                f"choose between candidates")
-        chosen = eligible[0]
+        chosen_state: Optional[str] = None
+        chosen_sidecar: Optional[str] = None
 
-        # Promote with a hard link, never a rename: the backup keeps pinning
-        # the inode until the new formal directory entry is fsync-durable.
+        if marked:
+            # A marked committed state is recoverable only as a pair: bind it
+            # to a sidecar whose whole chain verifies and whose tail carries
+            # this generation and the state's canonical hash. The formal
+            # sidecar (which can survive an out-of-band state deletion) wins
+            # over a redundant identical pin.
+            pool4 = _sidecar_recovery_pool(self, directory)
+            pool5 = [(path, entries, tail_seq, tail_hash, -1)
+                     for path, entries, tail_seq, tail_hash in pool4]
+            docs = {path: document for path, document in marked}
+            marked_verified = [(path, self.commit_seq - 1, 0)
+                               for path, _document in marked]
+            prefer = (self.integrity_log_path
+                      if os.path.exists(self.integrity_log_path) else None)
+            state_path, mate, found = _choose_unique_pair(
+                marked_verified, docs, pool5, prefer_sidecar=prefer)
+            if not found:
+                raise OSError(
+                    f"cannot self-heal {self.path}: a verifiable pinned "
+                    f"state has no matching integrity sidecar backup")
+            chosen_state, chosen_sidecar = state_path, mate
+        else:
+            # Sidecar-less legacy pin (pre-integrity-log). It commits no
+            # sidecar, so the choice is unambiguous only when exactly one
+            # verifiable state backup survives.
+            if not legacy:
+                raise OSError(
+                    f"cannot self-heal {self.path}: no verifiable pinned "
+                    f"backup of the last committed state")
+            if len(legacy) > 1:
+                raise OSError(
+                    f"cannot self-heal {self.path}: {len(legacy)} verifiable "
+                    f"pinned backups of the last committed state; refusing to "
+                    f"choose between candidates")
+            chosen_state = legacy[0]
+
+        self._promote_pair(directory, chosen_state, chosen_sidecar)
+
+        # Both formal paths durably name the committed inodes; every pinned
+        # copy, staged snapshot and demoted (quarantined) new snapshot of
+        # either file is now stale garbage. Sweep failures are harmless: a
+        # valid formal pair wins the leftover scan at every later startup.
+        _sweep_leftovers(
+            directory,
+            leftovers + quarantined + all_sidecar_leftovers
+            + _block_marker_paths(directory, self.path))
+        self.degraded = False
+        if self.blocked:
+            # The path was vacated out-of-band and the unique verifiable pair
+            # is now durably authoritative: the undecidable condition is gone,
+            # so drop the durable block marker and resume service.
+            _clear_block_markers(directory, self.path)
+            self.blocked = False
+
+    def _formal_pair_is_consistent(
+            self, formal: Dict[str, Any], sidecar_pins: List[str]) -> bool:
+        """Check the formal state's sidecar agreement for in-process heal.
+
+        A marked formal state is consistent when the formal sidecar parses,
+        its whole chain verifies and its tail binds to the formal generation
+        and canonical hash — or, when the formal sidecar is absent, exactly
+        one verified sidecar pin matches, in which case it is promoted onto
+        the formal sidecar path here. An unmarked (legacy) formal is
+        consistent only with no sidecar on the formal path. Anything else is
+        refused (the caller raises 503 and leaves the files untouched).
+        """
+        directory = os.path.dirname(os.path.abspath(self.path))
+        marked = INTEGRITY_LOG_VERSION_KEY in formal
+        generation = _commit_seq_of(formal)
+        want_hash = _document_state_hash(formal)
+        if not marked:
+            return not os.path.exists(self.integrity_log_path)
+        log_document = _read_integrity_log(self.integrity_log_path)
+        if log_document is not None:
+            try:
+                entries = _verify_integrity_log(log_document)
+            except IntegrityLogError:
+                return False
+            if entries:
+                last = entries[-1]
+                if (last["commit_seq"] == generation
+                        and last["state_hash"] == want_hash):
+                    return True
+            return False
+        # Formal sidecar absent: the unique matching pin, if one exists, is
+        # the committed mate — hard-link it onto the formal sidecar path.
+        verified = _verified_sidecar_pins(sidecar_pins)
+        mates = [path for path, _entries, tail_seq, tail_hash, _mtime
+                 in verified
+                 if tail_seq == generation and tail_hash == want_hash]
+        if len(mates) != 1:
+            return False
         linked = False
         try:
-            os.link(chosen, self.path)
+            os.link(mates[0], self.integrity_log_path)
             linked = True
             _fsync_directory(directory)
         except OSError:
             if linked:
-                # The entry may not be durable. Drop the name we just added —
-                # the inode stays pinned under the backup name — and best
-                # effort flush the removal, then hand the failure back.
-                _remove_quietly(self.path)
+                _remove_quietly(self.integrity_log_path)
                 try:
                     _fsync_directory(directory)
                 except OSError:
                     pass
-            raise
+            return False
+        return True
 
-        # The formal path durably names the committed inode; every pinned
-        # copy, staged snapshot and demoted (quarantined) new snapshot is now
-        # stale garbage. Sweep failures are harmless: a valid formal file
-        # always wins the leftover scan at every later startup.
-        _sweep_leftovers(directory, leftovers + quarantined)
-        self.degraded = False
-        if self.blocked:
-            # The path was vacated out-of-band and the unique verifiable
-            # backup is now durably authoritative: the undecidable condition
-            # is gone, so drop the durable block marker and resume service.
-            _clear_block_markers(directory, self.path)
-            self.blocked = False
+    def _promote_pair(self, directory: str, state_src: str,
+                      sidecar_src: Optional[str]) -> None:
+        """Hard-link the chosen state (and sidecar) pins onto the formal paths.
+
+        Both backups keep pinning their inodes until the new formal directory
+        entries are fsync-durable. On any failure the names added here are
+        removed (the inodes stay pinned) and the :class:`OSError` propagates
+        so the caller answers 503 and the next write retries the heal.
+        """
+        added: List[str] = []
+        try:
+            os.link(state_src, self.path)
+            added.append(self.path)
+            if (sidecar_src is not None
+                    and os.path.abspath(sidecar_src)
+                    != os.path.abspath(self.integrity_log_path)):
+                os.link(sidecar_src, self.integrity_log_path)
+                added.append(self.integrity_log_path)
+            _fsync_directory(directory)
+        except OSError:
+            for added_path in reversed(added):
+                _remove_quietly(added_path)
+            try:
+                _fsync_directory(directory)
+            except OSError:
+                pass
+            raise
 
     def integrity_report(self, store: "DeviceStore") -> Dict[str, Any]:
         """Read-only integrity probe backing ``GET /v1/persistence/integrity``.
@@ -1219,19 +1464,23 @@ def _fsync_directory(directory: str) -> bool:
     return True
 
 
-def _hardlink_backup(directory: str, target: str) -> Optional[str]:
+def _hardlink_backup(directory: str, target: str,
+                     prefix: str = _TMP_PREFIX) -> Optional[str]:
     """Pin the current *target*'s inode via a same-directory hard link.
 
-    Returns the backup path, or ``None`` when *target* does not exist yet
-    (first save: there is no old state to preserve). The link is created in
-    the same directory so it is guaranteed to be on the same file system and
-    the subsequent rollback ``os.replace`` is a pure metadata rename. Raises
-    :class:`OSError` if the link cannot be made; the caller treats that like
-    any pre-replace failure (the target is still untouched).
+    Returns the backup path (``<prefix>*.bak``), or ``None`` when *target*
+    does not exist yet (first save: there is no old file to preserve). The
+    state file uses the ``.state-`` prefix and its sidecar the
+    ``.integrity-`` prefix, so a two-file transaction's two pins are a
+    recognizable *pair*. The link is created in the same directory so it is
+    guaranteed to be on the same file system and the subsequent rollback
+    ``os.replace`` is a pure metadata rename. Raises :class:`OSError` if the
+    link cannot be made; the caller treats that like any pre-replace failure
+    (the target is still untouched).
     """
     if not os.path.exists(target):
         return None
-    fd, backup = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
+    fd, backup = tempfile.mkstemp(dir=directory, prefix=prefix,
                                   suffix=_BAK_SUFFIX)
     os.close(fd)
     try:
@@ -1245,9 +1494,9 @@ def _hardlink_backup(directory: str, target: str) -> Optional[str]:
     return backup
 
 
-def _quarantine_path(directory: str) -> str:
+def _quarantine_path(directory: str, prefix: str = _TMP_PREFIX) -> str:
     """Reserve a unique same-directory name for a demoted new snapshot."""
-    fd, quarantine = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
+    fd, quarantine = tempfile.mkstemp(dir=directory, prefix=prefix,
                                       suffix=_QUARANTINE_SUFFIX)
     os.close(fd)
     # The empty placeholder only reserves the unique name; free it for the
@@ -1256,20 +1505,22 @@ def _quarantine_path(directory: str) -> str:
     return quarantine
 
 
-def _vacate_new_snapshot(directory: str, target: str) -> None:
-    """Take the un-committed new snapshot off the formal path.
+def _vacate_snapshot(directory: str, target: str,
+                     prefix: str = _TMP_PREFIX) -> None:
+    """Take the un-committed new snapshot at *target* off its formal path.
 
     Used when a post-replace failure cannot be rolled back durably: the new
     inode must never become authoritative, so it is renamed aside to a
-    ``.quarantine`` name (which the crash-leftover scan never promotes), and
-    if even that rename is impossible it is deleted. Either way the formal
-    path is missing afterwards; a pinned ``.bak`` of the last committed
-    inode is the recovery candidate the next startup promotes. Best effort
-    only — a failure here is swallowed because the caller still reports the
-    transaction as failed and the old inode stays pinned elsewhere.
+    ``<prefix>*.quarantine`` name (which the crash-leftover scan never
+    promotes), and if even that rename is impossible it is deleted. Either
+    way the formal path is missing afterwards; a pinned ``.bak`` of the last
+    committed inode is the recovery candidate the next startup promotes. Best
+    effort only — a failure here is swallowed because the caller still
+    reports the transaction as failed and the old inode stays pinned
+    elsewhere.
     """
     try:
-        quarantine = _quarantine_path(directory)
+        quarantine = _quarantine_path(directory, prefix)
         try:
             os.replace(target, quarantine)
         except OSError:
@@ -1279,8 +1530,9 @@ def _vacate_new_snapshot(directory: str, target: str) -> None:
         _remove_quietly(target)
 
 
-def _repin_old_inode(directory: str, target: str) -> bool:
-    """Re-pin the restored old inode as a ``.bak`` and vacate *target*.
+def _repin_inode(directory: str, target: str,
+                 prefix: str = _TMP_PREFIX) -> bool:
+    """Re-pin the restored inode at *target* as a ``.bak`` and vacate it.
 
     The rollback rename restored the last committed inode at *target*, but
     flushing that rollback failed, so it cannot be treated as durable. Pin
@@ -1293,7 +1545,7 @@ def _repin_old_inode(directory: str, target: str) -> bool:
     not mark the store degraded while a good file is authoritative.
     """
     try:
-        fd, backup = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
+        fd, backup = tempfile.mkstemp(dir=directory, prefix=prefix,
                                       suffix=_BAK_SUFFIX)
         os.close(fd)
         os.unlink(backup)
@@ -1304,7 +1556,7 @@ def _repin_old_inode(directory: str, target: str) -> bool:
         # target itself to the backup name — one atomic rename both keeps
         # the old inode (under the .bak) and vacates the formal path.
         try:
-            fd, backup = tempfile.mkstemp(dir=directory, prefix=_TMP_PREFIX,
+            fd, backup = tempfile.mkstemp(dir=directory, prefix=prefix,
                                           suffix=_BAK_SUFFIX)
             os.close(fd)
             os.unlink(backup)
@@ -1596,178 +1848,490 @@ def _verified_recovery_candidates(
     return verified, any_with_seq
 
 
-def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
-    """Resolve temporary snapshots a crashed process left beside the file.
+def _document_state_hash(document: Dict[str, Any]) -> Optional[str]:
+    """Canonical ``state_hash`` of a verified version-1 state candidate.
 
-    * A valid formal file wins outright: it is never overwritten, and every
-      leftover is removed.
-    * An existing but corrupt/invalid formal file is left untouched: the
-      normal load then refuses startup, so present state is never silently
-      discarded (and its leftovers are kept for inspection).
-    * With the formal file missing, only candidates that parse as
-      version=1, explicitly carry the
-      ``group_sync_cursors``/``message_sync_cursors``/``key_events``
-      sections (each a list — the footprint of one complete durable
-      transaction), *and* pass full semantic verification are considered.
-      They rank by commit generation first — the highest ``commit_seq``
-      wins, so an older-mtime snapshot from a later generation is never
-      lost to a newer-mtime stale one. When two or more *verifiable*
-      candidates tie at that highest generation the choice is ambiguous and recovery
-      refuses outright: nothing is promoted or removed, the formal path stays
-      missing, and :func:`attach_persistence` raises
-      :class:`StateFileError` (the blocking state) rather than ever
-      breaking the tie by name or mtime. When every candidate
-      predates commit generations (none carries the field), selection stays the
-      legacy newest-mtime rule. The chosen snapshot is atomically
-      ``os.replace``-d into place (plus a parent-directory fsync) and
-      the remaining leftovers are removed. A section-less legacy/partial
-      snapshot is never promoted, so a resume cursor or the audit chain
-      cannot be silently lost.
-    * When no candidate is valid, all leftovers are removed; the normal
-      missing-file path in :func:`attach_persistence` then creates an empty
-      state.
+    Strips the envelope (``version``, ``commit_seq`` and the
+    ``integrity_log_version`` marker) and hashes the business payload exactly
+    as :func:`_gate_integrity_sidecar` does. Returns ``None`` when the
+    payload does not restore (callers only call this on a document that
+    already passed :func:`_document_restores`, so ``None`` then is a
+    defensive guard).
+    """
+    payload = {key: value for key, value in document.items()
+               if key not in ("version", COMMIT_SEQ_KEY,
+                              INTEGRITY_LOG_VERSION_KEY)}
+    try:
+        fresh = DeviceStore()
+        fresh.restore_state(copy.deepcopy(payload))
+        canonical = canonical_integrity_snapshot(fresh.snapshot_state())
+    except (ValueError, TypeError):
+        return None
+    return integrity_state_hash(canonical)
+
+
+def _verified_sidecar_pins(
+        sidecar_paths: List[str]) -> List[Tuple[str, List[Dict[str, Any]],
+                                                int, str, int]]:
+    """Fully verify sidecar backup pins; return ``(path, entries, seq, hash, mtime)``.
+
+    Each surviving pin parses as a version=1 sidecar document whose whole
+    hash chain verifies and which carries at least one entry. The tuple's
+    generation and hash are the *tail* entry's ``commit_seq`` and
+    ``state_hash`` — the values a state candidate of the same committed
+    transaction must match. Unreadable/unverifiable pins are skipped, never
+    raised: recovery ranks and chooses only what it can prove.
+    """
+    verified: List[Tuple[str, List[Dict[str, Any]], int, str, int]] = []
+    for path in sidecar_paths:
+        try:
+            document = _read_integrity_log(path)
+        except IntegrityLogError:
+            continue
+        if document is None:
+            continue
+        try:
+            entries = _verify_integrity_log(document)
+        except IntegrityLogError:
+            continue
+        if not entries:
+            continue
+        try:
+            mtime_ns = os.stat(path).st_mtime_ns
+        except OSError:
+            mtime_ns = -1
+        verified.append((path, entries, entries[-1]["commit_seq"],
+                         entries[-1]["state_hash"], mtime_ns))
+    return verified
+
+
+def _sidecar_recovery_pool(
+        state_store: "JsonStateStore", directory: str
+) -> List[Tuple[str, List[Dict[str, Any]], int, str]]:
+    """All sidecars a missing-formal state candidate may bind to.
+
+    The pool is the fully-verified ``.integrity-*.bak`` pins *plus*, when it
+    exists and its whole chain verifies, the formal ``<state>.integrity``
+    sidecar itself (a crash — or an out-of-band state deletion — can leave
+    the state formal missing while the committed sidecar formal survives).
+    Each entry is ``(path, entries, tail_commit_seq, tail_state_hash)``; a
+    caller tells the formal mate apart with
+    ``os.path.samefile``/abspath equality and does not rename or link over it.
+    """
+    pool: List[Tuple[str, List[Dict[str, Any]], int, str]] = []
+    formal_path = state_store.integrity_log_path
+    if os.path.exists(formal_path):
+        try:
+            document = _read_integrity_log(formal_path)
+            if document is not None:
+                entries = _verify_integrity_log(document)
+                if entries:
+                    pool.append((formal_path, entries,
+                                 entries[-1]["commit_seq"],
+                                 entries[-1]["state_hash"]))
+        except IntegrityLogError:
+            pass
+    for path, entries, tail_seq, tail_hash, _mtime in _verified_sidecar_pins(
+            _sidecar_leftover_paths(directory)):
+        pool.append((path, entries, tail_seq, tail_hash))
+    return pool
+
+
+def _is_formal_sidecar(state_store: "JsonStateStore", path: str) -> bool:
+    return os.path.abspath(path) == os.path.abspath(
+        state_store.integrity_log_path)
+
+
+def _choose_unique_pair(
+        state_verified: List[Tuple[str, int, int]],
+        state_docs: Dict[str, Optional[Dict[str, Any]]],
+        sidecar_pins: List[Tuple[str, List[Dict[str, Any]], int, str, int]],
+        prefer_sidecar: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str], bool]:
+    """Pick the unique highest generation matching state/sidecar *pair*.
+
+    ``state_verified`` are the surviving state candidates
+    ``(path, seq, mtime)`` and ``sidecar_pins`` the fully verified sidecar
+    pins ``(path, entries, tail_seq, tail_state_hash, mtime)``; ``state_docs``
+    maps a state candidate path to its parsed document for hashing.
+    *prefer_sidecar*, when given, names the formal sidecar: a match against
+    the on-formal-path committed sidecar always wins over a redundant
+    ``.bak`` pin carrying the same chain (a valid formal file takes
+    precedence), so the pair is never ambiguous merely because such a pin
+    also survives.
+
+    A pair matches when the sidecar tail generation equals the state
+    candidate's generation and the sidecar tail ``state_hash`` equals the
+    state payload's canonical hash, and the state document carries the
+    ``integrity_log_version=1`` marker (a marked state pairs only with a
+    sidecar). Among all matching pairs the highest generation wins; two or
+    more *distinct* pairs at that highest generation are ambiguous.
+
+    Every *state_verified* entry here is a marked, fully-verifiable state. A
+    marked state that matches no sidecar at all is a verifiable committed
+    candidate whose pair cannot be proven, which is a hard refusal too: the
+    caller must never promote a lower complete pair and delete that orphan
+    (it cannot prove the orphan is an un-committed stage). Raises
+    :class:`OSError` in both the unmatched and the many-pair cases.
+
+    Returns ``(state_path, sidecar_path, found)``:
+      * ``found=True`` with both paths — a unique highest marked pair;
+      * ``found=False, state_path=None`` — no marked pair; the caller falls
+        back to the legacy (sidecar-less) rule over unmarked states.
+    """
+    matches: List[Tuple[int, int, str, str]] = []
+    matched_states: set = set()
+    for state_path, seq, state_mtime in state_verified:
+        document = state_docs.get(state_path)
+        if document is None:
+            continue
+        if INTEGRITY_LOG_VERSION_KEY not in document:
+            # Legacy state: pairs with *no* sidecar, handled by the caller's
+            # sidecar-less fallback, never matched to a sidecar pin.
+            continue
+        state_hash = _document_state_hash(document)
+        if state_hash is None:
+            continue
+        for side_path, _entries, tail_seq, tail_hash, _side_mtime \
+                in sidecar_pins:
+            if tail_seq == seq and tail_hash == state_hash:
+                matches.append((seq, state_mtime, state_path, side_path))
+                matched_states.add(state_path)
+    marked_paths = {path for path, seq, _m in state_verified
+                    if state_docs.get(path) is not None
+                    and INTEGRITY_LOG_VERSION_KEY in state_docs[path]}
+    unmatched = marked_paths - matched_states
+    if unmatched:
+        # A marked verifiable state matched by no available chain cannot be
+        # proven committed or un-committed — UNLESS a formal sidecar is
+        # present and itself binds a matching pair: the on-formal chain is
+        # authoritative ("a valid formal pair wins"), so any state whose hash
+        # does not appear in it is a stale/foreign file (a snapshot from a
+        # different store, or a swept-away stage), safe to discard. With only
+        # backup pins and no formal chain an unmatched state cannot be
+        # disproven, so refuse rather than delete or overwrite it.
+        formal_chain = os.path.abspath(prefer_sidecar) if prefer_sidecar \
+            else None
+        formal_bound = any(os.path.abspath(side) == formal_chain
+                          for _s, _m, _st, side in matches) \
+            if formal_chain else False
+        if not formal_bound:
+            raise OSError(
+                f"a verifiable marked state candidate has no matching "
+                f"integrity sidecar ({len(unmatched)} unpaired); refusing "
+                f"to recover without deleting or overwriting it")
+    if not matches:
+        return None, None, False
+    top_seq = max(item[0] for item in matches)
+    top = [item for item in matches if item[0] == top_seq]
+    if prefer_sidecar is not None:
+        preferred = os.path.abspath(prefer_sidecar)
+        formal_matches = [item for item in top
+                          if os.path.abspath(item[3]) == preferred]
+        if formal_matches:
+            top = formal_matches
+    # Distinct pairs at the highest generation are ambiguous even when their
+    # bytes are semantically equal: the generation/hash pair names the
+    # content but not which pin the crashed transaction committed, so never
+    # break the tie by name or mtime.
+    distinct_state = {item[2] for item in top}
+    distinct_side = {item[3] for item in top}
+    if len(distinct_state) > 1 or len(distinct_side) > 1:
+        raise OSError(
+            f"ambiguous state recovery: {len(top)} verifiable state/sidecar "
+            f"pairs at commit_seq {top_seq}; refusing to choose between "
+            f"candidates by name or mtime")
+    _, _, state_path, side_path = top[0]
+    return state_path, side_path, True
+
+
+def _read_state_docs(
+        verified: List[Tuple[str, int, int]]
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """Map each verified state candidate path to its parsed document."""
+    docs: Dict[str, Optional[Dict[str, Any]]] = {}
+    for path, _seq, _mtime in verified:
+        docs[path] = _read_version1_document(path)
+    return docs
+
+
+def _promote_recovered_pair(state_store: "JsonStateStore", directory: str,
+                            state_path: str,
+                            sidecar_path: Optional[str]) -> None:
+    """Rename the chosen pins onto the two formal paths and flush the dir.
+
+    Restart promotion is an ``os.replace`` (the recovered file keeps its
+    inode, the crash-recovery tests rely on this). Both renames land before
+    the single directory fsync so the two files become the formal pair
+    together.
+    """
+    os.replace(state_path, state_store.path)
+    if sidecar_path is not None and os.path.abspath(sidecar_path) != \
+            os.path.abspath(state_store.integrity_log_path):
+        os.replace(sidecar_path, state_store.integrity_log_path)
+    _fsync_directory(directory)
+
+
+def _resolve_pair_for_missing_formal(
+        state_store: "JsonStateStore",
+        leftovers: List[str]
+) -> Tuple[Optional[str], Optional[str], bool, bool]:
+    """Choose the recovery for a missing formal state file.
+
+    Returns ``(state_path, sidecar_path, recoverable, saw_verifiable)``.
+    ``recoverable=True`` names the unique state file (and, for a marked
+    state, its matching sidecar pin — ``None`` for a sidecar-less legacy
+    recovery) to rename into place. ``recoverable=False`` with
+    ``saw_verifiable=True`` means a verifiable candidate exists but no
+    *unique* pair binds it, which the caller must treat as a hard refusal
+    (nothing deleted or overwritten). ``recoverable=False`` with
+    ``saw_verifiable=False`` means there is no candidate at all, so the
+    caller cleans the leftovers and creates an empty state.
+
+    Pairing rules: a state carrying the ``integrity_log_version`` marker is
+    only ever recovered together with the sidecar pin whose whole chain
+    verifies and whose tail entry matches the state's generation and
+    canonical ``state_hash``; the highest generation wins and a tie of
+    distinct pairs is refused (never broken by name or mtime). A marked
+    candidate with no mate, or ambiguous mates, is a hard refusal. Only when
+    *no* marked candidate exists does the sidecar-less legacy rule apply
+    (generation first, then newest mtime) over marker-less states.
+    """
+    verified, any_with_seq = _verified_recovery_candidates(leftovers)
+    if not verified:
+        return None, None, False, False
+    docs = _read_state_docs(verified)
+    marked = [(path, seq, mtime) for (path, seq, mtime) in verified
+              if docs.get(path) is not None
+              and INTEGRITY_LOG_VERSION_KEY in docs[path]]
+    directory = os.path.dirname(os.path.abspath(state_store.path))
+
+    if marked:
+        # A marked state may bind either to the formal sidecar (which can
+        # survive an out-of-band state deletion) or to a .integrity-*.bak
+        # pin. The formal sidecar wins over a redundant identical pin.
+        pool4 = _sidecar_recovery_pool(state_store, directory)
+        pool5 = [(path, entries, tail_seq, tail_hash, -1)
+                 for path, entries, tail_seq, tail_hash in pool4]
+        prefer = (state_store.integrity_log_path
+                  if os.path.exists(state_store.integrity_log_path)
+                  else None)
+        state_path, sidecar_path, found = _choose_unique_pair(
+            marked, docs, pool5, prefer_sidecar=prefer)
+        # _choose_unique_pair raises on a many-pair tie; found=False means a
+        # verifiable marked state exists but no sidecar binds it: that is a
+        # verifiable candidate without a unique pair — refuse, do not fall
+        # back to a sidecar-less recovery of a marked document.
+        return state_path, sidecar_path, found, True
+
+    # Pure legacy set: no state carries the sidecar marker. Keep the
+    # generation-first rule and the newest-mtime rule only when every
+    # candidate predates commit generations.
+    if any_with_seq:
+        ordered = sorted(verified, key=lambda item: (item[1], item[2],
+                                                     item[0]))
+        top_seq = ordered[-1][1]
+        top = [item for item in verified if item[1] == top_seq]
+        if len(top) >= 2:
+            raise OSError(
+                f"ambiguous state recovery for {state_store.path}: "
+                f"{len(top)} verifiable candidates at commit_seq "
+                f"{top_seq}; refusing to choose between them by name or "
+                f"mtime")
+        return top[0][0], None, True, True
+    ordered = sorted(verified, key=lambda item: (item[2], item[0]))
+    return ordered[-1][0], None, True, True
+
+
+def _recover_blocked_store(state_store: "JsonStateStore", directory: str,
+                           leftovers: List[str], quarantined: List[str],
+                           markers: List[str],
+                           all_sidecar_leftovers: List[str]) -> None:
+    """Restart recovery while a ``.block`` marker survives.
+
+    The crashed process could not vacate a possibly-un-committed pair, so a
+    restart must never serve the residual formal files as authoritative:
+
+    * formal state present: accept it only when it is a valid restorable
+      version-1 document that semantically equals a *verified state backup
+      pin at the same generation* AND whose sidecar pairing is provably
+      consistent (formal sidecar binding to it, or a unique matching
+      ``.integrity-*.bak`` promoted onto the formal sidecar path). A
+      self-consistent but un-committed *newer* pair fails the pin match and
+      stays refused. On acceptance every leftover/marker is swept;
+    * formal state missing: recover only when a unique verifiable pair (or a
+      unique legacy state) promotes, then sweep leftovers/markers;
+    * no unique pair, or zero verifiable candidates: refuse and keep
+      everything in place for an operator (nothing is created empty here).
+    """
+    sidecar_pins = _sidecar_leftover_paths(directory)
+
+    if os.path.exists(state_store.path):
+        formal = _read_version1_document(state_store.path)
+        verified, _any_seq = _verified_recovery_candidates(leftovers)
+        # Prove the formal equals the committed content pinned in a backup at
+        # the SAME generation; the un-committed residual is stamped one
+        # generation higher and can never match.
+        equals_committed_pin = (
+            formal is not None
+            and (COMMIT_SEQ_KEY not in formal
+                 or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
+            and _document_restores(formal)
+            and any(
+                _commit_seq_of(formal) == pin_seq
+                and _documents_payload_equal(
+                    formal, _read_version1_document(pin_path) or {})
+                for pin_path, pin_seq, _mtime in verified))
+        pair_consistent = (
+            equals_committed_pin
+            and state_store._formal_pair_is_consistent(formal, sidecar_pins))
+        if pair_consistent:
+            for path in (leftovers + quarantined + all_sidecar_leftovers
+                         + markers):
+                _remove_quietly(path)
+            _fsync_directory(directory)
+            return
+        raise OSError(
+            f"state store for {state_store.path} is blocked: an un-resolved, "
+            f"un-committed file occupies the formal path")
+
+    state_path, sidecar_path, recoverable, _saw = \
+        _resolve_pair_for_missing_formal(state_store, leftovers)
+    if not recoverable:
+        # Blocked with the path vacated but no unique provable pair: keep
+        # refusing (never create an empty state over a blocked incident).
+        raise OSError(
+            f"state store for {state_store.path} is blocked: the formal path "
+            f"is missing with no unique verifiable pair")
+
+    _promote_recovered_pair(state_store, directory, state_path, sidecar_path)
+    remaining_state = [path for path in leftovers if path != state_path]
+    remaining_side = [path for path in all_sidecar_leftovers
+                      if path != sidecar_path]
+    for path in (remaining_state + quarantined + remaining_side + markers):
+        _remove_quietly(path)
+    if sidecar_path is None:
+        _remove_quietly(state_store.integrity_log_path)
+    _fsync_directory(directory)
+
+
+def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
+    """Resolve the state/sidecar leftovers a crashed process left behind.
+
+    The two files are one transaction and are recovered as a *pair*.
+
+    * A valid formal pair wins outright: it is never overwritten and every
+      leftover (``.state-*`` and ``.integrity-*`` temp/backup/quarantine and
+      any block marker) is removed.
+    * An existing but corrupt/invalid formal state file is left untouched and
+      makes startup refuse; nothing is swept.
+    * With the formal state file missing, a state candidate carrying the
+      ``integrity_log_version`` marker is recovered only with the
+      ``.integrity-*.bak`` pin whose whole hash chain verifies and whose tail
+      matches the state's generation and canonical ``state_hash``; the
+      highest-generation unique such pair is renamed into place (state and
+      sidecar together) and the other leftovers are removed. A verifiable
+      marked candidate with no unique mate — or two distinct pairs tied at
+      the top generation — is a hard refusal: nothing is promoted, deleted or
+      overwritten and :func:`attach_persistence` raises
+      :class:`StateFileError` (the CLI exits 1 with one stderr JSON line,
+      ``field=data_file``). When every state candidate is a sidecar-less
+      legacy file the older generation/newest-mtime rule still applies. With
+      no verifiable candidate at all, every leftover (state and sidecar) is
+      removed and an empty state is created.
+    * A surviving ``.block`` marker applies the same pairing proof to the
+      residual formal file or the missing path and keeps refusing until a
+      unique pair can be promoted.
     """
     directory = os.path.dirname(os.path.abspath(state_store.path))
     leftovers = _leftover_tmp_paths(directory, state_store.path)
     quarantined = _quarantined_paths(directory, state_store.path)
     markers = _block_marker_paths(directory, state_store.path)
-    if not leftovers and not quarantined and not markers:
+    sidecar_pins = _sidecar_leftover_paths(directory)
+    sidecar_quarantined = _sidecar_quarantine_paths(directory)
+    sidecar_tmps = _integrity_tmp_paths(directory)
+    all_sidecar_leftovers = (sidecar_pins + sidecar_quarantined
+                             + sidecar_tmps)
+    present = bool(leftovers or quarantined or markers
+                   or all_sidecar_leftovers)
+    if not present:
         return
 
     if markers:
-        # A previous process ended in the blocking state: it could not vacate a
-        # possibly-un-committed file from the formal path. A restart must
-        # never serve that residual file as authoritative:
-        #  * formal present and provably the committed state (it semantically
-        #    equals the unique verifiable generation-bearing backup) -> a valid
-        #    formal takes precedence: keep it, sweep leftovers/markers;
-        #  * formal present in any other state (the un-committed
-        #    residual, or no unique matching backup) -> refuse startup,
-        #    touch nothing;
-        #  * formal missing -> recover only when exactly ONE verifiable,
-        #    generation-bearing candidate survives (never mtime/name picked);
-        #    promote it, sweep the transaction leftovers and clear the marker;
-        #  * zero or several verifiable candidates -> refuse and keep
-        #    everything in place for an operator.
-        verified, any_with_seq = _verified_recovery_candidates(leftovers)
-        top: List[Tuple[str, int, int]] = []
-        if verified and any_with_seq:
-            top_seq = max(item[1] for item in verified)
-            top = [item for item in verified
-                     if item[1] == top_seq]
-        unique_pin = top[0][0] if len(top) == 1 else None
-
-        if os.path.exists(state_store.path):
-            formal = _read_version1_document(state_store.path)
-            # A valid formal always takes precedence. There is no in-memory
-            # baseline at restart, so "committed" is proven relative to
-            # the verified backups: the formal is the committed state iff it
-            # restores, carries a valid generation, and semantically
-            # equals at least one verified backup at that SAME generation.
-            # The un-committed residual is stamped one generation higher than the
-            # pinned commit, so it can never match and stays refused —
-            # even when two or more backups exist.
-            formal_is_committed = (
-                formal is not None
-                and (COMMIT_SEQ_KEY not in formal
-                     or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
-                and _document_restores(formal)
-                and any(
-                    _commit_seq_of(formal) == _commit_seq_of(pin_doc)
-                    and _documents_payload_equal(formal, pin_doc)
-                    for pin_doc in (
-                        _read_version1_document(path)
-                        for path, _, _ in verified)
-                    if pin_doc is not None))
-            if formal_is_committed:
-                for path in leftovers + quarantined + markers:
-                    _remove_quietly(path)
-                _fsync_directory(directory)
-                return
-            raise OSError(
-                f"state store for {state_store.path} is blocked: an "
-                f"un-resolved, un-committed file occupies the formal path")
-        if unique_pin is None:
-            raise OSError(
-                f"state store for {state_store.path} is blocked: the formal "
-                f"path is missing with no unique verifiable backup")
-        recovered = unique_pin
-        os.replace(recovered, state_store.path)
-        _fsync_directory(directory)
-        leftovers = [path for path in leftovers if path != recovered]
-        for path in leftovers + quarantined + markers:
-            _remove_quietly(path)
-        _fsync_directory(directory)
+        # A previous process ended in the *blocking* state: it could not
+        # vacate a possibly-un-committed pair from the formal paths. A restart
+        # must never serve that residual as authoritative; resolution is
+        # delegated to the dedicated, stricter pair-aware routine below (which
+        # either proves the formal committed, promotes a unique pair after the
+        # path was vacated, or refuses without touching anything).
+        _recover_blocked_store(
+            state_store, directory, leftovers, quarantined, markers,
+            all_sidecar_leftovers)
         return
 
     if os.path.exists(state_store.path):
-        # The formal file exists. A valid one stays authoritative and the
-        # leftovers (including demoted snapshots parked in quarantine) are
-        # stale; an invalid one (including a present but malformed
-        # commit_seq) makes the normal load refuse startup, so neither the
-        # file nor the leftovers are touched here.
+        # The formal state exists. Accept it (and sweep everything) only when
+        # it is a valid restorable version-1 document whose sidecar pairing
+        # is also provably consistent; a marked state binds to its formal
+        # sidecar or a unique matching pin, a legacy state has no sidecar. An
+        # invalid/corrupt formal — or an inconsistent pair — makes the later
+        # strict load/gate refuse startup, so neither file nor any leftover
+        # is touched here.
         formal = _read_version1_document(state_store.path)
         formal_valid = (
             formal is not None
             and (COMMIT_SEQ_KEY not in formal
                  or _valid_commit_seq(formal[COMMIT_SEQ_KEY]))
-            and _document_restores(formal))
+            and _document_restores(formal)
+            and state_store._formal_pair_is_consistent(formal, sidecar_pins))
         if formal_valid:
-            for path in leftovers + quarantined:
+            for path in (leftovers + quarantined + all_sidecar_leftovers
+                         + markers):
                 _remove_quietly(path)
+            _fsync_directory(directory)
         return
 
-    # Formal file missing. Verify every leftover first (unverifiable ones are
-    # skipped), then rank the survivors by commit generation, not mtime: the
-    # highest commit_seq wins even when a stale older-generation snapshot has a newer
-    # mtime. A tie of two or more verifiable candidates at that highest
-    # generation is ambiguous and aborts recovery (nothing moved, startup refuses). A
-    # leftover without the field is a pre-generation snapshot at seq 0; only
-    # when every candidate is such a snapshot does the ranking collapse to the
-    # legacy pure-mtime rule (ties broken by name, deterministically).
-    verified, any_with_seq = _verified_recovery_candidates(leftovers)
+    # The formal state is missing. Choose either a unique pair or (legacy
+    # only) a unique sidecar-less state; this raises on a many-candidate tie.
+    state_path, sidecar_path, recoverable, saw_verifiable = \
+        _resolve_pair_for_missing_formal(state_store, leftovers)
 
-    recovered = None
-    if verified:
-        if any_with_seq:
-            # Generation-first ordering; missing field ranks at 0, so a
-            # present-generation snapshot always beats a field-less legacy one
-            # regardless of mtime.
-            verified.sort(key=lambda item: (item[1], item[2], item[0]))
-            top_seq = verified[-1][1]
-            top = [item for item in verified if item[1] == top_seq]
-            # Two or more *verifiable* candidates at the same top generation are
-            # ambiguous: the generation does not name which one the crashed transaction
-            # committed, and neither mtime nor file name may break the tie (both
-            # are forgeable and neither encodes commit identity). Refuse to promote or
-            # delete anything: keep the formal path missing and every leftover in
-            # place so attach_persistence refuses to start (the blocking state the
-            # spec demands) until an operator resolves the duplicates. Field-less
-            # legacy files never reach here: any_with_seq was False for them.
-            if len(top) >= 2:
-                raise OSError(
-                    f"ambiguous state recovery for {state_store.path}: "
-                    f"{len(top)} verifiable candidates at commit_seq "
-                    f"{top_seq}; refusing to choose between them by name or "
-                    f"mtime")
-            recovered = top[0][0]
-        else:
-            # Every candidate predates commit generations: keep the legacy
-            # newest-mtime rule.
-            verified.sort(key=lambda item: (item[2], item[0]))
-            recovered = verified[-1][0]
-
-    if recovered is not None:
-        os.replace(recovered, state_store.path)
+    if not recoverable:
+        if saw_verifiable:
+            # A verifiable candidate exists but no unique pair binds it (a
+            # marked state without a matching sidecar mate). Refuse and leave
+            # every file — formal paths, pins, staged temps, marker — exactly
+            # as found; the CLI reports one stderr JSON line and exits 1.
+            raise OSError(
+                f"state recovery for {state_store.path}: a verifiable state "
+                f"candidate has no unique integrity-sidecar pair; refusing "
+                f"to start without deleting or overwriting anything")
+        # No verifiable candidate: all leftovers are garbage. Sweep state and
+        # sidecar leftovers (and any marker); attach then creates an empty
+        # state. The orphaned formal sidecar, if one exists, is removed by
+        # attach's missing-file branch too.
+        for path in (leftovers + quarantined + all_sidecar_leftovers
+                     + markers):
+            _remove_quietly(path)
+        _remove_quietly(state_store.integrity_log_path)
         _fsync_directory(directory)
-        leftovers = [path for path in leftovers if path != recovered]
-    for path in leftovers:
+        return
+
+    # Promote the unique pair (or legacy sidecar-less state) together.
+    _promote_recovered_pair(state_store, directory, state_path, sidecar_path)
+
+    # Everything left is stale garbage from this or older crashed
+    # transactions — staged temps, redundant pins, demoted quarantines, the
+    # block marker. A recovered sidecar-less legacy state also sweeps any
+    # orphaned sidecar leftovers so the unmarked document starts clean.
+    remaining_state = [path for path in leftovers if path != state_path]
+    remaining_side = [path for path in all_sidecar_leftovers
+                      if path != sidecar_path]
+    for path in (remaining_state + quarantined + remaining_side + markers):
         _remove_quietly(path)
-    # A demoted snapshot is never a recovery candidate (its transaction was
-    # reported failed and rolled back); once the formal path has been
-    # resolved above, any quarantine file is pure garbage.
-    for path in quarantined:
-        _remove_quietly(path)
+    if sidecar_path is None:
+        _remove_quietly(state_store.integrity_log_path)
+    _fsync_directory(directory)
 
 
 def attach_persistence(service: "DeviceService", path: str) -> JsonStateStore:
