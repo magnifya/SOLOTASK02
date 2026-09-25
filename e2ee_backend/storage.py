@@ -158,6 +158,10 @@ INBOX_LEASE_UNAVAILABLE = "lease_unavailable"
 #: with a different outcome (an exact replay answers 200 instead). Ids are
 #: scoped to one lease and may recur on other leases.
 INBOX_LEASE_COMPLETION_CONFLICT = "completion_id_conflict"
+#: A batch acknowledgement named a lease whose completion is missing or
+#: carries an outcome other than ``delivered``; only a lease completed as
+#: delivered may be acknowledged.
+INBOX_LEASE_NOT_DELIVERED = "lease_not_delivered"
 
 #: Lifetime of one inbox redelivery lease, in seconds. A message leased by a
 #: claim is withheld from later claims until this deadline passes, after
@@ -2632,6 +2636,82 @@ class DeviceStore:
                      "completion_id": completion_id,
                      "outcome": outcome,
                      "completed_at": completed_at}, 201)
+
+    def inbox_lease_ack(
+            self, device_id: str, lease_id: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Acknowledge every message of one delivered 1:1-inbox lease.
+
+        ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/ack``. Under
+        the one store lock (shared with claims, releases, renewals,
+        completions, acks, retries and revocation), the lease is resolved
+        first: a never-committed *lease_id* raises ``lease_not_found``
+        (404/lease_id) and one owned by another device raises
+        ``lease_id_conflict`` (409/lease_id), regardless of the path
+        device's state. Only a lease whose completion carries the outcome
+        ``delivered`` may be acknowledged; any other state (no completion,
+        or a ``failed`` outcome) raises ``lease_not_delivered``
+        (409/lease_id).
+
+        A lease whose messages are all already acked is an exact replay:
+        the response is returned with status 200 and nothing is written —
+        even if the device has since been revoked. Only a first
+        acknowledgement resolves the device (unknown ->
+        ``device_unknown``, revoked -> ``device_inactive``, both
+        409/device_id). On success (201) every delivery record the lease
+        was taken on is marked ``acked`` with ``ack_sequence`` set to the
+        message's own sequence (records already acked keep their values);
+        ``attempts`` and the attempt-id set are left untouched. The whole
+        acknowledgement commits as one persistence notification
+        (commit_seq + 1); a durable write failure rolls every record back.
+        Returns ``(body, status_code)`` with keys ``device_id``,
+        ``lease_id``, ``acked`` (always ``True``) and ``message_count``
+        (the number of messages the lease claimed) in that order.
+        """
+        with self._lock:
+            existing = self._find_inbox_lease_locked(lease_id)
+            if existing is None:
+                raise InboxLeaseError(INBOX_LEASE_NOT_FOUND)
+            owner, _limit, _deadline, _released, keys = existing
+            # A cross-device acknowledgement is a conflict regardless of
+            # the path device's current state, mirroring the other lease
+            # routes.
+            if owner != device_id:
+                raise InboxLeaseError(INBOX_LEASE_CONFLICT)
+            # The lease copies on every delivery record are identical by
+            # restore validation, so the first is authoritative for the
+            # completion.
+            first_lease = next(lease for lease in self._delivery[keys[0]].leases
+                               if lease.lease_id == lease_id)
+            if first_lease.completion is None \
+                    or first_lease.completion.outcome != "delivered":
+                raise InboxLeaseError(INBOX_LEASE_NOT_DELIVERED)
+            states = [self._delivery[key] for key in keys]
+            body = {"device_id": device_id, "lease_id": lease_id,
+                    "acked": True, "message_count": len(keys)}
+            if all(state.acked for state in states):
+                # Exact replay: every message is already acked, so the
+                # response is returned byte-identically with 200 and
+                # nothing is written — even if the device has since been
+                # revoked.
+                return body, 200
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            for (session_id, message_id), state in zip(keys, states):
+                if state.acked:
+                    continue
+                state.acked = True
+                state.ack_sequence = next(
+                    m.sequence for m in self._messages[session_id]
+                    if m.message_id == message_id)
+            # One persistence notification for the whole acknowledgement:
+            # every per-message delivery record commits (or rolls back)
+            # together and the generation advances at most once.
+            self._notify_change()
+            return body, 201
 
     def inbox_lease_get(
             self, device_id: str, lease_id: str
