@@ -73,6 +73,7 @@ from .storage import (
     INBOX_LEASE_CONFLICT,
     INBOX_LEASE_DEVICE_INACTIVE,
     INBOX_LEASE_DEVICE_UNKNOWN,
+    INBOX_LEASE_NOT_DELIVERED,
     INBOX_LEASE_NOT_FOUND,
     INBOX_LEASE_UNAVAILABLE,
     PREKEY_CONFLICT,
@@ -1632,6 +1633,50 @@ class DeviceService:
                 raise ServiceError(
                     "lease is released or expired and cannot be completed",
                     "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
+    def inbox_lease_ack(self, device_id: str,
+                        lease_id: str) -> Tuple[Dict[str, Any], int]:
+        """Bulk-acknowledge every message of one delivered 1:1-inbox lease.
+
+        ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/ack`` (no
+        request body; the HTTP layer rejects a non-empty one with
+        400/field ``request_body``). The lease is resolved in the store
+        under the lock, ahead of the path device's state: a
+        never-committed ``lease_id`` is 404/field ``lease_id`` and a lease
+        owned by another device is 409/field ``lease_id``.
+
+        A lease whose messages are already all acked answers 200 and
+        writes nothing — even if the device has since been revoked; that
+        replay takes precedence. Otherwise only a lease completed with
+        ``completion.outcome == "delivered"`` may be acked: an active,
+        expired, released or ``failed`` lease is 409/field ``lease_id``.
+        A deliverable lease on an unknown or revoked device is
+        409/field ``device_id``. A first ack returns 201, sets every
+        leased message's delivery record acked with ``ack_sequence`` the
+        message sequence (attempts and attempt ids unchanged), and
+        persists one generation. The body keys are ``device_id``,
+        ``lease_id``, ``acked`` (always ``true``) and ``message_count``
+        (the number of messages the lease claimed) in that order.
+        """
+        try:
+            return self.store.inbox_lease_ack(device_id, lease_id)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_NOT_DELIVERED:
+                raise ServiceError(
+                    "lease can only be acknowledged after a 'delivered' "
+                    "completion", "lease_id", status_code=409)
             if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
                 raise ServiceError("device_id is not a registered device",
                                    "device_id", status_code=409)
