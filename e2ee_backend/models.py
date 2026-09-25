@@ -238,6 +238,29 @@ class MessageDelivery:
     attempt_ids: Set[str] = field(default_factory=set)
     acked: bool = False
     ack_sequence: int = 0
+    #: Active (and expired-but-unacked) inbox claim leases held on this
+    #: message, in claim order. Each :class:`InboxLease` pins the message for
+    #: one recipient device for 30 seconds; an expired lease no longer blocks
+    #: later claims. Leases survive restarts so an idempotent replay returns
+    #: the original response after a crash.
+    leases: List["InboxLease"] = field(default_factory=list)
+
+
+@dataclass
+class InboxLease:
+    """One 30-second inbox-claim lease held on an unacked 1:1 message.
+
+    The lease is owned by exactly one recipient device and one client-chosen
+    ``lease_id``; it remembers the claim's ``limit`` and the UTC deadline
+    (``leased_until``, six-digit microseconds, ``+00:00``) so a replay of the
+    same claim returns byte-identical values and a cross-device or changed
+    ``limit`` reuse conflicts. Only identifiers, the small integer limit and
+    the deadline string are retained.
+    """
+
+    lease_id: str
+    limit: int
+    leased_until: str
 
 
 @dataclass

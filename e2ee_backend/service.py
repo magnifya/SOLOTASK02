@@ -69,6 +69,7 @@ from .storage import (
     INBOX_RETRY_MESSAGE_UNKNOWN,
     INBOX_RETRY_NOT_RECIPIENT,
     INBOX_RETRY_SESSION_UNKNOWN,
+    INBOX_LEASE_ID_CONFLICT,
     PREKEY_CONFLICT,
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
@@ -97,6 +98,7 @@ from .storage import (
     GroupError,
     GroupSessionRotationError,
     GroupSyncError,
+    InboxLeaseError,
     MessageCreateError,
     MessageListError,
     InboxRetryBatchError,
@@ -1406,6 +1408,57 @@ class DeviceService:
                 f"{item_field}.message_id", status_code=409)
         body = {"device_id": device_id, "results": results}
         return body, 201 if any_new else 200
+
+    def inbox_claim(self, device_id: str,
+                    payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one 1:1 inbox lease claim.
+
+        ``POST /v1/devices/{device_id}/inbox/claim``. The body must be an
+        object carrying a non-empty string ``lease_id`` and a non-boolean
+        integer ``limit`` in 1..100. Shape errors are reported, in order, as
+        400/field ``request_body`` (bad/non-object body), ``lease_id``
+        (missing/empty/non-string) or ``limit`` (missing, non-integer,
+        boolean or out of range). An unknown or revoked path device is
+        409/field=device_id.
+
+        On a fresh claim the store leases up to ``limit`` unacked messages
+        (in inbox order) that carry no active (30-second) lease and answers
+        201 with key order ``device_id``, ``lease_id``, ``leased_until``
+        (UTC ISO-8601 with six microsecond digits and ``+00:00``),
+        ``messages`` (the seven-field envelopes). An empty selection answers
+        200 with ``leased_until=None`` and writes nothing. A replay of an
+        occupied ``lease_id`` for the same device and ``limit`` answers 200
+        with the byte-identical first response; the same id for another
+        device or a changed ``limit`` is 409/field=lease_id.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "lease_id" not in payload:
+            raise ServiceError("missing required field: lease_id",
+                               "lease_id")
+        if not is_nonempty_string(payload["lease_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: lease_id", "lease_id")
+        if "limit" not in payload:
+            raise ServiceError("missing required field: limit", "limit")
+        limit = payload["limit"]
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            body, is_new = self.store.inbox_claim(
+                device_id, payload["lease_id"], limit)
+        except MessageSyncError as error:
+            raise self._message_sync_error(error, device_id)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_ID_CONFLICT:
+                raise ServiceError(
+                    "lease_id is already used by another device or with a "
+                    "different limit", "lease_id", status_code=409)
+            raise
+        return body, 201 if is_new else 200
 
     # -- messages ----------------------------------------------------------
 
