@@ -173,9 +173,16 @@ class MissingFormalRecoveryTest(unittest.TestCase):
     def test_newest_mtime_valid_snapshot_is_chosen(self) -> None:
         _service_b, path_b, sid_b, bytes_b = build_fixture(
             tempfile.mkdtemp(), cursor=0)
+        with open(path_b + ".integrity", "rb") as handle:
+            sidecar_b = handle.read()
         os.unlink(self.path)
-        # Older valid snapshot (no cursor) and newer valid snapshot (cursor 2).
+        # Older valid pair (no cursor, lower generation) and newer valid
+        # pair (cursor 2, higher generation): the higher generation wins
+        # regardless of mtime, and both pairs are complete so there is no
+        # unpaired modern candidate.
         write_tmp(self.directory, ".state-old.tmp", bytes_b, mtime_ns=1000)
+        write_tmp(self.directory, ".integrity-old.tmp", sidecar_b,
+                  mtime_ns=1000)
         write_tmp(self.directory, ".state-new.tmp", self.formal_bytes,
                   mtime_ns=2000)
         service = DeviceService()

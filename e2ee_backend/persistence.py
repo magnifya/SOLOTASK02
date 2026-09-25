@@ -84,8 +84,13 @@ sections, has a valid sidecar chain whose tail generation and
 ``state_hash`` bind the state document (or, for a legacy document without
 the integrity marker, has no sidecar at all) is considered; the pair at the
 highest generation is recovered atomically (modification time breaks ties
-only between genuinely pre-generation files). Verifiable candidates
-without a unique pair make startup raise :class:`StateFileError` (exit 1,
+only between genuinely pre-generation files). Every verifiable
+``integrity_log_version=1`` state candidate must bind exactly one sidecar:
+an orphaned modern snapshot, one state bound by several sidecars, or one
+sidecar binding several states all make startup raise
+:class:`StateFileError` — a lower-generation complete pair is never a
+downgrade target. Verifiable candidates without a unique pair make startup
+raise :class:`StateFileError` (exit 1,
 one stderr JSON line, field=data_file) with nothing deleted or overwritten;
 only when no candidate is verifiable are the leftovers removed and an empty
 state created. An existing-but-corrupt formal file still makes startup
@@ -1844,6 +1849,53 @@ def _startup_state_candidates(
     return verified
 
 
+def _enforce_unique_modern_pairing(
+        state_cands: List[Tuple[str, Dict[str, Any], bool]],
+        sidecar_cands: List[Tuple[str, List[Dict[str, Any]], bool]]
+) -> None:
+    """Refuse startup unless every verifiable modern state pairs uniquely.
+
+    A verifiable state candidate stamped ``integrity_log_version=1`` is only
+    recoverable as one half of a matched pair: exactly one verified sidecar
+    whose complete hash chain ends in an entry carrying the state's
+    generation and canonical ``state_hash``. Zero binding sidecars (an
+    orphaned modern snapshot) or two or more (one state, several sidecars)
+    makes the set ambiguous: startup refuses with :class:`OSError` rather
+    than downgrading to some lower-generation complete pair or sweeping the
+    unpaired candidate as garbage. Two or more distinct states whose tails
+    are bound by the same sidecar are ambiguous for the same reason. Raises
+    before anything is promoted, renamed or deleted, so every candidate
+    keeps its name, bytes and inode.
+    """
+    bound_sidecar: Dict[str, str] = {}
+    for state_path, document, _is_formal in state_cands:
+        marker = document.get(INTEGRITY_LOG_VERSION_KEY)
+        if not (isinstance(marker, int) and not isinstance(marker, bool)
+                and marker == INTEGRITY_LOG_VERSION):
+            # Legacy (marker-less) and bad-marker candidates pair by the
+            # legacy rules in _pair_state_sidecar_candidates.
+            continue
+        state_hash = _state_document_state_hash(document)
+        if state_hash is None:
+            continue
+        seq = _commit_seq_of(document)
+        binding = [sidecar_path
+                   for sidecar_path, entries, _formal in sidecar_cands
+                   if _sidecar_tail_binds(entries, seq, state_hash)]
+        if len(binding) != 1:
+            raise OSError(
+                f"ambiguous state recovery: verifiable state candidate "
+                f"{state_path} (commit_seq {seq}) is bound by "
+                f"{len(binding)} integrity sidecars instead of exactly "
+                f"one; refusing to choose, downgrade or discard it")
+        other = bound_sidecar.setdefault(binding[0], state_path)
+        if other != state_path:
+            raise OSError(
+                f"ambiguous state recovery: integrity sidecar "
+                f"{binding[0]} binds both {other} and {state_path}; "
+                f"refusing to choose between them")
+
+
 def _gather_startup_pairs(
         state_store: "JsonStateStore",
         include_formal_state: bool,
@@ -1856,7 +1908,11 @@ def _gather_startup_pairs(
     the formal sidecar contribute verified chains. A marker-less legacy
     state pairs only when no sidecar file exists at all; a stamped state
     pairs with every sidecar whose verified tail binds its generation and
-    state hash.
+    state hash. Before any pair is built, every verifiable
+    ``integrity_log_version=1`` state candidate must bind exactly one
+    sidecar (and no sidecar may bind two states); otherwise
+    :func:`_enforce_unique_modern_pairing` raises :class:`OSError` and
+    startup refuses with nothing promoted, deleted or overwritten.
     """
     directory = os.path.dirname(os.path.abspath(state_store.path))
     state_leftovers = _leftover_tmp_paths(directory, state_store.path)
@@ -1883,6 +1939,12 @@ def _gather_startup_pairs(
         if entries is not None:
             sidecar_cands.append(
                 (state_store.integrity_log_path, entries, True))
+    # A verifiable modern (integrity_log_version=1) state candidate without
+    # exactly one binding sidecar — or two states bound by one sidecar —
+    # makes the whole set ambiguous: refuse before pairing, promoting or
+    # sweeping anything (a lower-generation complete pair is never a
+    # downgrade target).
+    _enforce_unique_modern_pairing(state_cands, sidecar_cands)
     # A legacy (marker-less) state candidate is pairable while no formal
     # sidecar occupies the sidecar path; sidecar leftovers are crash garbage
     # swept after recovery, not a disqualifier for legacy state.
@@ -1960,16 +2022,23 @@ def recover_crash_leftovers(state_store: "JsonStateStore") -> None:
       missing, the unique verifiable generation-bearing pair is promoted
       and the marker swept; zero or several verifiable pairs refuse and
       leave everything in place.
-    * With no marker and the formal state missing, pairs rank by generation
+    * With no marker and the formal state missing, every verifiable
+      ``integrity_log_version=1`` state candidate must bind exactly one
+      verified sidecar (and no sidecar may bind two states): an orphaned
+      modern snapshot, a state with several binding sidecars or a sidecar
+      shared by several states all make startup raise
+      :class:`StateFileError` with nothing promoted, deleted or
+      overwritten — a lower-generation complete pair is never recovered as
+      a downgrade. Otherwise pairs rank by generation
       first; two or more verifiable pairs tied at the highest generation are
       ambiguous and make startup raise :class:`StateFileError` (nothing
       promoted or deleted) rather than ever breaking the tie by name or
       mtime; only fully pre-generation pairs keep the legacy newest-mtime
       rule. After promotion every remaining leftover is removed.
-    * When no pair is verifiable, all leftovers (state and sidecar, staged
-      ``.tmp`` and pinned ``.bak``), quarantine files and any dangling
-      formal sidecar are removed; :func:`attach_persistence` then creates an
-      empty state.
+    * When no verifiable candidate exists at all, all leftovers (state and
+      sidecar, staged ``.tmp`` and pinned ``.bak``), quarantine files and
+      any dangling formal sidecar are removed; :func:`attach_persistence`
+      then creates an empty state.
     """
     directory = os.path.dirname(os.path.abspath(state_store.path))
     leftovers = _leftover_tmp_paths(directory, state_store.path)
