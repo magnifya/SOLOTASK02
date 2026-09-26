@@ -114,6 +114,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_inbox_job()
         elif path == _INBOX_JOBS_PATH + "/recover-batch":
             self._handle_inbox_job_recover_batch()
+        elif path == _INBOX_JOBS_PATH + "/dispatch-batch":
+            self._handle_inbox_job_dispatch_batch()
         elif path == _INBOX_JOBS_PATH + "/cancel-batch":
             self._handle_inbox_job_cancel_batch()
         elif path == _GROUPS_PATH:
@@ -1219,6 +1221,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.inbox_job(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_inbox_job_dispatch_batch(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.inbox_job_dispatch_batch(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

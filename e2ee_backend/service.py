@@ -85,6 +85,7 @@ from .storage import (
     REDELIVERY_JOB_CANCELLATION_CONFLICT,
     REDELIVERY_JOB_CANCEL_PARTIAL_REPLAY,
     REDELIVERY_JOB_CANCEL_STATE,
+    REDELIVERY_JOB_DISPATCH_PARTIAL_REPLAY,
     REDELIVERY_JOB_RECOVERY_CONFLICT,
     REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE,
     REDELIVERY_JOB_RECOVERY_PARTIAL_REPLAY,
@@ -126,6 +127,7 @@ from .storage import (
     PreKeyBatchClaimError,
     RedeliveryJobError,
     RedeliveryJobCancelBatchError,
+    RedeliveryJobDispatchBatchError,
     RedeliveryJobRecoverBatchError,
     SessionCreateError,
 )
@@ -2032,6 +2034,124 @@ class DeviceService:
                                    "device_id", status_code=409)
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
+
+    def inbox_job_dispatch_batch(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and atomically apply a batch of redelivery-job dispatches.
+
+        ``POST /v1/inbox-jobs/dispatch-batch``. The body must be a JSON
+        object carrying exactly a non-empty string ``device_id`` and a
+        non-empty ``items`` array (any other top-level key is
+        400/that field); each item is an object carrying exactly a
+        non-empty string ``job_id`` and no ``job_id`` may repeat across
+        items. Shape errors are reported, in order, as 400/field
+        ``request_body`` (bad/non-object body), ``device_id``
+        (missing/empty/non-string), ``items`` (missing/not-a-non-empty
+        array), ``items[i]`` (non-object element, an unexpected key, or a
+        repeated ``job_id``) or ``items[i].job_id`` for the offending field.
+
+        The device is then resolved (unknown/revoked -> 409/field
+        ``device_id``) and every item is prechecked in array order with the
+        single-job ``op=dispatch`` rules, the first error aborting the whole
+        batch with nothing written and its ``field`` prefixed to
+        ``items[i].``: an unknown job is 404/``items[i].job_id`` and a job
+        of another device or one whose id is already occupied as an inbox
+        lease id is 409/``items[i].job_id``.
+
+        An item whose job is no longer ``pending`` replays its single-job
+        dispatch; when every item is such a replay the batch answers 200
+        with the current views and writes nothing, and a mix of replays and
+        first-time (pending) items conflicts 409 with the first replayed
+        item's ``items[i].job_id``. A first-time batch dispatches every
+        pending job in input order (each with the usual 100-message limit
+        and a 30-second lease named by its own ``job_id``; earlier items'
+        fresh leases immediately withhold their messages from later items;
+        a non-empty pick moves the job to ``running``, an empty pick to
+        ``succeeded`` with ``lease_id`` null) and commits once (201). The
+        body keys are ``device_id`` then ``results``; results keep input
+        order and each item is ``job_id``, ``state``, ``lease_id`` in that
+        order.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id",
+                               "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        device_id = payload["device_id"]
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+        # The body carries exactly device_id and items; any other
+        # top-level key is 400 with that field (the first extra key, in
+        # payload order).
+        extras = [key for key in payload if key not in ("device_id", "items")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+
+        job_ids: List[str] = []
+        seen_job_ids: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            # Each item carries exactly job_id; any other key is 400 at the
+            # item level (items[i]).
+            if any(key != "job_id" for key in element):
+                raise ServiceError(
+                    f"array element must carry only job_id: {item_field}",
+                    item_field)
+            job_field = f"{item_field}.job_id"
+            if "job_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {job_field}", job_field)
+            if not is_nonempty_string(element["job_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {job_field}",
+                    job_field)
+            if element["job_id"] in seen_job_ids:
+                raise ServiceError(
+                    "duplicate job_id in items: "
+                    f"{element['job_id']}", item_field)
+            seen_job_ids.add(element["job_id"])
+            job_ids.append(element["job_id"])
+
+        try:
+            results, status_code = self.store.redelivery_job_dispatch_batch(
+                device_id, job_ids)
+        except RedeliveryJobError as error:
+            # Batch-level device failure (unknown/revoked): 409/device_id.
+            if error.reason == REDELIVERY_JOB_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+        except RedeliveryJobDispatchBatchError as error:
+            job_id = job_ids[error.index]
+            item_field = f"items[{error.index}]"
+            if error.reason == REDELIVERY_JOB_NOT_FOUND:
+                raise ServiceError(f"job not found: {job_id}",
+                                   f"{item_field}.job_id", status_code=404)
+            if error.reason in (REDELIVERY_JOB_CONFLICT,
+                                REDELIVERY_JOB_LEASE_OCCUPIED):
+                raise ServiceError(
+                    "job_id is already used by another device or its lease "
+                    "is occupied", f"{item_field}.job_id", status_code=409)
+            raise ServiceError(
+                "the item replays an already applied dispatch and cannot be "
+                "mixed with first-time items",
+                f"{item_field}.job_id", status_code=409)
+        body = {"device_id": device_id, "results": results}
+        return body, status_code
 
     def inbox_job_recover_batch(
             self, payload: object) -> Tuple[Dict[str, Any], int]:
