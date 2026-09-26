@@ -385,6 +385,25 @@ class RedeliveryJobEvent:
 
 
 @dataclass
+class RedeliveryJobEventCheckpoint:
+    """One consumer's read checkpoint on a device's job-event chain.
+
+    Records the event ``seq`` up to which the named consumer has consumed
+    the device's redelivery-job lifecycle event chain, together with the
+    timestamp of the last forward checkpoint (``updated_at``). Checkpoints
+    are independent per ``(device_id, consumer_id)`` pair and created
+    lazily on the first advance; a pair that never advanced has no record
+    and reads as ``seq`` 0 with a null ``updated_at``. Only the integer
+    cursor and its timestamp are kept.
+    """
+
+    device_id: str
+    consumer_id: str
+    seq: int = 0
+    updated_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

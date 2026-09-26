@@ -91,6 +91,7 @@ from .storage import (
     REDELIVERY_JOB_CANCEL_PARTIAL_REPLAY,
     REDELIVERY_JOB_CANCEL_STATE,
     REDELIVERY_JOB_DISPATCH_PARTIAL_REPLAY,
+    REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT,
     REDELIVERY_JOB_RECOVERY_CONFLICT,
     REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE,
     REDELIVERY_JOB_RECOVERY_PARTIAL_REPLAY,
@@ -1908,6 +1909,75 @@ class DeviceService:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
         return page
+
+    def inbox_job_event_checkpoint(
+            self, device_id: str,
+            payload: object) -> Tuple[Dict[str, Any], int]:
+        """Read or advance one consumer's job-event checkpoint.
+
+        ``POST /v1/devices/{device_id}/inbox-job-events/checkpoint``. The
+        body must be a JSON object carrying exactly ``consumer_id`` (a
+        non-empty string) and ``seq`` (``null`` or a non-negative,
+        non-boolean integer). A bad/non-object body is 400/field
+        ``request_body``; a missing, empty or wrongly typed field is 400
+        with the corresponding ``field`` (``consumer_id`` / ``seq``), as is
+        the first extra key in payload order.
+
+        An unknown device is 404/field ``device_id``; a revoked device
+        stays checkpointable. ``seq=null`` is a read-only query (200): a
+        pair that never checkpointed reports ``seq`` 0 and ``updated_at``
+        null, otherwise the stored values. An integer ``seq`` greater than
+        the device's last event ``seq`` or below this consumer's stored
+        value is 409/field ``seq``; an equal ``seq`` is an idempotent
+        no-op (200, the timestamp untouched); a strictly greater one
+        advances the checkpoint and refreshes ``updated_at`` (201).
+        Checkpoints are independent per ``(device_id, consumer_id)`` pair.
+        On success the body keys are ``device_id``, ``consumer_id``,
+        ``seq`` and ``updated_at`` in that order, with ``updated_at`` null
+        or a UTC ISO-8601 timestamp (six microsecond digits, ``+00:00``).
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly consumer_id and seq; any other key is
+        # 400 with that field (the first extra key, in payload order).
+        extras = [key for key in payload if key not in ("consumer_id", "seq")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        if "consumer_id" not in payload:
+            raise ServiceError(
+                "missing required field: consumer_id", "consumer_id")
+        if not is_nonempty_string(payload["consumer_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        if "seq" not in payload:
+            raise ServiceError("missing required field: seq", "seq")
+        seq = payload["seq"]
+        if seq is not None:
+            # bool is a subclass of int; reject it explicitly.
+            if not isinstance(seq, int) or isinstance(seq, bool):
+                raise ServiceError(
+                    "field must be an integer or null: seq", "seq")
+            if seq < 0:
+                raise ServiceError(
+                    "field must be a non-negative integer or null: seq",
+                    "seq")
+        try:
+            result = self.store.redelivery_job_event_checkpoint(
+                device_id, payload["consumer_id"], seq)
+        except RedeliveryJobError as error:
+            if error.reason == REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT:
+                raise ServiceError(
+                    "seq exceeds the last event seq or moves backwards",
+                    "seq", status_code=409)
+            raise
+        if result is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        view, advanced = result
+        return view, 201 if advanced else 200
 
     def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
         """Return one redelivery job's detail with its recovery chain.

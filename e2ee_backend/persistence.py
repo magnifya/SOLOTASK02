@@ -1201,7 +1201,7 @@ class JsonStateStore:
 
         On success returns ``{"commit_seq", "state_hash", "consistent":
         True}`` in that key order, where ``state_hash`` is the lowercase
-        SHA-256 hex of the canonical compact JSON snapshot (19 ordered
+        SHA-256 hex of the canonical compact JSON snapshot (20 ordered
         sections, ``ensure_ascii=False`` UTF-8). Any failure — unreadable or
         missing file (including the degraded/blocked states where the formal
         path is absent), parse/version/generation error, semantic error, or a

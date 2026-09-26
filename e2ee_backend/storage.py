@@ -37,6 +37,7 @@ from .models import (
     PreKeyClaim,
     RedeliveryJob,
     RedeliveryJobEvent,
+    RedeliveryJobEventCheckpoint,
     RedeliveryJobRecovery,
     Session,
     SignedPreKey,
@@ -265,6 +266,10 @@ REDELIVERY_JOB_EVENT_TYPES = frozenset({
     REDELIVERY_JOB_EVENT_CANCEL,
     REDELIVERY_JOB_EVENT_COMPLETE,
 })
+
+#: A job-event checkpoint move was rejected: the requested seq exceeds the
+#: device's last event seq or moves backwards for that consumer.
+REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT = "checkpoint_seq_conflict"
 
 
 def _is_utc_microsecond_iso(value: Any) -> bool:
@@ -688,6 +693,7 @@ INTEGRITY_SECTION_KEYS = (
     "key_events",
     "redelivery_jobs",
     "redelivery_job_events",
+    "redelivery_job_event_checkpoints",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -700,7 +706,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 19 canonical
+    """Project a store snapshot/document payload onto the 20 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -797,6 +803,13 @@ class DeviceStore:
         # transaction as the mutation itself, so the chain is persisted and
         # rolled back together with the rest of the state.
         self._redelivery_job_events: Dict[str, List[RedeliveryJobEvent]] = {}
+        # Per-consumer read checkpoints on the per-device job-event chains,
+        # keyed by (device_id, consumer_id); created lazily on the first
+        # forward checkpoint. Each committed advance happens inside the same
+        # locked transaction as every other mutation, so the checkpoints are
+        # persisted and rolled back together with the rest of the state.
+        self._redelivery_job_event_checkpoints: \
+            Dict[Tuple[str, str], RedeliveryJobEventCheckpoint] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -3981,6 +3994,77 @@ class DeviceStore:
             }
 
     @staticmethod
+    def _redelivery_job_event_checkpoint_view(
+            device_id: str, consumer_id: str,
+            record: Optional[RedeliveryJobEventCheckpoint]) -> Dict[str, Any]:
+        """Copy one job-event checkpoint into its public four-key view.
+
+        A ``(device_id, consumer_id)`` pair that never advanced has no
+        record and reads as ``seq`` 0 with a null ``updated_at``.
+        """
+        return {
+            "device_id": device_id,
+            "consumer_id": consumer_id,
+            "seq": record.seq if record is not None else 0,
+            "updated_at": record.updated_at if record is not None else None,
+        }
+
+    def redelivery_job_event_checkpoint(
+            self, device_id: str, consumer_id: str,
+            seq: Optional[int]) -> Optional[Tuple[Dict[str, Any], bool]]:
+        """Read or advance one consumer's job-event checkpoint (atomic).
+
+        ``POST /v1/devices/{device_id}/inbox-job-events/checkpoint``. Under
+        the one store lock (shared with the job queue/dispatch/recover/
+        cancel operations that append the events, the lease operations,
+        acks and revocation), an unknown *device_id* returns ``None``
+        (404/device_id at the service layer); a revoked device stays
+        checkpointable. A ``None`` *seq* is a read-only query: it returns
+        the stored checkpoint (or ``seq`` 0 / ``updated_at`` null when the
+        pair never advanced) and writes nothing. An integer *seq* must not
+        exceed the device's last event seq and must not move backwards for
+        this consumer — either raises :class:`RedeliveryJobError`
+        ``checkpoint_seq_conflict`` (409/seq at the service layer). An
+        equal *seq* is an idempotent no-op (200, the timestamp untouched);
+        a strictly greater one creates/advances the record with a fresh
+        ``updated_at`` (201) and persists through the change hook. Returns
+        ``(view, advanced)``.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                return None
+            key = (device_id, consumer_id)
+            record = self._redelivery_job_event_checkpoints.get(key)
+            if seq is None:
+                # Read-only: no write, no commit generation.
+                return (self._redelivery_job_event_checkpoint_view(
+                    device_id, consumer_id, record), False)
+            chain = self._redelivery_job_events.get(device_id, [])
+            max_seq = chain[-1].seq if chain else 0
+            if seq > max_seq:
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT)
+            current = record.seq if record is not None else 0
+            if seq < current:
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT)
+            if seq == current:
+                # Idempotent no-op: the timestamp is untouched.
+                return (self._redelivery_job_event_checkpoint_view(
+                    device_id, consumer_id, record), False)
+            if record is None:
+                record = RedeliveryJobEventCheckpoint(
+                    device_id=device_id, consumer_id=consumer_id, seq=seq)
+                self._redelivery_job_event_checkpoints[key] = record
+            else:
+                record.seq = seq
+                record.updated_at = utc_now_iso()
+            self._notify_change()
+            return (self._redelivery_job_event_checkpoint_view(
+                device_id, consumer_id, record), True)
+
+    @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
 
@@ -5463,6 +5547,15 @@ class DeviceStore:
                 for chain in self._redelivery_job_events.values()
                 for event in chain
             ]
+            redelivery_job_event_checkpoints = [
+                {
+                    "device_id": record.device_id,
+                    "consumer_id": record.consumer_id,
+                    "seq": record.seq,
+                    "updated_at": record.updated_at,
+                }
+                for record in self._redelivery_job_event_checkpoints.values()
+            ]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -5478,7 +5571,9 @@ class DeviceStore:
                         "message_sync_cursors": message_sync_cursors,
                         "message_submissions": message_submissions,
                         "redelivery_jobs": redelivery_jobs,
-                        "redelivery_job_events": redelivery_job_events}
+                        "redelivery_job_events": redelivery_job_events,
+                        "redelivery_job_event_checkpoints":
+                            redelivery_job_event_checkpoints}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -5657,6 +5752,8 @@ class DeviceStore:
         raw_message_submissions = state.get("message_submissions", [])
         raw_redelivery_jobs = state.get("redelivery_jobs", [])
         raw_redelivery_job_events = state.get("redelivery_job_events", [])
+        raw_redelivery_job_event_checkpoints = state.get(
+            "redelivery_job_event_checkpoints", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -5673,7 +5770,8 @@ class DeviceStore:
                 and isinstance(raw_message_sync_cursors, list)
                 and isinstance(raw_message_submissions, list)
                 and isinstance(raw_redelivery_jobs, list)
-                and isinstance(raw_redelivery_job_events, list)):
+                and isinstance(raw_redelivery_job_events, list)
+                and isinstance(raw_redelivery_job_event_checkpoints, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -7264,6 +7362,65 @@ class DeviceStore:
                     f"{event_job_id} carries state {last_event.state} but "
                     f"the job is {current_state}")
 
+        # Per-(device, consumer) job-event read checkpoints. Older
+        # version-1 files predate the section: it is absent and treated as
+        # empty (every pair reads as seq 0 with a null updated_at). A
+        # present section holds one record per (device_id, consumer_id)
+        # pair; every record carries exactly device_id/consumer_id/seq/
+        # updated_at in that order, references a registered device, and its
+        # seq must not exceed that device's last event seq. A duplicated
+        # pair, an unknown device, an out-of-range seq, or a field, type or
+        # key-order error refuses startup rather than silently dropping or
+        # clamping the record.
+        redelivery_job_event_checkpoints: \
+            Dict[Tuple[str, str], RedeliveryJobEventCheckpoint] = {}
+        for index, raw in enumerate(raw_redelivery_job_event_checkpoints):
+            where = f"redelivery_job_event_checkpoints[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["device_id", "consumer_id", "seq",
+                             "updated_at"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'device_id', "
+                    f"'consumer_id', 'seq', 'updated_at' in order")
+            c_device_id = raw["device_id"]
+            c_consumer_id = raw["consumer_id"]
+            c_seq = raw["seq"]
+            c_updated_at = raw["updated_at"]
+            if not (isinstance(c_device_id, str) and c_device_id):
+                raise ValueError(
+                    f"{where}.device_id must be a non-empty string")
+            if not (isinstance(c_consumer_id, str) and c_consumer_id):
+                raise ValueError(
+                    f"{where}.consumer_id must be a non-empty string")
+            if not isinstance(c_seq, int) or isinstance(c_seq, bool) \
+                    or c_seq < 0:
+                raise ValueError(
+                    f"{where}.seq must be a non-negative integer")
+            if not _is_utc_microsecond_iso(c_updated_at):
+                raise ValueError(
+                    f"{where}.updated_at must be a UTC ISO-8601 timestamp "
+                    f"with microseconds and a +00:00 offset")
+            if c_device_id not in device_index:
+                raise ValueError(
+                    f"{where} references an unknown device: {c_device_id}")
+            ckey = (c_device_id, c_consumer_id)
+            if ckey in redelivery_job_event_checkpoints:
+                raise ValueError(
+                    f"duplicate redelivery job event checkpoint in state: "
+                    f"{ckey}")
+            checkpoint_chain = redelivery_job_events.get(c_device_id, [])
+            max_event_seq = checkpoint_chain[-1].seq \
+                if checkpoint_chain else 0
+            if c_seq > max_event_seq:
+                raise ValueError(
+                    f"{where}.seq {c_seq} exceeds the device's last event "
+                    f"seq {max_event_seq}")
+            redelivery_job_event_checkpoints[ckey] = \
+                RedeliveryJobEventCheckpoint(
+                    device_id=c_device_id, consumer_id=c_consumer_id,
+                    seq=c_seq, updated_at=c_updated_at)
+
         # Per-device group-session delivery records. Older version-1 files
         # predate the section: it is absent and treated as empty. A present
         # section holds one record per (session, message, device); every
@@ -7608,6 +7765,8 @@ class DeviceStore:
             self._message_submissions = message_submissions
             self._redelivery_jobs = redelivery_jobs
             self._redelivery_job_events = redelivery_job_events
+            self._redelivery_job_event_checkpoints = \
+                redelivery_job_event_checkpoints
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor
