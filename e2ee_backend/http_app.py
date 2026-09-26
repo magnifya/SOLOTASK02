@@ -124,6 +124,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_inbox_job_ack_batch()
         elif path == _INBOX_JOBS_PATH + "/renew-batch":
             self._handle_inbox_job_renew_batch()
+        elif path == _INBOX_JOBS_PATH + "/release-batch":
+            self._handle_inbox_job_release_batch()
         elif path == _GROUPS_PATH:
             self._handle_create_group()
         elif path == _GROUP_SESSIONS_PATH:
@@ -1293,6 +1295,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.inbox_job_renew_batch(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_inbox_job_release_batch(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.inbox_job_release_batch(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
