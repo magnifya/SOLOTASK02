@@ -385,6 +385,24 @@ class RedeliveryJobEvent:
 
 
 @dataclass
+class RedeliveryJobEventCheckpoint:
+    """One consumer's read checkpoint over a device's job-event chain.
+
+    ``POST /v1/devices/{device_id}/inbox-job-events/checkpoint`` stores, per
+    ``(device_id, consumer_id)`` pair, the greatest event ``seq`` the
+    consumer has acknowledged and the UTC timestamp of that advance. A
+    checkpoint is created lazily on the first forward move; an equal ``seq``
+    never writes, so a checkpoint advanced from 0 to *n* keeps the timestamp
+    of its first advance. Only the identifier, an integer cursor and its
+    timestamp are kept.
+    """
+
+    consumer_id: str
+    seq: int
+    updated_at: str
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

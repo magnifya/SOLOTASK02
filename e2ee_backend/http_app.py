@@ -168,6 +168,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         elif path.startswith(_DEVICES_PATH + "/") \
                 and "/inbox/leases/" in path and path.endswith("/ack"):
             self._route_device_inbox_lease_ack(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/inbox-job-events/checkpoint"):
+            self._route_device_inbox_job_event_checkpoint(path)
         elif path.startswith(_DEVICES_PATH + "/"):
             self._route_add_prekey(path)
         elif path.startswith(_MESSAGES_PATH + "/") and path.endswith("/acks"):
@@ -348,6 +351,19 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         parts = suffix.split("/")
         if len(parts) == 2 and parts[0] and parts[1] == "prekeys":
             self._handle_add_prekey(unquote(parts[0]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_device_inbox_job_event_checkpoint(self, path: str) -> None:
+        # {device_id}/inbox-job-events/checkpoint — a single non-empty
+        # device segment followed by the two literal segments, split on
+        # raw slashes so a percent-encoded slash stays part of the id.
+        suffix = path[len(_DEVICES_PATH) + 1:
+                      -len("/inbox-job-events/checkpoint")]
+        if suffix and "/" not in suffix:
+            self._handle_device_inbox_job_event_checkpoint(
+                unquote(suffix))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -1184,6 +1200,19 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(200, body)
+
+    def _handle_device_inbox_job_event_checkpoint(
+            self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.inbox_job_event_checkpoint(
+                device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
 
     def _handle_device_inbox_job_get(
             self, device_id: str, job_id: str) -> None:
