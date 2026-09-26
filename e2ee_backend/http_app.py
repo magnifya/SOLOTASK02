@@ -377,6 +377,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_device_inbox_wait(unquote(device_id))
                 return
+            if suffix.endswith("/inbox-jobs"):
+                device_id = suffix[:-len("/inbox-jobs")]
+                if not device_id or "/" in device_id:
+                    self._send_json(404, {"message": "device not found",
+                                          "field": "device_id"})
+                    return
+                self._handle_device_inbox_jobs(unquote(device_id))
+                return
             if suffix.endswith("/inbox"):
                 device_id = suffix[:-len("/inbox")]
                 if not device_id or "/" in device_id:
@@ -979,6 +987,65 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self.service.inbox_leases(device_id, state, after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_device_inbox_jobs(self, device_id: str) -> None:
+        # The redelivery-job history query takes no request body: a
+        # non-empty one is 400/request_body. Only single-valued
+        # state/after/limit query parameters are accepted (defaults
+        # all/0/100); anything else is 400/query. keep_blank_values so a
+        # bare ``?foo`` flag is an actual (unknown) parameter rather than
+        # being silently dropped, while a trailing ``?`` with no parameter
+        # at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name not in ("state", "after", "limit")
+               for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        state_values = query.get("state", [])
+        if len(state_values) > 1:
+            self._send_json(400, {"message": "state must appear at most once",
+                                  "field": "state"})
+            return
+        state = state_values[0] if state_values else "all"
+        if state not in ("all", "pending", "running", "succeeded",
+                         "failed", "cancelled"):
+            self._send_json(400, {"message": "state must be one of 'all', "
+                                             "'pending', 'running', "
+                                             "'succeeded', 'failed' or "
+                                             "'cancelled'",
+                                  "field": "state"})
+            return
+        after = self._decimal_nonneg_param(query, "after", default=0,
+                                           maximum=(1 << 63) - 1,
+                                           max_digits=19)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        try:
+            body = self.service.inbox_jobs(device_id, state, after, limit)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
