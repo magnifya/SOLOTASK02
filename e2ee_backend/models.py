@@ -362,6 +362,29 @@ class RedeliveryJob:
 
 
 @dataclass
+class RedeliveryJobEvent:
+    """One committed lifecycle event of a 1:1-inbox redelivery job.
+
+    Appended in the same locked transaction as the mutation it records:
+    the first successful ``queue``/``dispatch``/``recover``/``cancel`` of a
+    job (idempotent replays and failed operations append nothing, and a
+    batch appends one event per applied item in input order) and the first
+    completion of the lease a ``running`` job currently holds (an ordinary
+    lease no running job holds appends nothing). ``seq`` runs consecutively
+    from 1 per device; ``type`` is the operation name
+    (``queue``/``dispatch``/``recover``/``cancel``/``complete``) and
+    ``state`` the job's state right after the commit (one of the five job
+    states). Only identifiers and the state machine are retained.
+    """
+
+    device_id: str
+    seq: int
+    job_id: str
+    type: str
+    state: str
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

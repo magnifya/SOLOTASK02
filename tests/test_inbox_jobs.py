@@ -319,6 +319,7 @@ class InboxJobPersistenceTest(InboxMixin, unittest.TestCase):
         with open(self.path, encoding="utf-8") as handle:
             document = json.load(handle)
         document.pop("redelivery_jobs")
+        document.pop("redelivery_job_events", None)
         document.pop("integrity_log_version", None)
         legacy_path = os.path.join(self.directory, "legacy.json")
         with open(legacy_path, "w", encoding="utf-8") as handle:

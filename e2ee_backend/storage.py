@@ -36,6 +36,7 @@ from .models import (
     PreKeyBatchClaim,
     PreKeyClaim,
     RedeliveryJob,
+    RedeliveryJobEvent,
     RedeliveryJobRecovery,
     Session,
     SignedPreKey,
@@ -245,6 +246,25 @@ REDELIVERY_JOB_DISPATCH_PARTIAL_REPLAY = "dispatch_partial_replay"
 
 #: Number of inbox messages one redelivery-job dispatch leases at most.
 REDELIVERY_JOB_DISPATCH_LIMIT = 100
+
+#: Lifecycle event types of a 1:1-inbox redelivery job (the ``type`` field
+#: of a :class:`RedeliveryJobEvent`): the first committed
+#: queue/dispatch/recover/cancel of the job, and the first completion of
+#: the lease a running job currently holds.
+REDELIVERY_JOB_EVENT_QUEUE = "queue"
+REDELIVERY_JOB_EVENT_DISPATCH = "dispatch"
+REDELIVERY_JOB_EVENT_RECOVER = "recover"
+REDELIVERY_JOB_EVENT_CANCEL = "cancel"
+REDELIVERY_JOB_EVENT_COMPLETE = "complete"
+
+#: All five redelivery-job event types, for restore-time validation.
+REDELIVERY_JOB_EVENT_TYPES = frozenset({
+    REDELIVERY_JOB_EVENT_QUEUE,
+    REDELIVERY_JOB_EVENT_DISPATCH,
+    REDELIVERY_JOB_EVENT_RECOVER,
+    REDELIVERY_JOB_EVENT_CANCEL,
+    REDELIVERY_JOB_EVENT_COMPLETE,
+})
 
 
 def _is_utc_microsecond_iso(value: Any) -> bool:
@@ -667,6 +687,7 @@ INTEGRITY_SECTION_KEYS = (
     "message_submissions",
     "key_events",
     "redelivery_jobs",
+    "redelivery_job_events",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -679,7 +700,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 18 canonical
+    """Project a store snapshot/document payload onto the 19 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -769,6 +790,13 @@ class DeviceStore:
         # (globally unique). A dispatched job's lease lives on the leased
         # messages' delivery records under a lease_id equal to the job_id.
         self._redelivery_jobs: Dict[str, RedeliveryJob] = {}
+        # Append-only redelivery-job lifecycle event chains, keyed by
+        # device_id. Each committed first queue/dispatch/recover/cancel of
+        # a job, and each first completion of the lease a running job
+        # currently holds, appends exactly one event inside the same locked
+        # transaction as the mutation itself, so the chain is persisted and
+        # rolled back together with the rest of the state.
+        self._redelivery_job_events: Dict[str, List[RedeliveryJobEvent]] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -820,6 +848,22 @@ class DeviceStore:
             hash=key_event_hash(device_id, seq, event_type, payload,
                                 prev_hash, created_at),
             created_at=created_at)
+        chain.append(event)
+        return event
+
+    def _append_redelivery_job_event_locked(
+            self, job: RedeliveryJob, event_type: str) -> RedeliveryJobEvent:
+        """Append one lifecycle event to a device's job-event chain.
+
+        Lock required. The event's ``seq`` continues the device's chain
+        (starting at 1); ``state`` freezes the job's state right after the
+        mutation being recorded. The caller appends only for real
+        transitions — idempotent replays and failed operations add nothing.
+        """
+        chain = self._redelivery_job_events.setdefault(job.device_id, [])
+        event = RedeliveryJobEvent(
+            device_id=job.device_id, seq=len(chain) + 1, job_id=job.job_id,
+            type=event_type, state=job.state)
         chain.append(event)
         return event
 
@@ -3894,6 +3938,48 @@ class DeviceStore:
                 "has_more": after + limit < len(filtered),
             }
 
+    def redelivery_job_events_page(self, device_id: str, after: int,
+                                   limit: int
+                                   ) -> Optional[Dict[str, Any]]:
+        """Read one page of one device's redelivery-job events (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox-job-events``. Under the one
+        store lock (shared with the job queue/dispatch/recover/cancel
+        operations, lease claims/renewals/releases/completions, acks and
+        revocation), an unknown *device_id* returns ``None``
+        (404/device_id at the service layer); a revoked device's chain
+        stays readable. The device's events are taken in chain order
+        (``seq`` ascending from 1): the page is the events with
+        ``seq > after``, at most *limit* of them. The query writes nothing
+        and advances no commit generation, so an unchanged state answers
+        byte-identically.
+
+        On success the body keys are ``device_id``, ``events``,
+        ``next_after`` and ``has_more`` in that order; each event item is
+        ``seq``, ``job_id``, ``type`` and ``state`` in that order. An
+        empty page echoes ``next_after=after``; otherwise it is the last
+        returned event's ``seq``. ``has_more`` says whether a further
+        event follows the page.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                return None
+            chain = self._redelivery_job_events.get(device_id, [])
+            page = [event for event in chain if event.seq > after][:limit]
+            next_after = page[-1].seq if page else after
+            return {
+                "device_id": device_id,
+                "events": [{
+                    "seq": event.seq,
+                    "job_id": event.job_id,
+                    "type": event.type,
+                    "state": event.state,
+                } for event in page],
+                "next_after": next_after,
+                "has_more": any(event.seq > next_after for event in chain),
+            }
+
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
@@ -4078,6 +4164,8 @@ class DeviceStore:
                     return self.redelivery_job_view(job), 200
                 job = RedeliveryJob(job_id=job_id, device_id=device_id)
                 self._redelivery_jobs[job_id] = job
+                self._append_redelivery_job_event_locked(
+                    job, REDELIVERY_JOB_EVENT_QUEUE)
                 self._notify_change()
                 return self.redelivery_job_view(job), 201
             if job is None:
@@ -4095,6 +4183,8 @@ class DeviceStore:
             if self._find_inbox_lease_locked(job_id) is not None:
                 raise RedeliveryJobError(REDELIVERY_JOB_LEASE_OCCUPIED)
             self._redelivery_job_apply_dispatch_locked(job, now)
+            self._append_redelivery_job_event_locked(
+                job, REDELIVERY_JOB_EVENT_DISPATCH)
             self._notify_change()
             return self.redelivery_job_view(job), 201
 
@@ -4239,6 +4329,8 @@ class DeviceStore:
             # withholds its messages from the items that follow.
             for job in jobs:
                 self._redelivery_job_apply_dispatch_locked(job, now)
+                self._append_redelivery_job_event_locked(
+                    job, REDELIVERY_JOB_EVENT_DISPATCH)
             # One persistence notification for the whole batch: every job
             # and lease commits (or rolls back) together and the generation
             # advances exactly once.
@@ -4303,6 +4395,8 @@ class DeviceStore:
             cancelled_at = now.isoformat(timespec="microseconds")
             self._redelivery_job_apply_cancel_locked(
                 job, cancellation_id, cancelled_at)
+            self._append_redelivery_job_event_locked(
+                job, REDELIVERY_JOB_EVENT_CANCEL)
             self._notify_change()
             return self.redelivery_job_view(job), 201
 
@@ -4403,6 +4497,8 @@ class DeviceStore:
                 .isoformat(timespec="microseconds")
             self._redelivery_job_apply_recovery_locked(
                 job, recovery_id, now, leased_until)
+            self._append_redelivery_job_event_locked(
+                job, REDELIVERY_JOB_EVENT_RECOVER)
             self._notify_change()
             return self.redelivery_job_view(job), 201
 
@@ -4582,6 +4678,8 @@ class DeviceStore:
             for job, (_job_id, recovery_id) in zip(jobs, items):
                 self._redelivery_job_apply_recovery_locked(
                     job, recovery_id, now, leased_until)
+                self._append_redelivery_job_event_locked(
+                    job, REDELIVERY_JOB_EVENT_RECOVER)
             # One persistence notification for the whole batch: every job
             # and lease commits (or rolls back) together and the generation
             # advances exactly once.
@@ -4690,6 +4788,8 @@ class DeviceStore:
             for job, (_job_id, cancellation_id) in zip(jobs, items):
                 self._redelivery_job_apply_cancel_locked(
                     job, cancellation_id, cancelled_at)
+                self._append_redelivery_job_event_locked(
+                    job, REDELIVERY_JOB_EVENT_CANCEL)
             # One persistence notification for the whole batch: every job
             # and lease commits (or rolls back) together and the
             # generation advances exactly once.
@@ -4737,15 +4837,18 @@ class DeviceStore:
         its lease id, so the running job is found by its current
         ``lease_id`` rather than by job id. It becomes ``succeeded`` on
         ``delivered`` and ``failed`` on ``failed``, inside the same locked
-        transaction as the completion. Leases not currently held by a
-        running job change nothing (an expired/superseded lease cannot be
-        completed anyway).
+        transaction as the completion, and the transition appends one
+        ``complete`` event to the device's job-event chain. Leases not
+        currently held by a running job change nothing (an
+        expired/superseded lease cannot be completed anyway).
         """
         for job in self._redelivery_jobs.values():
             if job.state == REDELIVERY_JOB_RUNNING \
                     and job.lease_id == lease_id:
                 job.state = REDELIVERY_JOB_SUCCEEDED \
                     if outcome == "delivered" else REDELIVERY_JOB_FAILED
+                self._append_redelivery_job_event_locked(
+                    job, REDELIVERY_JOB_EVENT_COMPLETE)
                 return
 
     def inbox_retry_batch(
@@ -5349,6 +5452,17 @@ class DeviceStore:
                 self.key_event_view(event)
                 for chain in self._key_events.values() for event in chain
             ]
+            redelivery_job_events = [
+                {
+                    "device_id": event.device_id,
+                    "seq": event.seq,
+                    "job_id": event.job_id,
+                    "type": event.type,
+                    "state": event.state,
+                }
+                for chain in self._redelivery_job_events.values()
+                for event in chain
+            ]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -5363,7 +5477,8 @@ class DeviceStore:
                         "group_sync_cursors": group_sync_cursors,
                         "message_sync_cursors": message_sync_cursors,
                         "message_submissions": message_submissions,
-                        "redelivery_jobs": redelivery_jobs}
+                        "redelivery_jobs": redelivery_jobs,
+                        "redelivery_job_events": redelivery_job_events}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -5541,6 +5656,7 @@ class DeviceStore:
         raw_message_sync_cursors = state.get("message_sync_cursors", [])
         raw_message_submissions = state.get("message_submissions", [])
         raw_redelivery_jobs = state.get("redelivery_jobs", [])
+        raw_redelivery_job_events = state.get("redelivery_job_events", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -5556,7 +5672,8 @@ class DeviceStore:
                 and isinstance(raw_group_sync_cursors, list)
                 and isinstance(raw_message_sync_cursors, list)
                 and isinstance(raw_message_submissions, list)
-                and isinstance(raw_redelivery_jobs, list)):
+                and isinstance(raw_redelivery_jobs, list)
+                and isinstance(raw_redelivery_job_events, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -7053,6 +7170,100 @@ class DeviceStore:
                 cancellation_id=j_cancellation_id,
                 cancelled_at=j_cancelled_at)
 
+        # Per-device redelivery-job lifecycle event chains. Older version-1
+        # files predate the section: it is absent and treated as empty (a
+        # job without any event is simply older than the section and stays
+        # compatible). A present section holds one item per committed
+        # lifecycle event; every item carries exactly
+        # device_id/seq/job_id/type/state in that order, references a
+        # registered device and one of that device's own jobs, and records
+        # a type/state pair the live transitions produce. Each device's
+        # chain must run consecutively from seq 1, and every job's last
+        # event must carry the job's current state. Any contradiction
+        # refuses startup rather than silently dropping the event history.
+        redelivery_job_events: Dict[str, List[RedeliveryJobEvent]] = {}
+        last_event_by_job: Dict[str, RedeliveryJobEvent] = {}
+        for index, raw in enumerate(raw_redelivery_job_events):
+            where = f"redelivery_job_events[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["device_id", "seq", "job_id", "type", "state"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'device_id', "
+                    f"'seq', 'job_id', 'type', 'state' in order")
+            e_device_id = raw["device_id"]
+            e_seq = raw["seq"]
+            e_job_id = raw["job_id"]
+            e_type = raw["type"]
+            e_state = raw["state"]
+            if not (isinstance(e_device_id, str) and e_device_id):
+                raise ValueError(
+                    f"{where}.device_id must be a non-empty string")
+            if not isinstance(e_seq, int) or isinstance(e_seq, bool) \
+                    or e_seq < 1:
+                raise ValueError(
+                    f"{where}.seq must be a positive integer")
+            if not (isinstance(e_job_id, str) and e_job_id):
+                raise ValueError(
+                    f"{where}.job_id must be a non-empty string")
+            if e_type not in REDELIVERY_JOB_EVENT_TYPES:
+                raise ValueError(
+                    f"{where}.type must be one of "
+                    f"{sorted(REDELIVERY_JOB_EVENT_TYPES)}")
+            if e_state not in REDELIVERY_JOB_STATES:
+                raise ValueError(
+                    f"{where}.state must be one of "
+                    f"{sorted(REDELIVERY_JOB_STATES)}")
+            # The type/state pair must be one the live transitions
+            # produce: queue commits pending, dispatch commits running or
+            # succeeded, recover commits running or succeeded, cancel
+            # commits cancelled and complete commits succeeded or failed.
+            if (e_type, e_state) not in (
+                    (REDELIVERY_JOB_EVENT_QUEUE, REDELIVERY_JOB_PENDING),
+                    (REDELIVERY_JOB_EVENT_DISPATCH, REDELIVERY_JOB_RUNNING),
+                    (REDELIVERY_JOB_EVENT_DISPATCH,
+                     REDELIVERY_JOB_SUCCEEDED),
+                    (REDELIVERY_JOB_EVENT_RECOVER, REDELIVERY_JOB_RUNNING),
+                    (REDELIVERY_JOB_EVENT_RECOVER, REDELIVERY_JOB_SUCCEEDED),
+                    (REDELIVERY_JOB_EVENT_CANCEL, REDELIVERY_JOB_CANCELLED),
+                    (REDELIVERY_JOB_EVENT_COMPLETE,
+                     REDELIVERY_JOB_SUCCEEDED),
+                    (REDELIVERY_JOB_EVENT_COMPLETE, REDELIVERY_JOB_FAILED)):
+                raise ValueError(
+                    f"{where} carries a type/state pair no committed "
+                    f"transition produces: {e_type}/{e_state}")
+            if e_device_id not in device_index:
+                raise ValueError(
+                    f"{where} references an unknown device: {e_device_id}")
+            event_job = redelivery_jobs.get(e_job_id)
+            if event_job is None:
+                raise ValueError(
+                    f"{where} references an unknown job: {e_job_id}")
+            if event_job.device_id != e_device_id:
+                raise ValueError(
+                    f"{where} references a job owned by another device: "
+                    f"{e_job_id}")
+            event = RedeliveryJobEvent(
+                device_id=e_device_id, seq=e_seq, job_id=e_job_id,
+                type=e_type, state=e_state)
+            redelivery_job_events.setdefault(e_device_id, []).append(event)
+        for event_device_id, chain in redelivery_job_events.items():
+            chain.sort(key=lambda event: event.seq)
+            for position, event in enumerate(chain):
+                if event.seq != position + 1:
+                    raise ValueError(
+                        f"redelivery_job_events chain of device "
+                        f"{event_device_id} must run consecutively from "
+                        f"seq 1")
+                last_event_by_job[event.job_id] = event
+        for event_job_id, last_event in last_event_by_job.items():
+            current_state = redelivery_jobs[event_job_id].state
+            if last_event.state != current_state:
+                raise ValueError(
+                    f"redelivery_job_events last event of job "
+                    f"{event_job_id} carries state {last_event.state} but "
+                    f"the job is {current_state}")
+
         # Per-device group-session delivery records. Older version-1 files
         # predate the section: it is absent and treated as empty. A present
         # section holds one record per (session, message, device); every
@@ -7396,6 +7607,7 @@ class DeviceStore:
             self._message_sync_cursors = message_sync_cursors
             self._message_submissions = message_submissions
             self._redelivery_jobs = redelivery_jobs
+            self._redelivery_job_events = redelivery_job_events
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor

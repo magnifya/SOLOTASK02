@@ -468,6 +468,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_device_inbox_jobs(unquote(device_id))
                 return
+            if suffix.endswith("/inbox-job-events"):
+                device_id = suffix[:-len("/inbox-job-events")]
+                if not device_id or "/" in device_id:
+                    self._send_json(404, {"message": "device not found",
+                                          "field": "device_id"})
+                    return
+                self._handle_device_inbox_job_events(unquote(device_id))
+                return
             if suffix.endswith("/inbox"):
                 device_id = suffix[:-len("/inbox")]
                 if not device_id or "/" in device_id:
@@ -1128,6 +1136,50 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body = self.service.inbox_jobs_page(device_id, state, after,
                                                 limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_device_inbox_job_events(self, device_id: str) -> None:
+        # The job-event chain query takes no request body: a non-empty one
+        # is 400/request_body. Only single-valued after/limit query
+        # parameters are accepted (defaults 0/100); anything else is
+        # 400/query. keep_blank_values so a bare ``?foo`` flag is an actual
+        # (unknown) parameter rather than being silently dropped, while a
+        # trailing ``?`` with no parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name not in ("after", "limit")
+               for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        after = self._decimal_nonneg_param(query, "after", default=0,
+                                           maximum=2**63 - 1, max_digits=19)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        try:
+            body = self.service.inbox_job_events_page(device_id, after,
+                                                      limit)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
