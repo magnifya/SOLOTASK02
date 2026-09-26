@@ -1900,6 +1900,43 @@ class DeviceService:
                     "job_id", status_code=409)
             raise
 
+    def inbox_job_events_page(self, device_id: str, after: int,
+                              limit: int) -> Dict[str, Any]:
+        """Return one page of a device's inbox redelivery-job event chain.
+
+        ``GET /v1/devices/{device_id}/inbox-job-events``. The GET takes no
+        request body (the HTTP layer rejects a non-empty one with
+        400/field ``request_body``) and only the single-valued query
+        parameters ``after`` and ``limit`` (any other parameter is
+        400/field ``query``). ``after`` defaults to 0 and must be an
+        unsigned single-value ASCII decimal integer in 0..2**63-1;
+        ``limit`` defaults to 100 and must be in 1..100 (the HTTP layer
+        enforces the decimal shape and single occurrence, answering 400
+        with the parameter name as ``field``).
+
+        Under the store lock the page carries the events with ``seq >
+        after`` (ascending, at most ``limit``). An unknown device is
+        404/field ``device_id``; a revoked device's chain stays readable.
+        On success the body keys are ``device_id``, ``events``,
+        ``next_after`` and ``has_more`` in that order; each event item is
+        ``seq``, ``job_id``, ``type`` and ``state`` with ``state`` one of
+        the five job states. The lookup writes nothing and advances no
+        ``commit_seq``.
+        """
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or not 0 <= after <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        page = self.store.inbox_job_events_page(device_id, after, limit)
+        if page is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return page
+
     def inbox_job(self, payload: object) -> Tuple[Dict[str, Any], int]:
         """Validate and apply one 1:1-inbox redelivery job operation.
 

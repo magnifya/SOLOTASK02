@@ -362,6 +362,34 @@ class RedeliveryJob:
 
 
 @dataclass
+class InboxJobEvent:
+    """One link of a device's append-only inbox redelivery-job event chain.
+
+    Every first-time job lifecycle operation records exactly one event on the
+    owning device's chain, inside the same locked transaction as the
+    operation: the first ``queue``/``dispatch``/``recover``/``cancel`` each
+    append one, and the first lease completion that moves a ``running`` job
+    to ``succeeded``/``failed`` appends one more. Replays, failed attempts
+    and ordinary (non-job-transitioning) lease operations record nothing;
+    batch operations record their events in the batch's input order.
+
+    ``seq`` starts at 1 and advances by one per event on the device; chains
+    are isolated per device (the persisted item repeats ``device_id`` so a
+    flat section can reconstruct them). ``type`` is the operation name
+    (``queue``/``dispatch``/``recover``/``cancel``) or ``complete`` for the
+    first terminal completion, and ``state`` is the job's post-commit state,
+    one of the five job states. Only identifiers and the state machine are
+    retained.
+    """
+
+    device_id: str
+    seq: int
+    job_id: str
+    type: str
+    state: str
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

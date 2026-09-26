@@ -319,6 +319,9 @@ class InboxJobPersistenceTest(InboxMixin, unittest.TestCase):
         with open(self.path, encoding="utf-8") as handle:
             document = json.load(handle)
         document.pop("redelivery_jobs")
+        # A file predating the redelivery_jobs section also predates its
+        # event chain section; both are absent together.
+        document.pop("redelivery_job_events", None)
         document.pop("integrity_log_version", None)
         legacy_path = os.path.join(self.directory, "legacy.json")
         with open(legacy_path, "w", encoding="utf-8") as handle:
