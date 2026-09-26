@@ -70,6 +70,7 @@ from .storage import (
     INBOX_RETRY_NOT_RECIPIENT,
     INBOX_RETRY_SESSION_UNKNOWN,
     INBOX_LEASE_COMPLETION_CONFLICT,
+    INBOX_LEASE_COMPLETION_PARTIAL_REPLAY,
     INBOX_LEASE_CONFLICT,
     INBOX_LEASE_DEVICE_INACTIVE,
     INBOX_LEASE_DEVICE_UNKNOWN,
@@ -121,6 +122,7 @@ from .storage import (
     MessageListError,
     InboxRetryBatchError,
     InboxLeaseError,
+    InboxLeaseCompleteBatchError,
     MessageSyncAckBatchError,
     MessageSyncError,
     PreKeyClaimError,
@@ -1692,6 +1694,166 @@ class DeviceService:
                                    "device_id", status_code=409)
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
+
+    def inbox_lease_complete_batch(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and atomically apply a batch of lease completions.
+
+        ``POST /v1/inbox-jobs/complete-batch``. The body must be a JSON
+        object carrying exactly a non-empty string ``device_id`` and a
+        non-empty ``items`` array (any other top-level key is
+        400/that field); each item is an object carrying exactly a
+        non-empty string ``lease_id`` and ``completion_id`` and an
+        ``outcome`` of exactly ``delivered`` or ``failed``, and neither id
+        may repeat across items. Shape errors are reported, in order, as
+        400/field ``request_body`` (bad/non-object body), ``device_id``
+        (missing/empty/non-string), ``items`` (missing/not-a-non-empty
+        array), ``items[i]`` (non-object element, an unexpected key, or a
+        repeated ``lease_id``/``completion_id``) or
+        ``items[i].lease_id`` / ``items[i].completion_id`` /
+        ``items[i].outcome`` for the offending field.
+
+        The device is then resolved (unknown/revoked -> 409/field
+        ``device_id``) and every item is prechecked in array order with
+        the single-lease completion rules, the first error aborting the
+        whole batch with nothing written and its ``field`` prefixed to
+        ``items[i].``: an unknown lease is 404/``items[i].lease_id``, a
+        lease of another device is 409/``items[i].lease_id``, and an
+        uncompleted lease that is released or expired is
+        409/``items[i].lease_id``. A lease already completed under the
+        item's own ``completion_id`` is an idempotent replay (an id
+        reused with a different committed completion is
+        409/``items[i].completion_id``); when every item is such a replay
+        the batch answers 200 with the frozen first responses and writes
+        nothing, and a mix of replays and first-time items conflicts 409
+        with the first replayed item's ``items[i].completion_id``.
+
+        A first-time batch completes every lease in input order with one
+        shared UTC ``completed_at`` (ISO-8601 with six microsecond digits
+        and ``+00:00``) and commits once (201); a running redelivery job
+        holding a lease moves to ``succeeded`` or ``failed`` with that
+        item's outcome in the same transaction. The body keys are
+        ``device_id`` then ``results``; results keep input order and each
+        item is ``lease_id``, ``completion_id``, ``outcome``,
+        ``completed_at`` in that order.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id",
+                               "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        device_id = payload["device_id"]
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+        # The body carries exactly device_id and items; any other
+        # top-level key is 400 with that field (the first extra key, in
+        # payload order), mirroring the other job batches.
+        extras = [key for key in payload
+                  if key not in ("device_id", "items")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+
+        items: List[Tuple[str, str, str]] = []
+        seen_lease_ids: set = set()
+        seen_completion_ids: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            # Each item carries exactly lease_id, completion_id and
+            # outcome; any other key is 400 at the item level (items[i]).
+            if any(key not in ("lease_id", "completion_id", "outcome")
+                   for key in element):
+                raise ServiceError(
+                    "array element must carry only lease_id, "
+                    f"completion_id and outcome: {item_field}", item_field)
+            lease_field = f"{item_field}.lease_id"
+            if "lease_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {lease_field}", lease_field)
+            if not is_nonempty_string(element["lease_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {lease_field}",
+                    lease_field)
+            completion_field = f"{item_field}.completion_id"
+            if "completion_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {completion_field}",
+                    completion_field)
+            if not is_nonempty_string(element["completion_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: "
+                    f"{completion_field}", completion_field)
+            outcome_field = f"{item_field}.outcome"
+            if "outcome" not in element:
+                raise ServiceError(
+                    f"missing required field: {outcome_field}",
+                    outcome_field)
+            outcome = element["outcome"]
+            if not isinstance(outcome, str) or outcome not in (
+                    "delivered", "failed"):
+                raise ServiceError(
+                    "field must be one of 'delivered' or 'failed': "
+                    f"{outcome_field}", outcome_field)
+            if element["lease_id"] in seen_lease_ids:
+                raise ServiceError(
+                    "duplicate lease_id in items: "
+                    f"{element['lease_id']}", item_field)
+            if element["completion_id"] in seen_completion_ids:
+                raise ServiceError(
+                    "duplicate completion_id in items: "
+                    f"{element['completion_id']}", item_field)
+            seen_lease_ids.add(element["lease_id"])
+            seen_completion_ids.add(element["completion_id"])
+            items.append((element["lease_id"],
+                          element["completion_id"], outcome))
+
+        try:
+            results, status_code = self.store.inbox_lease_complete_batch(
+                device_id, items)
+        except InboxLeaseError as error:
+            # Batch-level device failure (unknown/revoked): 409/device_id.
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+        except InboxLeaseCompleteBatchError as error:
+            lease_id, completion_id, _outcome = items[error.index]
+            item_field = f"items[{error.index}]"
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   f"{item_field}.lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    f"{item_field}.lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_UNAVAILABLE:
+                raise ServiceError(
+                    "lease is released or expired and cannot be completed",
+                    f"{item_field}.lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_COMPLETION_CONFLICT:
+                raise ServiceError(
+                    "completion_id is already used on this lease or the "
+                    "lease has already been completed",
+                    f"{item_field}.completion_id", status_code=409)
+            raise ServiceError(
+                "completion_id replays an already committed completion "
+                "and cannot be mixed with first-time items",
+                f"{item_field}.completion_id", status_code=409)
+        body = {"device_id": device_id, "results": results}
+        return body, status_code
 
     def inbox_lease_ack(self, device_id: str,
                         lease_id: str) -> Tuple[Dict[str, Any], int]:
