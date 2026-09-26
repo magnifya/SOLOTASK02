@@ -290,6 +290,13 @@ class MessageLease:
     lifecycle. A completed lease stays on the record as history (the
     completion, renewal and claim replays all answer from it) but no longer
     withholds its messages, and it can neither be renewed nor released.
+
+    ``ack_id`` is ``None`` until a bulk acknowledgement of the lease
+    commits (``POST .../inbox/leases/{lease_id}/ack`` or
+    ``POST /v1/inbox-jobs/ack-batch``); afterwards it freezes the
+    client-chosen id of that acknowledgement, which is only valid on a
+    lease whose completion outcome is ``delivered``. It stays on the
+    record so the same acknowledgement replays byte-identically.
     """
 
     lease_id: str
@@ -298,6 +305,7 @@ class MessageLease:
     released_at: Optional[str] = None
     renewals: List[MessageLeaseRenewal] = field(default_factory=list)
     completion: Optional[MessageLeaseCompletion] = None
+    ack_id: Optional[str] = None
 
 
 @dataclass
