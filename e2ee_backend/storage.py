@@ -3109,6 +3109,48 @@ class DeviceStore:
                 "has_more": after + limit < len(filtered),
             }
 
+    def redelivery_job_get(self, device_id: str, job_id: str
+                           ) -> Dict[str, Any]:
+        """Read one redelivery job's detail with its recovery chain.
+
+        ``GET /v1/devices/{device_id}/inbox-jobs/{job_id}``. Under the one
+        store lock (shared with the job queue/dispatch/recover/cancel
+        operations, lease claims/renewals/releases/completions, acks and
+        revocation) the device is resolved first: an unknown *device_id*
+        raises :class:`RedeliveryJobError` ``device_unknown``
+        (404/device_id at the service layer); a revoked device's jobs stay
+        readable. A never-queued *job_id* raises ``job_not_found``
+        (404/job_id) and an id committed for another device raises
+        ``job_id_conflict`` (409/job_id). On success the body keys are
+        ``job_id``, ``device_id``, ``state``, ``lease_id``, ``recoveries``,
+        ``cancellation_id`` and ``cancelled_at`` in that order;
+        ``recoveries`` keeps the commit order of the job's recovery
+        records, each item ``recovery_id`` then ``lease_id``. The query
+        writes nothing and advances no commit generation, so an unchanged
+        state answers byte-identically.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_UNKNOWN)
+            job = self._redelivery_jobs.get(job_id)
+            if job is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_NOT_FOUND)
+            if job.device_id != device_id:
+                raise RedeliveryJobError(REDELIVERY_JOB_CONFLICT)
+            return {
+                "job_id": job.job_id,
+                "device_id": job.device_id,
+                "state": job.state,
+                "lease_id": job.lease_id,
+                "recoveries": [{
+                    "recovery_id": record.recovery_id,
+                    "lease_id": record.lease_id,
+                } for record in job.recoveries],
+                "cancellation_id": job.cancellation_id,
+                "cancelled_at": job.cancelled_at,
+            }
+
     @staticmethod
     def redelivery_job_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery job, keys in response order."""

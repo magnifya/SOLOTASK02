@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, unquote_to_bytes, urlsplit
 
 from .persistence import PersistenceUnavailable
 from .service import DeviceService, ServiceError
@@ -26,6 +26,32 @@ _PERSISTENCE_INTEGRITY_HISTORY_PAGE_PATH = \
 
 #: Sentinel meaning a 400 for a malformed body was already sent.
 _BAD_REQUEST = object()
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _decode_path_segment(segment: str) -> Optional[str]:
+    """Strictly percent-decode one raw path segment as UTF-8.
+
+    Returns the decoded identifier, or ``None`` when a ``%`` is not
+    followed by exactly two hex digits or the decoded bytes are not valid
+    UTF-8. Unlike :func:`urllib.parse.unquote`, which replaces malformed
+    input, every escape must be well-formed and the result must decode
+    cleanly.
+    """
+    index = 0
+    while True:
+        index = segment.find("%", index)
+        if index == -1:
+            break
+        pair = segment[index + 1:index + 3]
+        if len(pair) != 2 or any(ch not in _HEX_DIGITS for ch in pair):
+            return None
+        index += 3
+    try:
+        return unquote_to_bytes(segment).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 class DeviceHTTPHandler(BaseHTTPRequestHandler):
@@ -376,6 +402,19 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                           "field": "device_id"})
                     return
                 self._handle_device_inbox_wait(unquote(device_id))
+                return
+            if "/inbox-jobs/" in suffix:
+                # {device_id}/inbox-jobs/{job_id} — split on raw slashes
+                # only; a percent-encoded slash inside an id segment is
+                # part of it. This exact pattern has no other handler, so
+                # a mismatch is simply not this route.
+                head, _, job_segment = suffix.partition("/inbox-jobs/")
+                if head and "/" not in head and job_segment \
+                        and "/" not in job_segment:
+                    self._handle_device_inbox_job_get(head, job_segment)
+                    return
+                self._send_json(404, {"message": "device not found",
+                                      "field": "device_id"})
                 return
             if suffix.endswith("/inbox-jobs"):
                 device_id = suffix[:-len("/inbox-jobs")]
@@ -1045,6 +1084,53 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body = self.service.inbox_jobs_page(device_id, state, after,
                                                 limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_device_inbox_job_get(
+            self, device_segment: str, job_segment: str) -> None:
+        # The job detail query takes no request body and no query
+        # parameters: either one is a 400 (field request_body / query).
+        # keep_blank_values so a bare ``?foo`` flag is an actual
+        # (malformed) parameter rather than being silently dropped; a
+        # trailing ``?`` with no parameter at all is accepted. Both path
+        # identifiers are then strictly percent-decoded as UTF-8; a bad
+        # escape or invalid encoding is a 400 naming its own segment.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        device_id = _decode_path_segment(device_segment)
+        if device_id is None:
+            self._send_json(400, {"message": "device_id is not valid "
+                                             "percent-encoded UTF-8",
+                                  "field": "device_id"})
+            return
+        job_id = _decode_path_segment(job_segment)
+        if job_id is None:
+            self._send_json(400, {"message": "job_id is not valid "
+                                             "percent-encoded UTF-8",
+                                  "field": "job_id"})
+            return
+        try:
+            body = self.service.inbox_job_get(device_id, job_id)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
