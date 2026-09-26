@@ -180,6 +180,10 @@ INBOX_LEASE_ACK_PARTIAL_REPLAY = "ack_partial_replay"
 #: committed renewals; the batch is atomic, so a partial replay conflicts
 #: (409/items[i].renewal_id of the first replayed item).
 INBOX_LEASE_RENEW_PARTIAL_REPLAY = "renew_partial_replay"
+#: A release-batch mixed first-time items with exact replays of already
+#: committed releases; the batch is atomic, so a partial replay conflicts
+#: (409/items[i].lease_id of the first replayed item).
+INBOX_LEASE_RELEASE_PARTIAL_REPLAY = "release_partial_replay"
 
 #: Lifetime of one inbox redelivery lease, in seconds. A message leased by a
 #: claim is withheld from later claims until this deadline passes, after
@@ -502,6 +506,25 @@ class InboxLeaseRenewBatchError(Exception):
     409/items[i].lease_id) plus ``renew_partial_replay`` for a batch
     mixing first-time items with exact replays of already committed
     renewals.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
+class InboxLeaseReleaseBatchError(Exception):
+    """A batch 1:1-inbox lease release failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the whole batch
+    writes nothing. Reasons are the per-lease :class:`InboxLeaseError`
+    release reasons (``lease_not_found`` -> 404/items[i].lease_id,
+    ``lease_id_conflict`` / ``lease_unavailable`` ->
+    409/items[i].lease_id) plus ``release_partial_replay`` for a batch
+    mixing first-time items with exact replays of already committed
+    releases.
     """
 
     def __init__(self, reason: str, index: int) -> None:
@@ -2715,6 +2738,133 @@ class DeviceStore:
             return ({"device_id": device_id, "lease_id": lease_id,
                      "released_at": released_at,
                      "released_count": len(keys)}, 201)
+
+    def inbox_lease_release_batch(
+            self, device_id: str,
+            items: List[str]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Atomically release many 1:1-inbox leases of one device.
+
+        ``POST /v1/inbox-jobs/release-batch``; *items* are ``lease_id``
+        strings already validated for shape and uniqueness (no ``lease_id``
+        repeats) by the service. Under the one store lock — shared with
+        claims, the single release, renewals, completions, acks, retries,
+        redelivery jobs and revocation — the device is resolved first
+        (unknown/revoked -> :class:`InboxLeaseError`
+        ``device_unknown``/``device_inactive``, 409/device_id).
+
+        Every item is then prechecked in input order, the first failure
+        raising :class:`InboxLeaseReleaseBatchError` carrying that item's
+        index and writing nothing: a never-committed ``lease_id`` raises
+        ``lease_not_found`` (404/items[i].lease_id), a lease owned by
+        another device ``lease_id_conflict`` (409/items[i].lease_id), and
+        a first-time release naming an already completed lease
+        ``lease_unavailable`` (409/items[i].lease_id). An already-released
+        lease is an exact replay: it skips the completion check and
+        answers with its frozen release timestamp — expiry alone never
+        blocks a first release, exactly as the single-lease entry.
+
+        Only after every item passes does the batch resolve: when every
+        item is such a replay the frozen first responses are returned with
+        200 and nothing is written (no persistence notification, no
+        commit_seq advance); a mix of replays and first-time items cannot
+        be applied atomically and raises ``release_partial_replay`` for
+        the first replayed item (409/items[i].lease_id). Otherwise every
+        first-time lease is released in input order, the same UTC
+        ``released_at`` (six microsecond digits, ``+00:00``) stamped onto
+        every delivery record each lease was taken on. The whole batch
+        commits with one persistence notification (201, commit_seq + 1; a
+        durable write failure rolls every record back). Returns
+        ``(results, status_code)`` with one three-field
+        (``lease_id``/``released_at``/``released_count``) result per item,
+        in input order (replays carry their frozen values);
+        ``released_count`` is the number of messages the lease claimed.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            # Resolve every lease once: first-seen is authoritative
+            # (restore validation keeps the per-delivery copies identical).
+            resolved: List[List[Tuple[str, str]]] = []
+            replays: List[bool] = []
+            frozen: List[Optional[str]] = []
+            for index, lease_id in enumerate(items):
+                existing = self._find_inbox_lease_locked(lease_id)
+                if existing is None:
+                    raise InboxLeaseReleaseBatchError(
+                        INBOX_LEASE_NOT_FOUND, index)
+                owner, _limit, _deadline, released_at, keys = existing
+                # A cross-device release is a conflict regardless of the
+                # path device's current state, mirroring the claim replay
+                # rules.
+                if owner != device_id:
+                    raise InboxLeaseReleaseBatchError(
+                        INBOX_LEASE_CONFLICT, index)
+                resolved.append(keys)
+                if released_at is not None:
+                    # Exact replay: the frozen first response, however
+                    # stale the request; the release check is skipped just
+                    # like the single-lease entry skips it.
+                    replays.append(True)
+                    frozen.append(released_at)
+                    continue
+                replays.append(False)
+                frozen.append(None)
+                # A completed lease has ended its lifecycle: its completion
+                # is its terminal record and a first release cannot follow
+                # it (409/items[i].lease_id). Expiry alone does not block
+                # a release.
+                completed = False
+                for key in keys:
+                    state = self._delivery.get(key)
+                    if state is None:
+                        continue
+                    if any(lease.lease_id == lease_id
+                           and lease.completion is not None
+                           for lease in state.leases):
+                        completed = True
+                        break
+                if completed:
+                    raise InboxLeaseReleaseBatchError(
+                        INBOX_LEASE_UNAVAILABLE, index)
+            if all(replays):
+                # Every item replays a committed release: answer the frozen
+                # responses with 200 and write nothing (no persistence
+                # notification, no commit_seq advance).
+                return [
+                    {"lease_id": lease_id, "released_at": released_at,
+                     "released_count": len(keys)}
+                    for lease_id, released_at, keys
+                    in zip(items, frozen, resolved)
+                ], 200
+            if any(replays):
+                # A partial replay cannot commit atomically: the batch is
+                # all-or-nothing, so the first replayed item conflicts.
+                raise InboxLeaseReleaseBatchError(
+                    INBOX_LEASE_RELEASE_PARTIAL_REPLAY, replays.index(True))
+            # Every first-time item shares the one batch release timestamp.
+            released_at = datetime.now(timezone.utc) \
+                .isoformat(timespec="microseconds")
+            for lease_id, keys in zip(items, resolved):
+                for key in keys:
+                    state = self._delivery.get(key)
+                    if state is None:
+                        continue
+                    for lease in state.leases:
+                        if lease.lease_id == lease_id:
+                            lease.released_at = released_at
+            # One persistence notification for the whole batch: every
+            # per-message release commits (or rolls back) together and the
+            # generation advances exactly once.
+            self._notify_change()
+            return [
+                {"lease_id": lease_id, "released_at": released_at,
+                 "released_count": len(keys)}
+                for lease_id, keys in zip(items, resolved)
+            ], 201
 
     def inbox_lease_renew(
             self, device_id: str, lease_id: str, renewal_id: str
