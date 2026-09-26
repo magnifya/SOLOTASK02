@@ -1852,6 +1852,39 @@ class DeviceService:
                                "device_id", status_code=404)
         return page
 
+    def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
+        """Return one redelivery job's detail with its recovery chain.
+
+        ``GET /v1/devices/{device_id}/inbox-jobs/{job_id}``. The GET takes
+        no request body (the HTTP layer rejects a non-empty one with
+        400/field ``request_body``) and no query parameters (any is
+        400/field ``query``); the two path identifiers are single
+        non-empty segments strictly percent-decoded as UTF-8 by the HTTP
+        layer. An unknown device is 404/field ``device_id`` and a revoked
+        device's jobs stay readable; a never-queued job is 404/field
+        ``job_id`` and a job committed for another device is 409/field
+        ``job_id``. The lookup is purely read-only (no write, no
+        ``commit_seq`` change). On success the body keys are ``job_id``,
+        ``device_id``, ``state``, ``lease_id``, ``recoveries``,
+        ``cancellation_id`` and ``cancelled_at`` in that order;
+        ``recoveries`` keeps commit order, each item ``recovery_id`` then
+        ``lease_id`` (string or null).
+        """
+        try:
+            return self.store.redelivery_job_get(device_id, job_id)
+        except RedeliveryJobError as error:
+            if error.reason == REDELIVERY_JOB_DEVICE_UNKNOWN:
+                raise ServiceError(f"device not found: {device_id}",
+                                   "device_id", status_code=404)
+            if error.reason == REDELIVERY_JOB_NOT_FOUND:
+                raise ServiceError(f"job not found: {job_id}",
+                                   "job_id", status_code=404)
+            if error.reason == REDELIVERY_JOB_CONFLICT:
+                raise ServiceError(
+                    "job_id is owned by another device",
+                    "job_id", status_code=409)
+            raise
+
     def inbox_job(self, payload: object) -> Tuple[Dict[str, Any], int]:
         """Validate and apply one 1:1-inbox redelivery job operation.
 

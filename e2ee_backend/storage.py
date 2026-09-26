@@ -3110,6 +3110,64 @@ class DeviceStore:
             }
 
     @staticmethod
+    def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
+        """The wire view of one redelivery-job detail, keys in response order.
+
+        Unlike :meth:`redelivery_job_view` (the four-key view returned by
+        the mutating ``POST /v1/inbox-jobs`` operations), this carries the
+        committed ``recoveries`` chain in commit order and the two
+        cancellation fields, exactly as persisted.
+        """
+        return {
+            "job_id": job.job_id,
+            "device_id": job.device_id,
+            "state": job.state,
+            "lease_id": job.lease_id,
+            "recoveries": [{
+                "recovery_id": record.recovery_id,
+                "lease_id": record.lease_id,
+            } for record in job.recoveries],
+            "cancellation_id": job.cancellation_id,
+            "cancelled_at": job.cancelled_at,
+        }
+
+    def redelivery_job_get(self, device_id: str,
+                           job_id: str) -> Dict[str, Any]:
+        """Read one 1:1-inbox redelivery job's detail (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox-jobs/{job_id}``. Under the one
+        store lock (shared with the job queue/dispatch/recover/cancel
+        operations, lease claims/renewals/releases/completions, acks and
+        revocation) the path device is resolved first — an unknown device
+        raises :class:`RedeliveryJobError` ``device_unknown``
+        (404/device_id). A never-queued *job_id* raises ``job_not_found``
+        (404/job_id) and an id committed for another device raises
+        ``job_id_conflict`` (409/job_id). A revoked device's jobs and a
+        cancelled job stay inspectable: the lookup deliberately performs no
+        active-state check, so it never raises ``device_inactive``.
+
+        On success the body keys are ``job_id``, ``device_id``, ``state``,
+        ``lease_id``, ``recoveries``, ``cancellation_id`` and
+        ``cancelled_at`` in that order; ``recoveries`` lists the committed
+        recovery chain in commit order, each item ``recovery_id`` then
+        ``lease_id`` (a non-empty recovery names its lease, an
+        empty-selection terminal recovery carries null). The lookup writes
+        nothing and advances no commit generation, so an unchanged state
+        answers byte-identically and a rebuild after restart yields the same
+        result.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_UNKNOWN)
+            job = self._redelivery_jobs.get(job_id)
+            if job is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_NOT_FOUND)
+            if job.device_id != device_id:
+                raise RedeliveryJobError(REDELIVERY_JOB_CONFLICT)
+            return self.redelivery_job_detail_view(job)
+
+    @staticmethod
     def redelivery_job_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery job, keys in response order."""
         return {

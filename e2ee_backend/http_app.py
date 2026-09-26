@@ -27,6 +27,44 @@ _PERSISTENCE_INTEGRITY_HISTORY_PAGE_PATH = \
 #: Sentinel meaning a 400 for a malformed body was already sent.
 _BAD_REQUEST = object()
 
+#: ASCII hexadecimal digits, for validating percent escapes strictly.
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _strict_percent_decode(segment: str) -> Optional[str]:
+    """Percent-decode one raw path segment strictly as UTF-8.
+
+    The request target reaches the handler decoded as ISO-8859-1 (see
+    :meth:`BaseHTTPRequestHandler.parse_request`), so each character of
+    *segment* stands for one raw byte 0..255. Every ``%`` must introduce a
+    well-formed escape (two hexadecimal digits) — a stray ``%`` or a
+    truncated escape is rejected — and the decoded bytes must be valid
+    UTF-8. A percent-encoded slash (``%2F``/``%2F``) decodes to an
+    ordinary ``/`` that stays part of the identifier; routing splits on
+    raw slashes only. Returns the decoded text, or ``None`` for a bad
+    escape or an invalid UTF-8 encoding.
+    """
+    raw = bytearray()
+    index = 0
+    size = len(segment)
+    while index < size:
+        char = segment[index]
+        if char == "%":
+            if index + 2 >= size \
+                    or segment[index + 1] not in _HEX_DIGITS \
+                    or segment[index + 2] not in _HEX_DIGITS:
+                return None
+            raw.append(int(segment[index + 1:index + 3], 16))
+            index += 3
+        else:
+            # ISO-8859-1 decoding means each character is one raw byte.
+            raw.append(ord(char))
+            index += 1
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
 
 class DeviceHTTPHandler(BaseHTTPRequestHandler):
     """Routes for ``POST /v1/devices`` and ``GET /v1/devices/{device_id}``."""
@@ -376,6 +414,35 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                           "field": "device_id"})
                     return
                 self._handle_device_inbox_wait(unquote(device_id))
+                return
+            if "/inbox-jobs/" in suffix:
+                # {device_id}/inbox-jobs/{job_id} — split on raw slashes
+                # only; a percent-encoded slash inside an id segment is
+                # part of it. Both segments must be non-empty and
+                # strictly percent-decodable as UTF-8; a bad escape or an
+                # invalid encoding is 400 with the offending segment as
+                # field.
+                head, _, job_segment = suffix.partition("/inbox-jobs/")
+                if head and "/" not in head and job_segment \
+                        and "/" not in job_segment:
+                    device_id = _strict_percent_decode(head)
+                    if device_id is None:
+                        self._send_json(400, {
+                            "message": "device_id has a malformed percent "
+                                       "escape or is not valid UTF-8",
+                            "field": "device_id"})
+                        return
+                    job_id = _strict_percent_decode(job_segment)
+                    if job_id is None:
+                        self._send_json(400, {
+                            "message": "job_id has a malformed percent "
+                                       "escape or is not valid UTF-8",
+                            "field": "job_id"})
+                        return
+                    self._handle_device_inbox_job_get(device_id, job_id)
+                    return
+                self._send_json(404, {"message": "device not found",
+                                      "field": "device_id"})
                 return
             if suffix.endswith("/inbox-jobs"):
                 device_id = suffix[:-len("/inbox-jobs")]
@@ -1045,6 +1112,41 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body = self.service.inbox_jobs_page(device_id, state, after,
                                                 limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_device_inbox_job_get(
+            self, device_id: str, job_id: str) -> None:
+        # The job detail query takes no request body and no query
+        # parameters: either one is a 400 (field request_body / query).
+        # The two path identifiers are already strictly percent-decoded as
+        # UTF-8 by the router (a bad escape is 400 with the offending
+        # segment). keep_blank_values so a bare ``?foo`` flag is an actual
+        # (unknown) parameter rather than being silently dropped, while a
+        # trailing ``?`` with no parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        try:
+            body = self.service.inbox_job_get(device_id, job_id)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
