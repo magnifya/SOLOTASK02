@@ -533,6 +533,22 @@ class InboxLeaseReleaseBatchError(Exception):
         self.index = index
 
 
+class InboxLeaseStatusBatchError(Exception):
+    """A read-only batch 1:1-inbox lease status query failed at one item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the query never
+    writes. Reasons are ``lease_not_found`` (a lease_id was never
+    committed -> 404/items[i].lease_id) and ``lease_id_conflict`` (the
+    lease belongs to another device -> 409/items[i].lease_id).
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
 class RedeliveryJobError(Exception):
     """A 1:1-inbox redelivery job operation failed; nothing was written.
 
@@ -3718,6 +3734,93 @@ class DeviceStore:
                 "next_after": next_after,
                 "has_more": after + limit < len(filtered),
             }
+
+    def inbox_lease_status_batch(
+            self, device_id: str, lease_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Read many 1:1-inbox leases' current states in one request.
+
+        ``POST /v1/inbox-jobs/lease-status-batch``; *lease_ids* are
+        non-empty strings already validated for shape and uniqueness (no
+        repeats) by the service. Under the one store lock — shared with
+        claims, renewals, releases, completions, acks, retries, redelivery
+        jobs and revocation — the device is resolved first
+        (unknown/revoked -> :class:`InboxLeaseError`
+        ``device_unknown``/``device_inactive``, 409/device_id). Every item
+        is then prechecked in array order at one uniform batch instant, the
+        first failure raising :class:`InboxLeaseStatusBatchError` carrying
+        that item's index: a never-committed ``lease_id`` raises
+        ``lease_not_found`` (404/items[i].lease_id) and a lease owned by
+        another device ``lease_id_conflict`` (409/items[i].lease_id).
+
+        The query is purely read-only: nothing is created, released or
+        advanced, no persistence notification is produced and no
+        commit_seq generation is consumed, so an unchanged state answers
+        byte-identically and a rebuild after restart yields the same
+        results. Results keep the input order; each item is
+        ``lease_id``/``state``/``leased_until``/``released_at``/
+        ``completion``/``message_count`` with the state, effective deadline
+        (the last renewal's value, or the claim value without renewals),
+        release timestamp, completion object (``None`` or
+        ``completion_id``/``outcome``/``completed_at``) and claimed-message
+        count decided exactly as in :meth:`inbox_lease_get` — a completion
+        wins, then a release, then active while the effective deadline is
+        still in the future, else expired.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            results: List[Dict[str, Any]] = []
+            for index, lease_id in enumerate(lease_ids):
+                existing = self._find_inbox_lease_locked(lease_id)
+                if existing is None:
+                    raise InboxLeaseStatusBatchError(
+                        INBOX_LEASE_NOT_FOUND, index)
+                owner, _limit, _claim_deadline, _released, ordered_keys = \
+                    existing
+                # A cross-device lookup is a conflict regardless of the
+                # body device's current state, mirroring the single-lease
+                # status route.
+                if owner != device_id:
+                    raise InboxLeaseStatusBatchError(
+                        INBOX_LEASE_CONFLICT, index)
+                # The lease copies on every delivery record are identical
+                # by restore validation; the first one (in inbox order) is
+                # authoritative for the lifecycle fields.
+                first_lease = next(
+                    item for item
+                    in self._delivery[ordered_keys[0]].leases
+                    if item.lease_id == lease_id)
+                if first_lease.completion is not None:
+                    state = "completed"
+                elif first_lease.released_at is not None:
+                    state = "released"
+                elif self._lease_is_active_locked(first_lease, now):
+                    state = "active"
+                else:
+                    state = "expired"
+                # Current effective deadline: the claim value, or the last
+                # renewal's after one or more renewals.
+                leased_until = first_lease.renewals[-1].leased_until \
+                    if first_lease.renewals else first_lease.leased_until
+                completion = None if first_lease.completion is None else {
+                    "completion_id": first_lease.completion.completion_id,
+                    "outcome": first_lease.completion.outcome,
+                    "completed_at": first_lease.completion.completed_at,
+                }
+                results.append({
+                    "lease_id": lease_id,
+                    "state": state,
+                    "leased_until": leased_until,
+                    "released_at": first_lease.released_at,
+                    "completion": completion,
+                    "message_count": len(ordered_keys),
+                })
+            return results
 
     def redelivery_jobs_page(self, device_id: str, state_filter: str,
                              after: int, limit: int
