@@ -218,6 +218,11 @@ REDELIVERY_JOB_RECOVERY_PARTIAL_REPLAY = "partial_replay"
 #: committed cancellations; the batch is atomic, so a partial replay
 #: conflicts (409/items[i].cancellation_id of the first replayed item).
 REDELIVERY_JOB_CANCEL_PARTIAL_REPLAY = "cancel_partial_replay"
+#: A dispatch-batch mixed first-time (pending) items with replays of
+#: already dispatched (non-pending) jobs; the batch is atomic, so a
+#: partial replay conflicts (409/items[i].job_id of the first replayed
+#: item).
+REDELIVERY_JOB_DISPATCH_PARTIAL_REPLAY = "dispatch_partial_replay"
 
 #: Number of inbox messages one redelivery-job dispatch leases at most.
 REDELIVERY_JOB_DISPATCH_LIMIT = 100
@@ -476,6 +481,23 @@ class RedeliveryJobCancelBatchError(Exception):
     :class:`RedeliveryJobError` cancel reasons plus
     ``cancel_partial_replay`` for a batch mixing first-time items with
     exact replays of committed cancellations.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
+class RedeliveryJobDispatchBatchError(Exception):
+    """A batch redelivery-job dispatch failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the whole batch
+    writes nothing. Reasons are the per-item
+    :class:`RedeliveryJobError` dispatch reasons plus
+    ``dispatch_partial_replay`` for a batch mixing first-time (pending)
+    items with replays of already dispatched jobs.
     """
 
     def __init__(self, reason: str, index: int) -> None:
@@ -3258,40 +3280,154 @@ class DeviceStore:
             # dispatch rather than corrupting the lease namespace.
             if self._find_inbox_lease_locked(job_id) is not None:
                 raise RedeliveryJobError(REDELIVERY_JOB_LEASE_OCCUPIED)
-            picked: List[Tuple[Tuple[str, str], Message]] = []
-            for _, session_id, message in self._inbox_entries_locked(
-                    device_id):
-                key = (session_id, message.message_id)
-                state = self._delivery.get(key)
-                if state is not None \
-                        and self._has_active_lease_locked(state, now):
-                    continue
-                picked.append((key, message))
-                if len(picked) >= REDELIVERY_JOB_DISPATCH_LIMIT:
-                    break
-            if picked:
-                # timespec="microseconds" always emits six fractional
-                # digits, mirroring the claim endpoint's deadlines.
-                leased_until = (now + timedelta(
-                    seconds=INBOX_LEASE_SECONDS)) \
-                    .isoformat(timespec="microseconds")
-                for key, _message in picked:
-                    state = self._delivery.get(key)
-                    if state is None:
-                        state = MessageDelivery()
-                        self._delivery[key] = state
-                    state.leases.append(MessageLease(
-                        lease_id=job_id,
-                        limit=REDELIVERY_JOB_DISPATCH_LIMIT,
-                        leased_until=leased_until))
-                job.state = REDELIVERY_JOB_RUNNING
-                job.lease_id = job_id
-            else:
-                # Nothing to redeliver: the job succeeds immediately and
-                # never takes a lease.
-                job.state = REDELIVERY_JOB_SUCCEEDED
+            # timespec="microseconds" always emits six fractional digits,
+            # mirroring the claim endpoint's deadlines.
+            leased_until = (now + timedelta(
+                seconds=INBOX_LEASE_SECONDS)) \
+                .isoformat(timespec="microseconds")
+            self._redelivery_job_apply_dispatch_locked(
+                job, now, leased_until)
             self._notify_change()
             return self.redelivery_job_view(job), 201
+
+    def _redelivery_job_apply_dispatch_locked(
+            self, job: RedeliveryJob, now: datetime,
+            leased_until: str) -> None:
+        """Lease one pending job's dispatch selection and move its state.
+
+        Lock required; the caller guarantees *job* is ``pending`` and its
+        ``job_id`` is free as an inbox lease id. The inbox's fixed
+        ``(session.created_at, session_id, sequence)`` order yields up to
+        :data:`REDELIVERY_JOB_DISPATCH_LIMIT` unacked messages without a
+        still-active lease at *now*. A non-empty selection is leased for
+        the usual :data:`INBOX_LEASE_SECONDS` window under a lease whose id
+        is the ``job_id`` itself (deadline *leased_until*): the job moves
+        to ``running`` with ``lease_id`` set. An empty selection ends the
+        job straight as ``succeeded`` with ``lease_id`` null.
+        """
+        picked: List[Tuple[str, str]] = []
+        for _, session_id, message in self._inbox_entries_locked(
+                job.device_id):
+            key = (session_id, message.message_id)
+            state = self._delivery.get(key)
+            if state is not None \
+                    and self._has_active_lease_locked(state, now):
+                continue
+            picked.append(key)
+            if len(picked) >= REDELIVERY_JOB_DISPATCH_LIMIT:
+                break
+        if picked:
+            for key in picked:
+                state = self._delivery.get(key)
+                if state is None:
+                    state = MessageDelivery()
+                    self._delivery[key] = state
+                state.leases.append(MessageLease(
+                    lease_id=job.job_id,
+                    limit=REDELIVERY_JOB_DISPATCH_LIMIT,
+                    leased_until=leased_until))
+            job.state = REDELIVERY_JOB_RUNNING
+            job.lease_id = job.job_id
+        else:
+            # Nothing to redeliver: the job succeeds immediately and
+            # never takes a lease.
+            job.state = REDELIVERY_JOB_SUCCEEDED
+
+    def redelivery_job_dispatch_batch(
+            self, device_id: str, items: List[str]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Atomically dispatch many pending redelivery jobs of one device.
+
+        ``POST /v1/inbox-jobs/dispatch-batch``; *items* are ``job_id``
+        strings already validated for shape and uniqueness by the service.
+        Under the one store lock — shared with leases, completions, acks
+        and revocation — the device is resolved first (unknown/revoked ->
+        :class:`RedeliveryJobError` ``device_unknown``/``device_inactive``,
+        409/device_id).
+
+        Every item is then prechecked in input order with exactly the
+        single-job ``op=dispatch`` rules, the first failure raising
+        :class:`RedeliveryJobDispatchBatchError` carrying that item's index
+        and writing nothing: a never-queued ``job_id`` raises
+        ``job_not_found`` (404/items[i].job_id), a job of another device
+        ``job_id_conflict`` (409/items[i].job_id), and a pending job whose
+        ``job_id`` is already occupied as an inbox lease id
+        ``lease_occupied`` (409/items[i].job_id). A non-``pending`` job is
+        an exact dispatch replay (the single-job entry answers it 200
+        without writing) and skips the lease-occupancy check.
+
+        Only after every item passes does the batch resolve: when all
+        items are replays the jobs' current views are returned with 200
+        and nothing is written; a mix of replays and first-time (pending)
+        items cannot be applied atomically and raises
+        ``dispatch_partial_replay`` for the first replayed item
+        (409/items[i].job_id). Otherwise each job is dispatched in input
+        order via :meth:`_redelivery_job_apply_dispatch_locked` — earlier
+        items' fresh leases already withhold their messages from later
+        items — and the whole batch commits with one persistence
+        notification (201, commit_seq + 1; a durable write failure rolls
+        every job and lease back). Returns ``(results, status_code)`` with
+        one three-key (``job_id``/``state``/``lease_id``) view per item,
+        in input order.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            device = self._find_device(device_id)
+            if device is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_INACTIVE)
+            jobs: List[RedeliveryJob] = []
+            replays: List[bool] = []
+            for index, job_id in enumerate(items):
+                job = self._redelivery_jobs.get(job_id)
+                if job is not None and job.device_id != device_id:
+                    raise RedeliveryJobDispatchBatchError(
+                        REDELIVERY_JOB_CONFLICT, index)
+                if job is None:
+                    raise RedeliveryJobDispatchBatchError(
+                        REDELIVERY_JOB_NOT_FOUND, index)
+                jobs.append(job)
+                # A dispatch replayed on a non-pending job returns the
+                # current view and writes nothing (mirroring the
+                # single-job entry); only a pending job is applied.
+                if job.state != REDELIVERY_JOB_PENDING:
+                    replays.append(True)
+                    continue
+                replays.append(False)
+                # The dispatch lease takes the job_id as its lease_id.
+                # Within one batch the ids are already unique (the service
+                # rejects duplicates) and no item has been applied yet, so
+                # the committed state decides.
+                if self._find_inbox_lease_locked(job_id) is not None:
+                    raise RedeliveryJobDispatchBatchError(
+                        REDELIVERY_JOB_LEASE_OCCUPIED, index)
+            if all(replays):
+                # Every item replays a committed dispatch: answer the
+                # current views with 200 and write nothing (no persistence
+                # notification, no commit_seq advance).
+                return [self._redelivery_job_batch_item_view(job)
+                        for job in jobs], 200
+            if any(replays):
+                # A partial replay cannot commit atomically: the batch is
+                # all-or-nothing, so the first replayed item conflicts.
+                raise RedeliveryJobDispatchBatchError(
+                    REDELIVERY_JOB_DISPATCH_PARTIAL_REPLAY,
+                    replays.index(True))
+            # One deadline for the whole batch: every item commits in the
+            # same locked transaction, mirroring the single dispatch's
+            # timespec="microseconds" rendering.
+            leased_until = (now + timedelta(seconds=INBOX_LEASE_SECONDS)) \
+                .isoformat(timespec="microseconds")
+            for job in jobs:
+                self._redelivery_job_apply_dispatch_locked(
+                    job, now, leased_until)
+            # One persistence notification for the whole batch: every job
+            # and lease commits (or rolls back) together and the
+            # generation advances exactly once.
+            self._notify_change()
+            return [self._redelivery_job_batch_item_view(job)
+                    for job in jobs], 201
 
     def redelivery_job_cancel(
             self, device_id: str, job_id: str, cancellation_id: str
@@ -3614,8 +3750,8 @@ class DeviceStore:
                 # Every item replays its committed recovery: answer the
                 # current views with 200 and write nothing (no persistence
                 # notification, no commit_seq advance).
-                return [self._recover_batch_item_view(job) for job in jobs], \
-                    200
+                return [self._redelivery_job_batch_item_view(job)
+                        for job in jobs], 200
             if any(replays):
                 # A partial replay cannot commit atomically: the batch is
                 # all-or-nothing, so the first replayed item conflicts.
@@ -3634,11 +3770,12 @@ class DeviceStore:
             # and lease commits (or rolls back) together and the generation
             # advances exactly once.
             self._notify_change()
-            return [self._recover_batch_item_view(job) for job in jobs], 201
+            return [self._redelivery_job_batch_item_view(job)
+                    for job in jobs], 201
 
     @staticmethod
-    def _recover_batch_item_view(job: RedeliveryJob) -> Dict[str, Any]:
-        """One recover-batch result item, keys in response order."""
+    def _redelivery_job_batch_item_view(job: RedeliveryJob) -> Dict[str, Any]:
+        """One job-batch result item, keys in response order."""
         return {
             "job_id": job.job_id,
             "state": job.state,
@@ -3723,8 +3860,8 @@ class DeviceStore:
                 # Every item replays its committed cancellation: answer
                 # the current views with 200 and write nothing (no
                 # persistence notification, no commit_seq advance).
-                return [self._recover_batch_item_view(job) for job in jobs], \
-                    200
+                return [self._redelivery_job_batch_item_view(job)
+                        for job in jobs], 200
             if any(replays):
                 # A partial replay cannot commit atomically: the batch is
                 # all-or-nothing, so the first replayed item conflicts.
@@ -3742,7 +3879,8 @@ class DeviceStore:
             # and lease commits (or rolls back) together and the
             # generation advances exactly once.
             self._notify_change()
-            return [self._recover_batch_item_view(job) for job in jobs], 201
+            return [self._redelivery_job_batch_item_view(job)
+                    for job in jobs], 201
 
     def _redelivery_job_apply_cancel_locked(
             self, job: RedeliveryJob, cancellation_id: str,
