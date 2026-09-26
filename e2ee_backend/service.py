@@ -83,6 +83,7 @@ from .storage import (
     REDELIVERY_JOB_LEASE_OCCUPIED,
     REDELIVERY_JOB_NOT_FOUND,
     REDELIVERY_JOB_CANCELLATION_CONFLICT,
+    REDELIVERY_JOB_CANCEL_PARTIAL_REPLAY,
     REDELIVERY_JOB_CANCEL_STATE,
     REDELIVERY_JOB_RECOVERY_CONFLICT,
     REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE,
@@ -124,6 +125,7 @@ from .storage import (
     PreKeyClaimError,
     PreKeyBatchClaimError,
     RedeliveryJobError,
+    RedeliveryJobCancelBatchError,
     RedeliveryJobRecoverBatchError,
     SessionCreateError,
 )
@@ -2167,6 +2169,151 @@ class DeviceService:
                 "recovery_id replays an already committed recovery and "
                 "cannot be mixed with first-time items",
                 f"{item_field}.recovery_id", status_code=409)
+        body = {"device_id": device_id, "results": results}
+        return body, status_code
+
+    def inbox_job_cancel_batch(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and atomically apply a batch of redelivery-job cancels.
+
+        ``POST /v1/inbox-jobs/cancel-batch``. The body must be a JSON
+        object carrying exactly a non-empty string ``device_id`` and a
+        non-empty ``items`` array (any other top-level key is
+        400/that field); each item is an object carrying exactly a
+        non-empty string ``job_id`` and ``cancellation_id``, and neither
+        field may repeat across items. Shape errors are reported, in
+        order, as 400/field ``request_body`` (bad/non-object body),
+        ``device_id`` (missing/empty/non-string), ``items``
+        (missing/not-a-non-empty array), ``items[i]`` (non-object
+        element, an unexpected key, or a repeated ``job_id``/
+        ``cancellation_id``) or ``items[i].job_id`` /
+        ``items[i].cancellation_id`` for the offending field.
+
+        The device is then resolved (unknown/revoked -> 409/field
+        ``device_id``) and every item is prechecked in array order with
+        the single-job ``op=cancel`` rules, the first error aborting the
+        whole batch with nothing written and its ``field`` prefixed to
+        ``items[i].``: an unknown job is 404/``items[i].job_id``, a job
+        of another device or a ``succeeded``/``failed`` terminal job is
+        409/``items[i].job_id``, and an already cancelled job named under
+        a different ``cancellation_id`` is
+        409/``items[i].cancellation_id``. An item replaying its own
+        committed cancellation skips those checks; when every item is
+        such a replay the batch answers 200 with the current views and
+        writes nothing, and a mix of replays and first-time items
+        conflicts 409 with the first replayed item's
+        ``items[i].cancellation_id``.
+
+        A first-time batch cancels every job in input order — a pending
+        job is cancelled directly, a running job also releases its
+        current lease so the messages can be claimed again — and commits
+        once (201). The body keys are ``device_id`` then ``results``;
+        results keep input order and each item is ``job_id``, ``state``,
+        ``lease_id`` in that order.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id",
+                               "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        device_id = payload["device_id"]
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+        # The body carries exactly device_id and items; any other
+        # top-level key is 400 with that field (the first extra key, in
+        # payload order), mirroring the single-job op=cancel tightening.
+        extras = [key for key in payload
+                  if key not in ("device_id", "items")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+
+        items: List[Tuple[str, str]] = []
+        seen_job_ids: set = set()
+        seen_cancellation_ids: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            # Each item carries exactly job_id and cancellation_id; any
+            # other key is 400 at the item level (items[i]).
+            if any(key not in ("job_id", "cancellation_id")
+                   for key in element):
+                raise ServiceError(
+                    "array element must carry only job_id and "
+                    f"cancellation_id: {item_field}", item_field)
+            job_field = f"{item_field}.job_id"
+            if "job_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {job_field}", job_field)
+            if not is_nonempty_string(element["job_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {job_field}",
+                    job_field)
+            cancellation_field = f"{item_field}.cancellation_id"
+            if "cancellation_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {cancellation_field}",
+                    cancellation_field)
+            if not is_nonempty_string(element["cancellation_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: "
+                    f"{cancellation_field}", cancellation_field)
+            if element["job_id"] in seen_job_ids:
+                raise ServiceError(
+                    "duplicate job_id in items: "
+                    f"{element['job_id']}", item_field)
+            if element["cancellation_id"] in seen_cancellation_ids:
+                raise ServiceError(
+                    "duplicate cancellation_id in items: "
+                    f"{element['cancellation_id']}", item_field)
+            seen_job_ids.add(element["job_id"])
+            seen_cancellation_ids.add(element["cancellation_id"])
+            items.append((element["job_id"], element["cancellation_id"]))
+
+        try:
+            results, status_code = self.store.redelivery_job_cancel_batch(
+                device_id, items)
+        except RedeliveryJobError as error:
+            # Batch-level device failure (unknown/revoked): 409/device_id.
+            if error.reason == REDELIVERY_JOB_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+        except RedeliveryJobCancelBatchError as error:
+            job_id, cancellation_id = items[error.index]
+            item_field = f"items[{error.index}]"
+            if error.reason == REDELIVERY_JOB_NOT_FOUND:
+                raise ServiceError(f"job not found: {job_id}",
+                                   f"{item_field}.job_id", status_code=404)
+            if error.reason == REDELIVERY_JOB_CONFLICT:
+                raise ServiceError(
+                    "job_id is already used by another device",
+                    f"{item_field}.job_id", status_code=409)
+            if error.reason == REDELIVERY_JOB_CANCEL_STATE:
+                raise ServiceError(
+                    "a succeeded or failed job cannot be cancelled",
+                    f"{item_field}.job_id", status_code=409)
+            if error.reason == REDELIVERY_JOB_CANCELLATION_CONFLICT:
+                raise ServiceError(
+                    "the job is already cancelled under a different "
+                    "cancellation_id",
+                    f"{item_field}.cancellation_id", status_code=409)
+            raise ServiceError(
+                "cancellation_id replays an already committed "
+                "cancellation and cannot be mixed with first-time items",
+                f"{item_field}.cancellation_id", status_code=409)
         body = {"device_id": device_id, "results": results}
         return body, status_code
 

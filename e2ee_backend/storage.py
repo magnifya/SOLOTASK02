@@ -214,6 +214,10 @@ REDELIVERY_JOB_CANCEL_STATE = "job_not_cancellable"
 #: recoveries; the batch is atomic, so a partial replay conflicts
 #: (409/items[i].recovery_id of the first replayed item).
 REDELIVERY_JOB_RECOVERY_PARTIAL_REPLAY = "partial_replay"
+#: A cancel-batch mixed first-time items with exact replays of already
+#: committed cancellations; the batch is atomic, so a partial replay
+#: conflicts (409/items[i].cancellation_id of the first replayed item).
+REDELIVERY_JOB_CANCEL_PARTIAL_REPLAY = "cancel_partial_replay"
 
 #: Number of inbox messages one redelivery-job dispatch leases at most.
 REDELIVERY_JOB_DISPATCH_LIMIT = 100
@@ -455,6 +459,23 @@ class RedeliveryJobRecoverBatchError(Exception):
     writes nothing. Reasons are the per-item
     :class:`RedeliveryJobError` recover reasons plus ``partial_replay`` for
     a batch mixing first-time items with replays of committed recoveries.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
+class RedeliveryJobCancelBatchError(Exception):
+    """A batch redelivery-job cancellation failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the whole batch
+    writes nothing. Reasons are the per-item
+    :class:`RedeliveryJobError` cancel reasons plus
+    ``cancel_partial_replay`` for a batch mixing first-time items with
+    exact replays of committed cancellations.
     """
 
     def __init__(self, reason: str, index: int) -> None:
@@ -3328,19 +3349,8 @@ class DeviceStore:
                 raise RedeliveryJobError(REDELIVERY_JOB_CANCEL_STATE)
             now = datetime.now(timezone.utc)
             cancelled_at = now.isoformat(timespec="microseconds")
-            if job.state == REDELIVERY_JOB_RUNNING and job.lease_id:
-                # Release the current lease in the same transaction so its
-                # messages are claimable again. The lease stays as history;
-                # a current lease already released (via the release
-                # endpoint) keeps its earlier, frozen release timestamp.
-                for state in self._delivery.values():
-                    for lease in state.leases:
-                        if lease.lease_id == job.lease_id \
-                                and lease.released_at is None:
-                            lease.released_at = cancelled_at
-            job.state = REDELIVERY_JOB_CANCELLED
-            job.cancellation_id = cancellation_id
-            job.cancelled_at = cancelled_at
+            self._redelivery_job_apply_cancel_locked(
+                job, cancellation_id, cancelled_at)
             self._notify_change()
             return self.redelivery_job_view(job), 201
 
@@ -3634,6 +3644,136 @@ class DeviceStore:
             "state": job.state,
             "lease_id": job.lease_id,
         }
+
+    def redelivery_job_cancel_batch(
+            self, device_id: str, items: List[Tuple[str, str]]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Atomically cancel many 1:1-inbox redelivery jobs of one device.
+
+        ``POST /v1/inbox-jobs/cancel-batch``; *items* are ``(job_id,
+        cancellation_id)`` pairs already validated for shape and per-field
+        uniqueness by the service. Under the one store lock — shared with
+        leases, completions, acks and revocation — the device is resolved
+        first (unknown/revoked -> :class:`RedeliveryJobError`
+        ``device_unknown``/``device_inactive``, 409/device_id).
+
+        Every item is then prechecked in input order with exactly the
+        single-job ``op=cancel`` rules, the first failure raising
+        :class:`RedeliveryJobCancelBatchError` carrying that item's index
+        and writing nothing: a never-queued ``job_id`` raises
+        ``job_not_found`` (404/items[i].job_id), a job of another device
+        ``job_id_conflict`` (409/items[i].job_id), a
+        ``succeeded``/``failed`` terminal job ``job_not_cancellable``
+        (409/items[i].job_id), and an already cancelled job whose stored
+        ``cancellation_id`` differs raises ``cancellation_id_conflict``
+        (409/items[i].cancellation_id). An item whose ``cancellation_id``
+        matches its job's committed cancellation is an exact replay and
+        skips the remaining checks, as the single-job entry does.
+
+        Only after every item passes does the batch resolve: when all
+        items are replays the jobs' current views are returned with 200
+        and nothing is written; a mix of replays and first-time items
+        cannot be applied atomically and raises
+        ``cancel_partial_replay`` for the first replayed item
+        (409/items[i].cancellation_id). Otherwise each job is cancelled
+        in input order via :meth:`_redelivery_job_apply_cancel_locked` — a
+        pending job keeps no lease, a running job releases its current
+        lease so its messages can be claimed again — and the whole batch
+        commits with one persistence notification (201, commit_seq + 1; a
+        durable write failure rolls every job and lease back). Returns
+        ``(results, status_code)`` with one three-key
+        (``job_id``/``state``/``lease_id``) view per item, in input order.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            device = self._find_device(device_id)
+            if device is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_INACTIVE)
+            jobs: List[RedeliveryJob] = []
+            replays: List[bool] = []
+            for index, (job_id, cancellation_id) in enumerate(items):
+                job = self._redelivery_jobs.get(job_id)
+                if job is not None and job.device_id != device_id:
+                    raise RedeliveryJobCancelBatchError(
+                        REDELIVERY_JOB_CONFLICT, index)
+                if job is None:
+                    raise RedeliveryJobCancelBatchError(
+                        REDELIVERY_JOB_NOT_FOUND, index)
+                jobs.append(job)
+                # An exact replay of the committed cancellation skips the
+                # remaining per-item checks (mirroring the single-job
+                # entry) and is only classified here.
+                if job.state == REDELIVERY_JOB_CANCELLED:
+                    if job.cancellation_id == cancellation_id:
+                        replays.append(True)
+                        continue
+                    raise RedeliveryJobCancelBatchError(
+                        REDELIVERY_JOB_CANCELLATION_CONFLICT, index)
+                replays.append(False)
+                # A succeeded/failed terminal job cannot be cancelled;
+                # pending/running jobs accept any cancellation_id (the
+                # service already rejects duplicates within the batch).
+                if job.state in (REDELIVERY_JOB_SUCCEEDED,
+                                 REDELIVERY_JOB_FAILED):
+                    raise RedeliveryJobCancelBatchError(
+                        REDELIVERY_JOB_CANCEL_STATE, index)
+            if all(replays):
+                # Every item replays its committed cancellation: answer
+                # the current views with 200 and write nothing (no
+                # persistence notification, no commit_seq advance).
+                return [self._recover_batch_item_view(job) for job in jobs], \
+                    200
+            if any(replays):
+                # A partial replay cannot commit atomically: the batch is
+                # all-or-nothing, so the first replayed item conflicts.
+                raise RedeliveryJobCancelBatchError(
+                    REDELIVERY_JOB_CANCEL_PARTIAL_REPLAY,
+                    replays.index(True))
+            # One timestamp for the whole batch: every item commits in the
+            # same locked transaction, mirroring the single cancel's
+            # timespec="microseconds" rendering.
+            cancelled_at = now.isoformat(timespec="microseconds")
+            for job, (_job_id, cancellation_id) in zip(jobs, items):
+                self._redelivery_job_apply_cancel_locked(
+                    job, cancellation_id, cancelled_at)
+            # One persistence notification for the whole batch: every job
+            # and lease commits (or rolls back) together and the
+            # generation advances exactly once.
+            self._notify_change()
+            return [self._recover_batch_item_view(job) for job in jobs], 201
+
+    def _redelivery_job_apply_cancel_locked(
+            self, job: RedeliveryJob, cancellation_id: str,
+            cancelled_at: str) -> None:
+        """Move a pending/running *job* to ``cancelled`` under the lock.
+
+        Shared by the single ``op=cancel`` and the batch entry; the caller
+        is responsible for the device gate, replay/terminal-state checks
+        and the persistence notification. A ``pending`` cancel touches no
+        lease and sets ``lease_id`` to null. A ``running`` cancel releases
+        the job's current lease (stamping unfilled lease copies with
+        *cancelled_at*; an already-released current lease keeps its earlier
+        release timestamp) so the leased messages are claimable again,
+        while the job keeps that lease's id. Both cases stamp
+        ``cancellation_id`` and ``cancelled_at``.
+        """
+        if job.state == REDELIVERY_JOB_RUNNING and job.lease_id:
+            # Release the current lease in the same transaction so its
+            # messages are claimable again. The lease stays as history;
+            # a current lease already released (via the release endpoint)
+            # keeps its earlier, frozen release timestamp.
+            for state in self._delivery.values():
+                for lease in state.leases:
+                    if lease.lease_id == job.lease_id \
+                            and lease.released_at is None:
+                        lease.released_at = cancelled_at
+        elif job.state == REDELIVERY_JOB_PENDING:
+            job.lease_id = None
+        job.state = REDELIVERY_JOB_CANCELLED
+        job.cancellation_id = cancellation_id
+        job.cancelled_at = cancelled_at
 
     def _redelivery_job_completed_locked(self, lease_id: str,
                                          outcome: str) -> None:
