@@ -533,6 +533,22 @@ class InboxLeaseReleaseBatchError(Exception):
         self.index = index
 
 
+class InboxLeaseStatusBatchError(Exception):
+    """A batch 1:1-inbox lease status query failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the batch is
+    read-only, so nothing is ever written. Reasons are the lookup reasons
+    of :class:`InboxLeaseError` (``lease_not_found`` ->
+    404/items[i].lease_id, ``lease_id_conflict`` -> 409/items[i].lease_id).
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
 class RedeliveryJobError(Exception):
     """A 1:1-inbox redelivery job operation failed; nothing was written.
 
@@ -3629,6 +3645,98 @@ class DeviceStore:
                 "completion": completion,
                 "messages": messages,
             }
+
+    def inbox_lease_status_batch(
+            self, device_id: str,
+            lease_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Read many 1:1-inbox leases' current state in one batch (read-only).
+
+        ``POST /v1/inbox-jobs/lease-status-batch``; *lease_ids* are
+        non-empty strings already validated for shape and uniqueness (no
+        repeats) by the service. Under the one store lock — shared with
+        claims, renewals, releases, completions, acks, retries, redelivery
+        jobs and revocation — the device is resolved first
+        (unknown/revoked -> :class:`InboxLeaseError`
+        ``device_unknown``/``device_inactive``, 409/device_id).
+
+        Every item is then prechecked in input order, the first failure
+        raising :class:`InboxLeaseStatusBatchError` carrying that item's
+        index: a never-committed ``lease_id`` raises ``lease_not_found``
+        (404/items[i].lease_id) and a lease owned by another device
+        ``lease_id_conflict`` (409/items[i].lease_id). Every lease's state
+        is decided against one uniform batch instant, exactly as in
+        :meth:`inbox_lease_get` — a completion wins, then a release, then
+        active while the effective deadline is still in the future, else
+        expired.
+
+        Returns one result per item, in input order, with keys
+        ``lease_id``, ``state``, ``leased_until``, ``released_at``,
+        ``completion`` and ``message_count`` in that order:
+        ``leased_until`` is the current effective deadline (the claim
+        value, or the last renewal's after one or more renewals),
+        ``released_at`` the release timestamp or ``None``, ``completion``
+        ``None`` or the completion's
+        ``completion_id``/``outcome``/``completed_at``, and
+        ``message_count`` the number of messages the lease claimed. The
+        query writes nothing and advances no commit generation, so an
+        unchanged state answers byte-identically and a rebuild after
+        restart yields the same result.
+        """
+        with self._lock:
+            # One uniform batch instant: every item's active/expired
+            # decision is taken against it, so a batch crossing a deadline
+            # mid-scan still reports one consistent snapshot.
+            now = datetime.now(timezone.utc)
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            results: List[Dict[str, Any]] = []
+            for index, lease_id in enumerate(lease_ids):
+                existing = self._find_inbox_lease_locked(lease_id)
+                if existing is None:
+                    raise InboxLeaseStatusBatchError(
+                        INBOX_LEASE_NOT_FOUND, index)
+                owner, _limit, _deadline, _released, ordered_keys = existing
+                # A cross-device lookup is a conflict regardless of the
+                # path device's current state, mirroring the other batch
+                # lease routes.
+                if owner != device_id:
+                    raise InboxLeaseStatusBatchError(
+                        INBOX_LEASE_CONFLICT, index)
+                # The lease copies on every delivery record are identical
+                # by restore validation; the first is authoritative.
+                first_lease = next(
+                    item for item in self._delivery[ordered_keys[0]].leases
+                    if item.lease_id == lease_id)
+                if first_lease.completion is not None:
+                    state = "completed"
+                elif first_lease.released_at is not None:
+                    state = "released"
+                elif self._lease_is_active_locked(first_lease, now):
+                    state = "active"
+                else:
+                    state = "expired"
+                # Current effective deadline as a stored string: the claim
+                # value, or the last renewal's after one or more renewals.
+                leased_until = first_lease.renewals[-1].leased_until \
+                    if first_lease.renewals else first_lease.leased_until
+                completion = None if first_lease.completion is None else {
+                    "completion_id": first_lease.completion.completion_id,
+                    "outcome": first_lease.completion.outcome,
+                    "completed_at": first_lease.completion.completed_at,
+                }
+                results.append({
+                    "lease_id": lease_id,
+                    "state": state,
+                    "leased_until": leased_until,
+                    "released_at": first_lease.released_at,
+                    "completion": completion,
+                    "message_count": len(ordered_keys),
+                })
+            return results
 
     def inbox_leases_page(self, device_id: str, state_filter: str,
                           after: int, limit: int
