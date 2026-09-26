@@ -1807,6 +1807,51 @@ class DeviceService:
                                "device_id", status_code=404)
         return page
 
+    def inbox_jobs_page(self, device_id: str, state: str, after: int,
+                        limit: int) -> Dict[str, Any]:
+        """Return one page of a device's redelivery-job history (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox-jobs``. The GET takes no
+        request body (the HTTP layer rejects a non-empty one with
+        400/field ``request_body``) and only the single-valued query
+        parameters ``state``, ``after`` and ``limit`` (any other parameter
+        is 400/field ``query``). ``state`` defaults to ``all`` and must be
+        one of ``all``/``pending``/``running``/``succeeded``/``failed``/
+        ``cancelled``; ``after`` defaults to 0 and must be an unsigned
+        decimal integer in 0..2**63-1; ``limit`` defaults to 100 and must
+        be in 1..100 (the HTTP layer enforces the decimal shape and single
+        occurrence, answering 400 with the parameter name as ``field``).
+
+        Under the store lock the jobs are listed in the order their first
+        successful ``queue`` committed, filtered by state and paged (skip
+        *after*, take *limit*). An unknown device is 404/field
+        ``device_id``; a revoked device's history stays readable. On
+        success the body keys are ``device_id``, ``jobs``, ``next_after``
+        and ``has_more`` in that order; each job item is ``job_id``,
+        ``state``, ``lease_id``, ``cancellation_id`` and ``cancelled_at``
+        with the latter three a string or ``null`` exactly as persisted.
+        The lookup writes nothing and advances no ``commit_seq``.
+        """
+        if state not in ("all", "pending", "running", "succeeded",
+                         "failed", "cancelled"):
+            raise ServiceError(
+                "field must be one of 'all', 'pending', 'running', "
+                "'succeeded', 'failed' or 'cancelled': state", "state")
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or not 0 <= after <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        page = self.store.redelivery_jobs_page(device_id, state, after,
+                                               limit)
+        if page is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return page
+
     def inbox_job(self, payload: object) -> Tuple[Dict[str, Any], int]:
         """Validate and apply one 1:1-inbox redelivery job operation.
 

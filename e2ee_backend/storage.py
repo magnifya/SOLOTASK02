@@ -3059,6 +3059,56 @@ class DeviceStore:
                 "has_more": after + limit < len(filtered),
             }
 
+    def redelivery_jobs_page(self, device_id: str, state_filter: str,
+                             after: int, limit: int
+                             ) -> Optional[Dict[str, Any]]:
+        """Read one page of one device's redelivery-job history (read-only).
+
+        ``GET /v1/devices/{device_id}/inbox-jobs``. Under the one store
+        lock (shared with the job queue/dispatch/recover/cancel
+        operations, lease claims/renewals/releases/completions, acks and
+        revocation), an unknown *device_id* returns ``None``
+        (404/device_id at the service layer); a revoked device's history
+        stays readable. Jobs are listed in the order their first
+        successful ``queue`` committed (the insertion order of
+        ``self._redelivery_jobs``, which the state file preserves across
+        restarts), filtered to the path device and then to *state_filter*
+        (``all`` keeps every state), and paged: the first *after* matching
+        jobs are skipped and at most *limit* are returned. The query
+        writes nothing and advances no commit generation, so an unchanged
+        state answers byte-identically.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                return None
+
+            filtered: List[Dict[str, Any]] = []
+            for job in self._redelivery_jobs.values():
+                if job.device_id != device_id:
+                    continue
+                if state_filter != "all" and job.state != state_filter:
+                    continue
+                filtered.append({
+                    "job_id": job.job_id,
+                    "state": job.state,
+                    "lease_id": job.lease_id,
+                    "cancellation_id": job.cancellation_id,
+                    "cancelled_at": job.cancelled_at,
+                })
+
+            page = filtered[after:after + limit]
+            if not page:
+                next_after = after
+            else:
+                next_after = after + len(page)
+            return {
+                "device_id": device_id,
+                "jobs": page,
+                "next_after": next_after,
+                "has_more": after + limit < len(filtered),
+            }
+
     @staticmethod
     def redelivery_job_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery job, keys in response order."""
