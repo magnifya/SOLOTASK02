@@ -618,6 +618,23 @@ class RedeliveryJobDispatchBatchError(Exception):
         self.index = index
 
 
+class RedeliveryJobStatusBatchError(Exception):
+    """A batch redelivery-job status query failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the batch is
+    read-only, so nothing is ever written. Reasons are the lookup reasons
+    of :class:`RedeliveryJobError` (``job_not_found`` ->
+    404/items[i].job_id, ``job_id_conflict`` ->
+    409/items[i].job_id).
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
 class GroupSessionRotationError(Exception):
     """An atomic group-session rotation failed; nothing was written."""
 
@@ -3934,6 +3951,78 @@ class DeviceStore:
             if job.device_id != device_id:
                 raise RedeliveryJobError(REDELIVERY_JOB_CONFLICT)
             return self.redelivery_job_detail_view(job)
+
+    @staticmethod
+    def redelivery_job_status_view(job: RedeliveryJob) -> Dict[str, Any]:
+        """The wire view of one batch job-status item, keys in response order.
+
+        Like :meth:`redelivery_job_detail_view` but without the repeated
+        ``device_id`` (the batch body carries it once): ``job_id``,
+        ``state``, ``lease_id``, ``recoveries``, ``cancellation_id`` and
+        ``cancelled_at``.
+        """
+        return {
+            "job_id": job.job_id,
+            "state": job.state,
+            "lease_id": job.lease_id,
+            "recoveries": [{
+                "recovery_id": record.recovery_id,
+                "lease_id": record.lease_id,
+            } for record in job.recoveries],
+            "cancellation_id": job.cancellation_id,
+            "cancelled_at": job.cancelled_at,
+        }
+
+    def redelivery_job_status_batch(
+            self, device_id: str,
+            job_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Read many 1:1-inbox redelivery jobs' current state (read-only).
+
+        ``POST /v1/inbox-jobs/status-batch``; *job_ids* are non-empty
+        strings already validated for shape and uniqueness (no repeats) by
+        the service. Under the one store lock — shared with the job
+        queue/dispatch/recover/cancel operations, lease
+        claims/renewals/releases/completions, acks and revocation — the
+        device is resolved first: an unknown *device_id* raises
+        :class:`RedeliveryJobError` ``device_unknown``
+        (404/device_id). Unlike the mutating and lease batch routes, a
+        revoked device stays queryable, exactly as for the single-job GET.
+
+        Every item is then prechecked in input order, the first failure
+        raising :class:`RedeliveryJobStatusBatchError` carrying that item's
+        index: a never-queued ``job_id`` raises ``job_not_found``
+        (404/items[i].job_id) and an id committed for another device raises
+        ``job_id_conflict`` (409/items[i].job_id). The precheck runs ahead
+        of building any result, so the first error fails the whole batch.
+
+        Returns one result per item, in input order, each the
+        :meth:`redelivery_job_status_view` of the job — ``state`` one of
+        the five job states, ``lease_id`` and the two cancellation fields a
+        non-empty string or ``None``, ``cancelled_at`` the persisted UTC
+        stamp, and ``recoveries`` the recovery chain in commit order (each
+        item ``recovery_id`` then ``lease_id``). The query writes nothing
+        and advances no commit generation, so an unchanged state answers
+        byte-identically and a rebuild after restart yields the same
+        result.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise RedeliveryJobError(REDELIVERY_JOB_DEVICE_UNKNOWN)
+            # Precheck every item in input order; the first failure aborts
+            # the whole (read-only) batch.
+            jobs: List[RedeliveryJob] = []
+            for index, job_id in enumerate(job_ids):
+                job = self._redelivery_jobs.get(job_id)
+                if job is None:
+                    raise RedeliveryJobStatusBatchError(
+                        REDELIVERY_JOB_NOT_FOUND, index)
+                if job.device_id != device_id:
+                    raise RedeliveryJobStatusBatchError(
+                        REDELIVERY_JOB_CONFLICT, index)
+                jobs.append(job)
+            return [self.redelivery_job_status_view(job) for job in jobs]
 
     @staticmethod
     def redelivery_job_view(job: RedeliveryJob) -> Dict[str, Any]:

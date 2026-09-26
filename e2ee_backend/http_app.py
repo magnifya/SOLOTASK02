@@ -128,6 +128,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_inbox_job_release_batch()
         elif path == _INBOX_JOBS_PATH + "/lease-status-batch":
             self._handle_inbox_job_lease_status_batch()
+        elif path == _INBOX_JOBS_PATH + "/status-batch":
+            self._handle_inbox_job_status_batch()
         elif path == _GROUPS_PATH:
             self._handle_create_group()
         elif path == _GROUP_SESSIONS_PATH:
@@ -1320,6 +1322,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body, status_code = \
                 self.service.inbox_job_lease_status_batch(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_inbox_job_status_batch(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = \
+                self.service.inbox_job_status_batch(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

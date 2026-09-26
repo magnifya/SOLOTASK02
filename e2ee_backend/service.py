@@ -139,6 +139,7 @@ from .storage import (
     RedeliveryJobCancelBatchError,
     RedeliveryJobDispatchBatchError,
     RedeliveryJobRecoverBatchError,
+    RedeliveryJobStatusBatchError,
     SessionCreateError,
 )
 
@@ -3113,6 +3114,114 @@ class DeviceService:
             raise ServiceError(
                 "lease_id is owned by another device",
                 f"{item_field}.lease_id", status_code=409)
+        body = {"device_id": device_id, "results": results}
+        return body, 200
+
+    def inbox_job_status_batch(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and read a batch of redelivery-job states (read-only).
+
+        ``POST /v1/inbox-jobs/status-batch``. The body must be a JSON
+        object carrying exactly a non-empty string ``device_id`` and a
+        non-empty ``items`` array; each item is an object carrying exactly
+        the non-empty string ``job_id``, and no ``job_id`` may repeat
+        across items. Shape errors are reported, in order, as
+        400/field ``request_body`` (bad/non-object body), ``device_id``
+        (missing/empty/non-string), ``items`` (missing/not-a-non-empty
+        array), the first extra top-level key, ``items[i]`` (non-object
+        element, an unexpected key, or a repeated ``job_id``) or
+        ``items[i].job_id`` for the offending field.
+
+        The device is then resolved under the store lock: an unknown
+        device is 404/field ``device_id`` while, unlike the mutating and
+        lease batch routes, a revoked device stays queryable (as for the
+        single-job GET). Every item is prechecked in array order, the first
+        error aborting the whole batch with its ``field`` prefixed to
+        ``items[i].``: a never-queued job is 404/``items[i].job_id`` and a
+        job committed for another device is 409/``items[i].job_id``.
+
+        The query is purely read-only — it shares the store lock with the
+        mutating operations but writes nothing, advances no
+        ``commit_seq`` and changes no state — and always answers 200 on
+        success. The body keys are ``device_id`` then ``results``; results
+        keep input order and each item is ``job_id``, ``state``,
+        ``lease_id``, ``recoveries``, ``cancellation_id`` and
+        ``cancelled_at`` in that order, with ``recoveries`` in commit
+        order (each item ``recovery_id`` then ``lease_id``).
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id",
+                               "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        device_id = payload["device_id"]
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+        # The body carries exactly device_id and items; any other
+        # top-level key is 400 with that field (the first extra key, in
+        # payload order).
+        extras = [key for key in payload if key not in ("device_id", "items")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+
+        job_ids: List[str] = []
+        seen_job_ids: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            # Each item carries exactly job_id; any other key is 400 at
+            # the item level (items[i]).
+            if any(key != "job_id" for key in element):
+                raise ServiceError(
+                    f"array element must carry only job_id: {item_field}",
+                    item_field)
+            job_field = f"{item_field}.job_id"
+            if "job_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {job_field}", job_field)
+            if not is_nonempty_string(element["job_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {job_field}",
+                    job_field)
+            if element["job_id"] in seen_job_ids:
+                raise ServiceError(
+                    "duplicate job_id in items: "
+                    f"{element['job_id']}", item_field)
+            seen_job_ids.add(element["job_id"])
+            job_ids.append(element["job_id"])
+
+        try:
+            results = self.store.redelivery_job_status_batch(
+                device_id, job_ids)
+        except RedeliveryJobError as error:
+            # A revoked device stays queryable; only an unknown device
+            # fails, and it does so as 404/device_id (like the GET).
+            if error.reason == REDELIVERY_JOB_DEVICE_UNKNOWN:
+                raise ServiceError(f"device not found: {device_id}",
+                                   "device_id", status_code=404)
+            raise
+        except RedeliveryJobStatusBatchError as error:
+            job_id = job_ids[error.index]
+            item_field = f"items[{error.index}]"
+            if error.reason == REDELIVERY_JOB_NOT_FOUND:
+                raise ServiceError(f"job not found: {job_id}",
+                                   f"{item_field}.job_id",
+                                   status_code=404)
+            raise ServiceError(
+                "job_id is owned by another device",
+                f"{item_field}.job_id", status_code=409)
         body = {"device_id": device_id, "results": results}
         return body, 200
 
