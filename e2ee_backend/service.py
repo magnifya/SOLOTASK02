@@ -78,6 +78,7 @@ from .storage import (
     INBOX_LEASE_DEVICE_UNKNOWN,
     INBOX_LEASE_NOT_DELIVERED,
     INBOX_LEASE_NOT_FOUND,
+    INBOX_LEASE_RENEW_PARTIAL_REPLAY,
     INBOX_LEASE_UNAVAILABLE,
     PREKEY_CONFLICT,
     REDELIVERY_JOB_CONFLICT,
@@ -126,6 +127,7 @@ from .storage import (
     InboxLeaseError,
     InboxLeaseCompleteBatchError,
     InboxLeaseAckBatchError,
+    InboxLeaseRenewBatchError,
     MessageSyncAckBatchError,
     MessageSyncError,
     PreKeyClaimError,
@@ -2739,6 +2741,143 @@ class DeviceService:
                 "the item replays an already committed acknowledgement "
                 "and cannot be mixed with first-time items",
                 f"{item_field}.ack_id", status_code=409)
+        body = {"device_id": device_id, "results": results}
+        return body, status_code
+
+    def inbox_job_renew_batch(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and atomically apply a batch of inbox lease renewals.
+
+        ``POST /v1/inbox-jobs/renew-batch``. The body must be a JSON object
+        carrying exactly a non-empty string ``device_id`` and a non-empty
+        ``items`` array; each item is an object carrying exactly the
+        non-empty strings ``lease_id`` and ``renewal_id``; neither
+        ``lease_id`` nor ``renewal_id`` may repeat across items. Shape
+        errors are reported, in order, as 400/field ``request_body``
+        (bad/non-object body), ``device_id`` (missing/empty/non-string),
+        ``items`` (missing/not-a-non-empty array), the first extra
+        top-level key, ``items[i]`` (non-object element, an unexpected
+        key, or a repeated ``lease_id``/``renewal_id``) or
+        ``items[i].lease_id`` / ``items[i].renewal_id`` for the offending
+        field.
+
+        The device is then resolved (unknown/revoked -> 409/field
+        ``device_id``) and every item is prechecked in array order with the
+        single-lease renewal rules, the first error aborting the whole
+        batch with nothing written and its ``field`` prefixed to
+        ``items[i].``: an unknown lease is 404/``items[i].lease_id`` and a
+        lease of another device is 409/``items[i].lease_id``. An item
+        replaying its own committed renewal (same renewal_id on the same
+        lease) skips the remaining checks; when every item is such a
+        replay the batch answers 200 with the frozen responses and writes
+        nothing, and a mix of replays and first-time items conflicts 409
+        with the first replayed item's ``items[i].renewal_id``.
+
+        A first-time batch renews every lease in input order — each one's
+        current effective deadline extended by exactly 30 seconds — and
+        commits once (201). The body keys are ``device_id`` then
+        ``results``; results keep input order and each item is
+        ``lease_id``, ``renewal_id``, ``leased_until`` in that order (a
+        replay carries its frozen ``leased_until``).
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "device_id" not in payload:
+            raise ServiceError("missing required field: device_id",
+                               "device_id")
+        if not is_nonempty_string(payload["device_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: device_id", "device_id")
+        device_id = payload["device_id"]
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+        # The body carries exactly device_id and items; any other
+        # top-level key is 400 with that field (the first extra key, in
+        # payload order).
+        extras = [key for key in payload
+                  if key not in ("device_id", "items")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+
+        items: List[Tuple[str, str]] = []
+        seen_lease_ids: set = set()
+        seen_renewal_ids: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            # Each item carries exactly lease_id and renewal_id; any other
+            # key is 400 at the item level (items[i]).
+            if any(key not in ("lease_id", "renewal_id")
+                   for key in element):
+                raise ServiceError(
+                    "array element must carry only lease_id and "
+                    f"renewal_id: {item_field}", item_field)
+            lease_field = f"{item_field}.lease_id"
+            if "lease_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {lease_field}", lease_field)
+            if not is_nonempty_string(element["lease_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {lease_field}",
+                    lease_field)
+            renewal_field = f"{item_field}.renewal_id"
+            if "renewal_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {renewal_field}",
+                    renewal_field)
+            if not is_nonempty_string(element["renewal_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {renewal_field}",
+                    renewal_field)
+            if element["lease_id"] in seen_lease_ids:
+                raise ServiceError(
+                    "duplicate lease_id in items: "
+                    f"{element['lease_id']}", item_field)
+            if element["renewal_id"] in seen_renewal_ids:
+                raise ServiceError(
+                    "duplicate renewal_id in items: "
+                    f"{element['renewal_id']}", item_field)
+            seen_lease_ids.add(element["lease_id"])
+            seen_renewal_ids.add(element["renewal_id"])
+            items.append((element["lease_id"], element["renewal_id"]))
+
+        try:
+            results, status_code = self.store.inbox_lease_renew_batch(
+                device_id, items)
+        except InboxLeaseError as error:
+            # Batch-level device failure (unknown/revoked): 409/device_id.
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+        except InboxLeaseRenewBatchError as error:
+            lease_id, renewal_id = items[error.index]
+            item_field = f"items[{error.index}]"
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   f"{item_field}.lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    f"{item_field}.lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_UNAVAILABLE:
+                raise ServiceError(
+                    "lease is released or expired and cannot be renewed",
+                    f"{item_field}.lease_id", status_code=409)
+            raise ServiceError(
+                "the item replays an already committed renewal and "
+                "cannot be mixed with first-time items",
+                f"{item_field}.renewal_id", status_code=409)
         body = {"device_id": device_id, "results": results}
         return body, status_code
 

@@ -176,6 +176,10 @@ INBOX_LEASE_ACK_CONFLICT = "ack_id_conflict"
 #: committed acknowledgements; the batch is atomic, so a partial replay
 #: conflicts (409/items[i].ack_id of the first replayed item).
 INBOX_LEASE_ACK_PARTIAL_REPLAY = "ack_partial_replay"
+#: A renew-batch mixed first-time items with replays of already committed
+#: renewals; the batch is atomic, so a partial replay conflicts
+#: (409/items[i].renewal_id of the first replayed item).
+INBOX_LEASE_RENEW_PARTIAL_REPLAY = "renew_partial_replay"
 
 #: Lifetime of one inbox redelivery lease, in seconds. A message leased by a
 #: claim is withheld from later claims until this deadline passes, after
@@ -479,6 +483,25 @@ class InboxLeaseAckBatchError(Exception):
     409/items[i].lease_id, ``ack_id_conflict`` -> 409/items[i].ack_id) plus
     ``ack_partial_replay`` for a batch mixing first-time items with exact
     replays of already committed acknowledgements.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
+class InboxLeaseRenewBatchError(Exception):
+    """A batch 1:1-inbox lease renewal failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the whole batch
+    writes nothing. Reasons are the per-lease :class:`InboxLeaseError`
+    renewal reasons (``lease_not_found`` -> 404/items[i].lease_id,
+    ``lease_id_conflict`` / ``lease_unavailable`` ->
+    409/items[i].lease_id) plus ``renew_partial_replay`` for a batch
+    mixing first-time items with exact replays of already committed
+    renewals.
     """
 
     def __init__(self, reason: str, index: int) -> None:
@@ -2783,6 +2806,145 @@ class DeviceStore:
                      "lease_id": lease_id,
                      "renewal_id": renewal_id,
                      "leased_until": leased_until}, 201)
+
+    def inbox_lease_renew_batch(
+            self, device_id: str,
+            items: List[Tuple[str, str]]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Atomically renew many 1:1-inbox leases of one device.
+
+        ``POST /v1/inbox-jobs/renew-batch``; *items* are ``(lease_id,
+        renewal_id)`` pairs already validated for shape and per-field
+        uniqueness (no ``lease_id`` or ``renewal_id`` repeats) by the
+        service. Under the one store lock — shared with claims, releases,
+        renewals, completions, acks, retries, redelivery jobs and
+        revocation — the device is resolved first (unknown/revoked ->
+        :class:`InboxLeaseError` ``device_unknown``/``device_inactive``,
+        409/device_id), ahead of every item, before any item is decided.
+
+        Every item is then prechecked in input order with exactly the
+        single-lease renewal rules, the first failure raising
+        :class:`InboxLeaseRenewBatchError` carrying that item's index and
+        writing nothing: a never-committed ``lease_id`` raises
+        ``lease_not_found`` (404/items[i].lease_id) and a lease owned by
+        another device ``lease_id_conflict`` (409/items[i].lease_id).
+        Replaying the same renewal_id on the same lease is decided next:
+        such an item skips the remaining state checks, as the single-lease
+        entry does, however stale the request (the lease may since have
+        expired, been released, completed or the device revoked).
+
+        Only after every item passes does the batch resolve: when every
+        item is such a replay the frozen first responses are returned with
+        200 and nothing is written (no persistence notification, no
+        commit_seq advance); a mix of replays and first-time items cannot
+        be applied atomically and raises ``renew_partial_replay`` for the
+        first replayed item (409/items[i].renewal_id). Otherwise every
+        first-time lease is renewed in input order, each extending its own
+        current effective deadline — the claim deadline or its last
+        renewal's — by exactly :data:`INBOX_LEASE_SECONDS` seconds; a lease
+        already released, completed or past its current effective deadline
+        raises ``lease_unavailable`` (409/items[i].lease_id). The whole
+        batch commits with one persistence notification (201, commit_seq +
+        1; a durable write failure rolls every record back). Returns
+        ``(results, status_code)`` with one three-field
+        (``lease_id``/``renewal_id``/``leased_until``) result per item, in
+        input order (replays carry their frozen values).
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            # The device gate precedes every item decision, mirroring the
+            # other inbox batch endpoints.
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            # Resolve every lease once: first-seen is authoritative (restore
+            # validation keeps the per-delivery copies identical).
+            resolved: List[List[Tuple[Tuple[str, str], MessageLease]]] = []
+            replays: List[bool] = []
+            for index, (lease_id, renewal_id) in enumerate(items):
+                hits: List[Tuple[Tuple[str, str], MessageLease]] = []
+                for key, state in self._delivery.items():
+                    for lease in state.leases:
+                        if lease.lease_id == lease_id:
+                            hits.append((key, lease))
+                if not hits:
+                    raise InboxLeaseRenewBatchError(
+                        INBOX_LEASE_NOT_FOUND, index)
+                owner_session = self._sessions.get(hits[0][0][0])
+                owner = owner_session.recipient_device_id \
+                    if owner_session is not None else ""
+                if owner != device_id:
+                    raise InboxLeaseRenewBatchError(
+                        INBOX_LEASE_CONFLICT, index)
+                resolved.append(hits)
+                # The replay decision precedes the lease-state check,
+                # mirroring the single-lease renewal: an exact replay of the
+                # same renewal_id answers the frozen first response, however
+                # stale the request.
+                replay_until: Optional[str] = None
+                for renewal in hits[0][1].renewals:
+                    if renewal.renewal_id == renewal_id:
+                        replay_until = renewal.leased_until
+                        break
+                if replay_until is not None:
+                    replays.append(True)
+                    continue
+                replays.append(False)
+                # Every copy of the lease shares one lifecycle; once
+                # released, completed or past its current effective deadline
+                # it cannot be renewed.
+                if any(not self._lease_is_active_locked(lease, now)
+                       for _key, lease in hits):
+                    raise InboxLeaseRenewBatchError(
+                        INBOX_LEASE_UNAVAILABLE, index)
+            if all(replays):
+                # Every item replays its committed renewal: answer the
+                # frozen responses with 200 and write nothing (no
+                # persistence notification, no commit_seq advance).
+                return [
+                    {"lease_id": lease_id, "renewal_id": renewal_id,
+                     "leased_until": next(
+                         renewal.leased_until
+                         for renewal in hits[0][1].renewals
+                         if renewal.renewal_id == renewal_id)}
+                    for (lease_id, renewal_id), hits
+                    in zip(items, resolved)
+                ], 200
+            if any(replays):
+                # A partial replay cannot commit atomically: the batch is
+                # all-or-nothing, so the first replayed item conflicts.
+                raise InboxLeaseRenewBatchError(
+                    INBOX_LEASE_RENEW_PARTIAL_REPLAY, replays.index(True))
+            # Each first-time item extends its own current effective
+            # deadline by exactly the lease lifetime; items touch disjoint
+            # lease_ids (validated by the service), so the per-lease
+            # extensions are independent even when the leases share
+            # delivery records.
+            results: List[Dict[str, Any]] = []
+            for index, ((lease_id, renewal_id), hits) in enumerate(
+                    zip(items, resolved)):
+                current = self._lease_effective_deadline_locked(hits[0][1])
+                # The active check above guarantees a parseable aware
+                # deadline on every copy.
+                if current is None:  # pragma: no cover - ruled out above
+                    raise InboxLeaseRenewBatchError(
+                        INBOX_LEASE_UNAVAILABLE, index)
+                leased_until = (current + timedelta(
+                    seconds=INBOX_LEASE_SECONDS)) \
+                    .isoformat(timespec="microseconds")
+                for _key, lease in hits:
+                    lease.renewals.append(MessageLeaseRenewal(
+                        renewal_id=renewal_id, leased_until=leased_until))
+                results.append({"lease_id": lease_id,
+                                "renewal_id": renewal_id,
+                                "leased_until": leased_until})
+            # One persistence notification for the whole batch: every
+            # per-lease renewal commits (or rolls back) together and the
+            # generation advances exactly once.
+            self._notify_change()
+            return results, 201
 
     def inbox_lease_complete(
             self, device_id: str, lease_id: str, completion_id: str,
