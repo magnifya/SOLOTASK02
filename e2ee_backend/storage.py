@@ -168,6 +168,14 @@ INBOX_LEASE_NOT_DELIVERED = "lease_not_delivered"
 #: committed completions; the batch is atomic, so a partial replay conflicts
 #: (409/items[i].completion_id of the first replayed item).
 INBOX_LEASE_COMPLETE_PARTIAL_REPLAY = "complete_partial_replay"
+#: An ack-batch named a lease already acknowledged under a different
+#: ack_id (an exact replay answers 200 instead). Ids are scoped to one
+#: lease and may recur on other leases.
+INBOX_LEASE_ACK_CONFLICT = "ack_id_conflict"
+#: An ack-batch mixed first-time items with exact replays of already
+#: committed acknowledgements; the batch is atomic, so a partial replay
+#: conflicts (409/items[i].ack_id of the first replayed item).
+INBOX_LEASE_ACK_PARTIAL_REPLAY = "ack_partial_replay"
 
 #: Lifetime of one inbox redelivery lease, in seconds. A message leased by a
 #: claim is withheld from later claims until this deadline passes, after
@@ -452,6 +460,25 @@ class InboxLeaseCompleteBatchError(Exception):
     ``items[i].completion_id``) plus ``complete_partial_replay`` for a
     batch mixing first-time items with exact replays of already committed
     completions.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
+class InboxLeaseAckBatchError(Exception):
+    """A batch 1:1-inbox lease acknowledgement failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the whole batch
+    writes nothing. Reasons are the per-lease :class:`InboxLeaseError` ack
+    reasons (``lease_not_found`` -> 404/items[i].lease_id,
+    ``lease_id_conflict`` / ``lease_not_delivered`` ->
+    409/items[i].lease_id, ``ack_id_conflict`` -> 409/items[i].ack_id) plus
+    ``ack_partial_replay`` for a batch mixing first-time items with exact
+    replays of already committed acknowledgements.
     """
 
     def __init__(self, reason: str, index: int) -> None:
@@ -3082,6 +3109,122 @@ class DeviceStore:
             self._notify_change()
             return response(), 201
 
+    def inbox_lease_ack_batch(
+            self, device_id: str,
+            items: List[Tuple[str, str]]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Atomically bulk-acknowledge many delivered 1:1-inbox leases.
+
+        ``POST /v1/inbox-jobs/ack-batch``; *items* are ``(lease_id,
+        ack_id)`` pairs already validated for shape and per-field
+        uniqueness (no ``lease_id`` or ``ack_id`` repeats) by the service.
+        Under the one store lock — shared with claims, releases, renewals,
+        completions, the single and batched acks, retries, redelivery jobs
+        and revocation — the device is resolved first (unknown/revoked ->
+        :class:`InboxLeaseError` ``device_unknown``/``device_inactive``,
+        409/device_id).
+
+        Every item is then prechecked in input order, the first failure
+        raising :class:`InboxLeaseAckBatchError` carrying that item's index
+        and writing nothing: a never-committed ``lease_id`` raises
+        ``lease_not_found`` (404/items[i].lease_id), a lease owned by
+        another device ``lease_id_conflict`` (409/items[i].lease_id), an
+        already-acknowledged lease whose recorded ack_id differs
+        ``ack_id_conflict`` (409/items[i].ack_id), and a lease without a
+        ``delivered`` completion ``lease_not_delivered``
+        (409/items[i].lease_id). An item replaying its own committed ack
+        (same ack_id) skips the remaining checks.
+
+        Only after every item passes does the batch resolve: when every
+        item is such a replay the frozen first responses are returned with
+        200 and nothing is written (no persistence notification, no
+        commit_seq advance); a mix of replays and first-time items cannot
+        be applied atomically and raises ``ack_partial_replay`` for the
+        first replayed item (409/items[i].ack_id). Otherwise every
+        first-time lease is acknowledged in input order: each delivery
+        record the lease lives on is set ``acked=True`` with
+        ``ack_sequence`` equal to the message's own sequence (``attempts``
+        and the attempt-id dedup set untouched) and the lease freezes its
+        ``ack_id`` on every copy. The whole batch commits with one
+        persistence notification (201, commit_seq + 1; a durable write
+        failure rolls every record back). Returns ``(results,
+        status_code)`` with one three-field
+        (``lease_id``/``ack_id``/``message_count``) result per item, in
+        input order (replays carry their frozen values).
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            # Resolve every lease once: first-seen is authoritative
+            # (restore validation keeps the per-delivery copies identical).
+            resolved: List[List[Tuple[Tuple[str, str], MessageLease]]] = []
+            replays: List[bool] = []
+            for index, (lease_id, ack_id) in enumerate(items):
+                hits: List[Tuple[Tuple[str, str], MessageLease]] = []
+                for key, state in self._delivery.items():
+                    for lease in state.leases:
+                        if lease.lease_id == lease_id:
+                            hits.append((key, lease))
+                if not hits:
+                    raise InboxLeaseAckBatchError(
+                        INBOX_LEASE_NOT_FOUND, index)
+                owner_session = self._sessions.get(hits[0][0][0])
+                owner = owner_session.recipient_device_id \
+                    if owner_session is not None else ""
+                if owner != device_id:
+                    raise InboxLeaseAckBatchError(
+                        INBOX_LEASE_CONFLICT, index)
+                resolved.append(hits)
+                recorded = hits[0][1].ack_id
+                if recorded is not None:
+                    # The replay decision precedes the delivery-state
+                    # check: an exact replay of the same ack_id answers the
+                    # frozen first response, however stale the request.
+                    if recorded == ack_id:
+                        replays.append(True)
+                        continue
+                    raise InboxLeaseAckBatchError(
+                        INBOX_LEASE_ACK_CONFLICT, index)
+                replays.append(False)
+                completion = hits[0][1].completion
+                if completion is None or completion.outcome != "delivered":
+                    raise InboxLeaseAckBatchError(
+                        INBOX_LEASE_NOT_DELIVERED, index)
+            if all(replays):
+                # Every item replays its committed acknowledgement: answer
+                # the frozen responses with 200 and write nothing.
+                return [
+                    {"lease_id": lease_id, "ack_id": ack_id,
+                     "message_count": len(hits)}
+                    for (lease_id, ack_id), hits in zip(items, resolved)
+                ], 200
+            if any(replays):
+                # A partial replay cannot commit atomically: the batch is
+                # all-or-nothing, so the first replayed item conflicts.
+                raise InboxLeaseAckBatchError(
+                    INBOX_LEASE_ACK_PARTIAL_REPLAY, replays.index(True))
+            for (lease_id, ack_id), hits in zip(items, resolved):
+                for (session_id, message_id), lease in hits:
+                    state = self._delivery[(session_id, message_id)]
+                    sequence = next(
+                        m.sequence for m in self._messages[session_id]
+                        if m.message_id == message_id)
+                    state.acked = True
+                    state.ack_sequence = sequence
+                    lease.ack_id = ack_id
+            # One persistence notification for the whole batch: every
+            # per-message acknowledgement commits (or rolls back) together
+            # and the generation advances exactly once.
+            self._notify_change()
+            return [
+                {"lease_id": lease_id, "ack_id": ack_id,
+                 "message_count": len(hits)}
+                for (lease_id, ack_id), hits in zip(items, resolved)
+            ], 201
+
     def inbox_lease_get(
             self, device_id: str, lease_id: str
     ) -> Dict[str, Any]:
@@ -4636,6 +4779,7 @@ class DeviceStore:
                         "outcome": lease.completion.outcome,
                         "completed_at": lease.completion.completed_at,
                     },
+                    "ack_id": lease.ack_id,
                 } for lease in state.leases],
             } for (sid, mid), state in self._delivery.items()]
             group_delivery = [{
@@ -5817,12 +5961,14 @@ class DeviceStore:
         delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         # Global inbox-lease index, keyed by lease_id. One id is durably
         # bound to exactly one device, one limit, one claim deadline, one
-        # release timestamp and one renewal list across every delivery
-        # record it appears on; a contradiction refuses startup. Built
-        # while delivery records are parsed and cross-checked below
-        # (sessions are already restored, so the owner device is known).
+        # release timestamp, one renewal list, one completion and one
+        # ack_id across every delivery record it appears on; a
+        # contradiction refuses startup. Built while delivery records are
+        # parsed and cross-checked below (sessions are already restored, so
+        # the owner device is known).
         lease_index: Dict[str, Tuple[str, int, str, Optional[str],
-                                     Tuple[Tuple[str, str], ...]]] = {}
+                                     Tuple[Tuple[str, str], ...],
+                                     Any, Optional[str]]] = {}
         for index, raw in enumerate(raw_delivery):
             where = f"delivery[{index}]"
             if not isinstance(raw, dict):
@@ -6035,6 +6181,25 @@ class DeviceStore:
                         raise ValueError(
                             f"{l_where} cannot carry both a release and a "
                             f"completion")
+                    # The bulk-ack id. Older files predate the key: absent
+                    # means null (never acked through the batch entry). A
+                    # present value must be null or a non-empty string; a
+                    # non-null id is only possible on a lease completed
+                    # ``delivered`` whose every carrying delivery record is
+                    # acked with the message's own sequence (checked below,
+                    # once the record's ack cursor is known).
+                    ack_id = raw_lease.get("ack_id")
+                    if ack_id is not None \
+                            and not (isinstance(ack_id, str) and ack_id):
+                        raise ValueError(
+                            f"{l_where}.ack_id must be null or a non-empty "
+                            f"string")
+                    if ack_id is not None and (
+                            completion is None
+                            or completion.outcome != "delivered"):
+                        raise ValueError(
+                            f"{l_where}.ack_id requires a 'delivered' "
+                            f"completion")
                     if lease_id in seen_lease_ids:
                         raise ValueError(
                             f"{l_where} repeats lease_id {lease_id}")
@@ -6046,18 +6211,20 @@ class DeviceStore:
                                None if completion is None
                                else (completion.completion_id,
                                      completion.outcome,
-                                     completion.completed_at))
+                                     completion.completed_at),
+                               ack_id)
                     prior = lease_index.get(lease_id)
                     if prior is not None and prior != binding:
                         raise ValueError(
                             f"inbox lease {lease_id} is bound inconsistently "
                             f"across records (device/limit/leased_until/"
-                            f"released_at/renewals/completion)")
+                            f"released_at/renewals/completion/ack_id)")
                     lease_index[lease_id] = binding
                     leases.append(MessageLease(
                         lease_id=lease_id, limit=lease_limit,
                         leased_until=leased_until, released_at=released_at,
-                        renewals=renewals, completion=completion))
+                        renewals=renewals, completion=completion,
+                        ack_id=ack_id))
             # The ack cursor mirrors the message once acked and is 0 before.
             if acked:
                 if ack_sequence != target.sequence:
@@ -6067,6 +6234,14 @@ class DeviceStore:
             elif ack_sequence != 0:
                 raise ValueError(
                     f"{where} ack_sequence must be 0 while not acked")
+            # A lease acked through the batch entry carries its ack_id on
+            # every delivery record it lives on, and each of those records
+            # is itself acked at the message's own sequence.
+            if any(lease.ack_id is not None for lease in leases) \
+                    and not acked:
+                raise ValueError(
+                    f"{where} must be acked while carrying an "
+                    f"acknowledged lease")
             delivery[dkey] = MessageDelivery(
                 attempts=attempts, attempt_ids=set(attempt_ids), acked=acked,
                 ack_sequence=ack_sequence, leases=leases)

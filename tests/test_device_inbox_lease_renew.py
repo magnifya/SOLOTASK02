@@ -321,7 +321,7 @@ class RenewPersistenceTest(RenewMixin, unittest.TestCase):
             lease = record["leases"][0]
             self.assertEqual(list(lease),
                              ["lease_id", "limit", "leased_until",
-                              "released_at", "renewals", "completion"])
+                              "released_at", "renewals", "completion", "ack_id"])
             self.assertIsNone(lease["completion"])
             self.assertEqual(len(lease["renewals"]), 1)
             renewal = lease["renewals"][0]
