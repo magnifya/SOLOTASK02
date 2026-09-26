@@ -164,6 +164,10 @@ INBOX_LEASE_COMPLETION_CONFLICT = "completion_id_conflict"
 #: A lease bulk-ack named a lease whose completion is missing or whose
 #: ``outcome`` is not ``delivered``; only a delivered lease may be acked.
 INBOX_LEASE_NOT_DELIVERED = "lease_not_delivered"
+#: A complete-batch mixed first-time items with exact replays of already
+#: committed completions; the batch is atomic, so a partial replay conflicts
+#: (409/items[i].completion_id of the first replayed item).
+INBOX_LEASE_COMPLETE_PARTIAL_REPLAY = "complete_partial_replay"
 
 #: Lifetime of one inbox redelivery lease, in seconds. A message leased by a
 #: claim is withheld from later claims until this deadline passes, after
@@ -434,6 +438,26 @@ class InboxLeaseError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class InboxLeaseCompleteBatchError(Exception):
+    """A batch 1:1-inbox lease completion failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; items are prechecked in array order and the whole batch
+    writes nothing. Reasons are the per-lease :class:`InboxLeaseError`
+    complete reasons (``lease_not_found`` -> 404/items[i].lease_id,
+    ``lease_id_conflict`` / ``lease_unavailable`` /
+    ``completion_id_conflict`` -> 409/items[i].lease_id or
+    ``items[i].completion_id``) plus ``complete_partial_replay`` for a
+    batch mixing first-time items with exact replays of already committed
+    completions.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
 
 
 class RedeliveryJobError(Exception):
@@ -2832,6 +2856,145 @@ class DeviceStore:
                      "completion_id": completion_id,
                      "outcome": outcome,
                      "completed_at": completed_at}, 201)
+
+    def inbox_lease_complete_batch(
+            self, device_id: str,
+            items: List[Tuple[str, str, str]]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Atomically complete many 1:1-inbox leases of one device.
+
+        ``POST /v1/inbox-jobs/complete-batch``; *items* are
+        ``(lease_id, completion_id, outcome)`` triples already validated for
+        shape, outcome and per-field uniqueness (no ``lease_id`` or
+        ``completion_id`` repeats) by the service. Under the one store lock
+        — shared with claims, releases, renewals, the single completions,
+        acks, redelivery jobs and revocation — the device is resolved first
+        (unknown/revoked -> :class:`InboxLeaseError`
+        ``device_unknown``/``device_inactive``, 409/device_id).
+
+        Every item is then prechecked in input order with exactly the
+        single-lease completion rules, the first failure raising
+        :class:`InboxLeaseCompleteBatchError` carrying that item's index and
+        writing nothing: a never-committed ``lease_id`` raises
+        ``lease_not_found`` (404/items[i].lease_id), a lease owned by
+        another device ``lease_id_conflict`` (409/items[i].lease_id), an
+        already-completed lease whose completion_id differs or a reused
+        completion id ``completion_id_conflict``
+        (409/items[i].completion_id), and an unfinished but released or
+        expired lease ``lease_unavailable`` (409/items[i].lease_id). An item
+        replaying its own committed completion (same id and outcome) skips
+        those checks, as the single-lease entry does.
+
+        Only after every item passes does the batch resolve: when every
+        item is such a replay the frozen first responses are returned with
+        200 and nothing is written; a mix of replays and first-time items
+        cannot be applied atomically and raises
+        ``complete_partial_replay`` for the first replayed item
+        (409/items[i].completion_id). Otherwise every first-time lease is
+        completed in input order with one shared UTC timestamp (six
+        microsecond digits, ``+00:00``) and the whole batch commits with one
+        persistence notification (201, commit_seq + 1; a durable write
+        failure rolls every lease and redelivery job back); each item's
+        associated running redelivery job moves to ``succeeded``/``failed``
+        with its outcome in the same locked transaction. Returns
+        ``(results, status_code)`` with one four-field
+        (``lease_id``/``completion_id``/``outcome``/``completed_at``) result
+        per item, in input order (replays carry their frozen values).
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            # Resolve every lease once: first-seen is authoritative (restore
+            # validation keeps the per-delivery copies identical).
+            resolved: List[List[Tuple[Tuple[str, str], MessageLease]]] = []
+            replays: List[bool] = []
+            for index, (lease_id, completion_id, outcome) in enumerate(items):
+                hits: List[Tuple[Tuple[str, str], MessageLease]] = []
+                for key, state in self._delivery.items():
+                    for lease in state.leases:
+                        if lease.lease_id == lease_id:
+                            hits.append((key, lease))
+                if not hits:
+                    raise InboxLeaseCompleteBatchError(
+                        INBOX_LEASE_NOT_FOUND, index)
+                owner_session = self._sessions.get(hits[0][0][0])
+                owner = owner_session.recipient_device_id \
+                    if owner_session is not None else ""
+                if owner != device_id:
+                    raise InboxLeaseCompleteBatchError(
+                        INBOX_LEASE_CONFLICT, index)
+                resolved.append(hits)
+                existing = hits[0][1].completion
+                if existing is not None:
+                    # The replay decision precedes every other state check,
+                    # mirroring the single-lease completion: an exact replay
+                    # of the same completion_id and outcome answers the
+                    # frozen first response, however stale the request.
+                    if existing.completion_id == completion_id \
+                            and existing.outcome == outcome:
+                        replays.append(True)
+                        continue
+                    raise InboxLeaseCompleteBatchError(
+                        INBOX_LEASE_COMPLETION_CONFLICT, index)
+                replays.append(False)
+                if any(not self._lease_is_active_locked(lease, now)
+                       for _key, lease in hits):
+                    raise InboxLeaseCompleteBatchError(
+                        INBOX_LEASE_UNAVAILABLE, index)
+            if all(replays):
+                # Every item replays its committed completion: answer the
+                # frozen responses with 200 and write nothing (no
+                # persistence notification, no commit_seq advance).
+                return [
+                    self._complete_batch_item_view(
+                        lease_id, hits[0][1].completion)
+                    for (lease_id, _cid, _outcome), hits
+                    in zip(items, resolved)
+                ], 200
+            if any(replays):
+                # A partial replay cannot commit atomically: the batch is
+                # all-or-nothing, so the first replayed item conflicts.
+                raise InboxLeaseCompleteBatchError(
+                    INBOX_LEASE_COMPLETE_PARTIAL_REPLAY, replays.index(True))
+            # One timestamp for the whole batch: every item commits in the
+            # same locked transaction, mirroring the single completion's
+            # timespec="microseconds" rendering.
+            completed_at = now.isoformat(timespec="microseconds")
+            for (lease_id, completion_id, outcome), hits in zip(
+                    items, resolved):
+                completion = MessageLeaseCompletion(
+                    completion_id=completion_id, outcome=outcome,
+                    completed_at=completed_at)
+                for _key, lease in hits:
+                    lease.completion = completion
+                # A lease taken by a redelivery job moves its job to the
+                # matching terminal state in the same locked transaction.
+                self._redelivery_job_completed_locked(lease_id, outcome)
+            # One persistence notification for the whole batch: every lease
+            # completion (and redelivery-job transition) commits or rolls
+            # back together and the generation advances exactly once.
+            self._notify_change()
+            return [
+                {"lease_id": lease_id, "completion_id": completion_id,
+                 "outcome": outcome, "completed_at": completed_at}
+                for lease_id, completion_id, outcome in items
+            ], 201
+
+    @staticmethod
+    def _complete_batch_item_view(
+            lease_id: str,
+            completion: MessageLeaseCompletion) -> Dict[str, Any]:
+        """One complete-batch replay result item, keys in response order."""
+        return {
+            "lease_id": lease_id,
+            "completion_id": completion.completion_id,
+            "outcome": completion.outcome,
+            "completed_at": completion.completed_at,
+        }
 
     def inbox_lease_ack(
             self, device_id: str, lease_id: str
