@@ -4245,6 +4245,113 @@ class DeviceStore:
             return ({"device_id": device_id, "seq": seq,
                      "removed": removed}, 201)
 
+    def redelivery_job_event_gc_observe(
+            self, device_id: str, after: int,
+            limit: int) -> Optional[Dict[str, Any]]:
+        """Observe one device's event retention state (read-only).
+
+        ``GET /v1/event-gc/{device_id}``. Under the one store lock (shared
+        with the GC operations, the checkpoint advances, the job operations
+        that append events, the lease operations, acks and revocation), an
+        unknown *device_id* returns ``None`` (404/device_id at the service
+        layer); a revoked device stays observable. The service layer has
+        already validated *after* (a non-negative, non-boolean offset) and
+        *limit* (1..100) under the same pagination contract as the events
+        page.
+
+        Every checkpoint registration of the device is listed in
+        ``consumer_id`` code-point order; the page skips the first *after*
+        registrations and takes at most *limit* of them. Each item carries
+        ``consumer_id``, ``seq``, ``updated_at``, ``active`` and
+        ``expires`` in that order; ``active`` is true only while the lease
+        is neither revoked nor expired and the stored ``seq`` is at least
+        the retention watermark (a lease-less record never expires). The
+        body also carries the ``watermark`` and the surviving chain's
+        ``first_seq``/``last_seq`` (both null when the chain is empty),
+        ``next_after`` (the offset plus the page length) and ``has_more``
+        (whether a registration follows the page). The query writes nothing
+        and advances no commit generation, so an unchanged state answers
+        byte-identically.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                return None
+            now = datetime.now(timezone.utc)
+            watermark = self._redelivery_job_event_gc.get(device_id, 0)
+            chain = self._redelivery_job_events.get(device_id, [])
+            if chain:
+                first_seq = chain[0].seq
+                last_seq = chain[-1].seq
+            else:
+                first_seq = None
+                last_seq = None
+            records = [
+                record for key, record
+                in self._redelivery_job_event_checkpoints.items()
+                if key[0] == device_id]
+            # Default string ordering is Unicode code-point order.
+            records.sort(key=lambda record: record.consumer_id)
+            total = len(records)
+            page = records[after:after + limit]
+            consumers = [{
+                "consumer_id": record.consumer_id,
+                "seq": record.seq,
+                "updated_at": record.updated_at,
+                "active": self._job_event_consumer_valid_locked(record, now),
+                "expires": record.expires,
+            } for record in page]
+            next_after = after + len(page)
+            return {
+                "device_id": device_id,
+                "watermark": watermark,
+                "first_seq": first_seq,
+                "last_seq": last_seq,
+                "consumers": consumers,
+                "next_after": next_after,
+                "has_more": next_after < total,
+            }
+
+    def redelivery_job_event_gc_cleanup_expired(
+            self, device_id: str) -> Optional[Tuple[Dict[str, Any], int]]:
+        """Delete this device's expired retention registrations.
+
+        ``POST /v1/event-gc/{device_id}/cleanup-expired``. Under the one
+        store lock (shared with the GC operations, the checkpoint advances,
+        the job operations that append events, the lease operations, acks
+        and revocation), an unknown *device_id* returns ``None``
+        (404/device_id at the service layer); a revoked device stays
+        usable. Every checkpoint registration carrying a non-null
+        ``expires`` at or before now is deleted; revoke records (which
+        always carry a null ``expires``) and lease-less registrations are
+        left untouched. A deleted registration is gone for good and later
+        behaves as never registered.
+
+        With nothing expired the call is a 200 no-op (``removed`` 0,
+        nothing written, no commit generation); otherwise the deletions
+        persist through the change hook and the answer is 201. The body
+        keys are ``device_id`` and ``removed``.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                return None
+            now = datetime.now(timezone.utc)
+            expired_keys = [
+                key for key, record
+                in self._redelivery_job_event_checkpoints.items()
+                if key[0] == device_id
+                and record.expires is not None
+                and datetime.fromisoformat(record.expires) <= now]
+            if not expired_keys:
+                # Idempotent no-op: no write, no commit generation.
+                return ({"device_id": device_id, "removed": 0}, 200)
+            for key in expired_keys:
+                del self._redelivery_job_event_checkpoints[key]
+            self._notify_change()
+            return ({"device_id": device_id,
+                     "removed": len(expired_keys)}, 201)
+
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.

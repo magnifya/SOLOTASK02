@@ -2091,6 +2091,71 @@ class DeviceService:
                                "device_id", status_code=404)
         return result
 
+    def event_gc_observe(self, device_id: str, after: int,
+                         limit: int) -> Dict[str, Any]:
+        """Observe one device's event retention state (read-only).
+
+        ``GET /v1/event-gc/{device_id}``. The GET takes no request body
+        (the HTTP layer rejects a non-empty one with 400/field
+        ``request_body``); only single-valued ``after`` and ``limit``
+        query parameters are accepted under the existing events
+        pagination contract (defaults 0/100, ``after`` a strict decimal
+        integer 0..2^63-1, ``limit`` 1..100), anything else is
+        400/field ``query``. An unknown device is 404/field
+        ``device_id``; a revoked device stays observable, as do its
+        revoked consumer registrations.
+
+        On success the body keys are ``device_id``, ``watermark``,
+        ``first_seq``, ``last_seq``, ``consumers``, ``next_after`` and
+        ``has_more`` in that order; the two seqs are null when the
+        surviving event chain is empty. ``consumers`` is a page taken in
+        ``consumer_id`` code-point order by skipping *after* registrations
+        and taking at most *limit*; each item carries ``consumer_id``,
+        ``seq``, ``updated_at``, ``active`` and ``expires`` in that order,
+        with ``active`` true only while the lease is neither revoked nor
+        expired and ``seq`` is at least the watermark. ``next_after`` is
+        the offset plus the page length; ``has_more`` says whether a
+        registration follows. The lookup is purely read-only: no write,
+        no ``commit_seq`` change, byte-identical for an unchanged state.
+        """
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or not 0 <= after <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        body = self.store.redelivery_job_event_gc_observe(
+            device_id, after, limit)
+        if body is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return body
+
+    def event_gc_cleanup_expired(
+            self, device_id: str) -> Tuple[Dict[str, Any], int]:
+        """Delete one device's expired event-retention registrations.
+
+        ``POST /v1/event-gc/{device_id}/cleanup-expired``. The POST takes
+        no query parameters and no request body; the HTTP layer rejects
+        either with 400/field ``query`` or ``request_body``. An unknown
+        device is 404/field ``device_id``; a revoked device stays usable.
+        Registrations whose non-null ``expires`` has passed are deleted;
+        revoke records (a null ``expires``) and lease-less registrations
+        are never deleted, and a deleted registration later behaves as
+        never registered. With nothing expired the answer is 200
+        (``removed`` 0, nothing written); otherwise the deletion commits
+        once (``commit_seq`` plus one) and the answer is 201. On success
+        the body keys are ``device_id`` and ``removed``.
+        """
+        result = self.store.redelivery_job_event_gc_cleanup_expired(
+            device_id)
+        if result is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return result
+
     def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
         """Return one redelivery job's detail with its recovery chain.
 
