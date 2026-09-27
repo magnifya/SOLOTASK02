@@ -472,6 +472,13 @@ class CleanupLease:
     acknowledged or expired lease stays on record as history (its replay
     answers from it) but no longer blocks new claims, so the same
     consumer can claim again.
+
+    ``terminal`` records the explicit resolution delivered by
+    ``POST /v1/event-gc-batch/lease`` (``None`` for an unconfirmed
+    lease, ``"confirm"`` once the cleanup was confirmed and
+    ``"release"`` once it was released); legacy files written before
+    that endpoint restore as ``None``. A terminal lease is history and
+    never blocks a new claim.
     """
 
     lease_id: str
@@ -480,6 +487,7 @@ class CleanupLease:
     next_after: int
     limit: int
     expires: str
+    terminal: Optional[str] = None
 
 
 @dataclass

@@ -36,7 +36,11 @@ from .storage import (
     CLEANUP_CHECKPOINT_AFTER_CONFLICT,
     CLEANUP_CHECKPOINT_EXPECTED_CONFLICT,
     CLEANUP_LEASE_CONSUMER_BUSY,
+    CLEANUP_LEASE_CONSUMER_MISMATCH,
+    CLEANUP_LEASE_EXPECTED_CONFLICT,
     CLEANUP_LEASE_ID_CONFLICT,
+    CLEANUP_LEASE_STATE_CONFLICT,
+    CLEANUP_LEASE_UNKNOWN,
     DELIVERY_BAD_SEQUENCE,
     DELIVERY_DEVICE_INACTIVE,
     DELIVERY_DEVICE_MISMATCH,
@@ -2534,6 +2538,106 @@ class DeviceService:
                 raise ServiceError(
                     "the consumer already holds another unacknowledged, "
                     "unexpired lease", "consumer_id", status_code=409)
+            raise
+
+    def event_gc_batch_lease(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Confirm or release one claimed batch-cleanup audit lease.
+
+        ``POST /v1/event-gc-batch/lease``. The call takes no query
+        parameters (the HTTP layer rejects any with 400/field ``query``)
+        and the body must be a JSON object carrying exactly
+        ``consumer_id``, ``lease_id``, ``expected`` and ``op``; a
+        bad/non-object body is 400/field ``request_body``, a missing,
+        wrongly typed or extra field is 400 with that field (the first
+        extra key, in payload order). ``consumer_id`` and ``lease_id``
+        must be non-empty strings, ``expected`` a non-boolean integer in
+        0..2^63-1 and ``op`` exactly ``"confirm"`` or ``"release"``.
+
+        Under the one store lock the named ``lease_id`` is resolved
+        first: an unknown id is 404/field ``lease_id`` and an id
+        committed for another consumer is 409/field ``consumer_id``.
+        Once the lease and consumer match, a lease already resolved by
+        the same ``op`` replies 200 with the byte-identical first
+        response and writes nothing; a replay with the other ``op`` is
+        409/field ``lease_id``. For a first resolution the durable
+        lease state is checked before ``expected``: when the
+        consumer's checkpoint already reached ``next_after`` (a
+        checkpoint/consume acknowledged the lease first), a confirm is
+        a read-only 200 (no write, no generation) and a release is
+        409/lease_id, and an unconfirmed, unacknowledged lease whose
+        30-second deadline has passed is 409/lease_id for either op.
+        Only then must ``expected`` equal the lease's frozen origin
+        (the consumer's checkpoint at claim time) — otherwise
+        409/field ``expected``.
+
+        A first confirm answers 201, records the
+        resolution on the lease and advances the checkpoint to
+        ``next_after``; a first release answers 201, records the
+        resolution without advancing the checkpoint and immediately
+        unblocks the consumer's next claim. Concurrent resolutions and
+        claims share the store's one lock, so only one first resolution
+        answers 201; a data-file failure is 503/field ``data_file`` with
+        the resolution, the checkpoint advance, the commit generation
+        and both files rolled back. On success the body keys are
+        ``consumer_id``, ``lease_id``, ``op`` and ``after`` in that
+        order; ``after`` is ``next_after`` (confirm) or the unchanged
+        ``expected`` (release).
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly consumer_id, lease_id, expected and op;
+        # any other key is 400 with that field (the first extra key, in
+        # payload order).
+        extras = [key for key in payload
+                  if key not in ("consumer_id", "lease_id", "expected",
+                                 "op")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("consumer_id", "lease_id", "expected", "op"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["consumer_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        if not is_nonempty_string(payload["lease_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: lease_id", "lease_id")
+        expected = payload["expected"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(expected, int) or isinstance(expected, bool) \
+                or not 0 <= expected <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: expected",
+                "expected")
+        if payload["op"] not in ("confirm", "release"):
+            raise ServiceError(
+                'field must be "confirm" or "release": op', "op")
+        try:
+            return self.store.cleanup_lease_resolve(
+                payload["consumer_id"], payload["lease_id"], expected,
+                payload["op"])
+        except RedeliveryJobError as error:
+            if error.reason == CLEANUP_LEASE_UNKNOWN:
+                raise ServiceError(
+                    "unknown lease_id", "lease_id", status_code=404)
+            if error.reason == CLEANUP_LEASE_CONSUMER_MISMATCH:
+                raise ServiceError(
+                    "lease_id belongs to another consumer",
+                    "consumer_id", status_code=409)
+            if error.reason == CLEANUP_LEASE_STATE_CONFLICT:
+                raise ServiceError(
+                    "the lease is not open for this operation (already "
+                    "resolved with another op, expired, or released "
+                    "after acknowledgement)",
+                    "lease_id", status_code=409)
+            if error.reason == CLEANUP_LEASE_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the lease's origin "
+                    "checkpoint", "expected", status_code=409)
             raise
 
     def event_gc_batch_checkpoints(
