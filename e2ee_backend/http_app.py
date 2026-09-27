@@ -19,6 +19,8 @@ _MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
 _INBOX_JOBS_PATH = "/v1/inbox-jobs"
 _EVENT_GC_PATH = "/v1/event-gc"
 _EVENT_GC_BATCH_CLEANUP_PATH = "/v1/event-gc-batch/cleanup-expired"
+_EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH = \
+    "/v1/event-gc-batch/cleanup-expired/requests"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 _PERSISTENCE_INTEGRITY_PATH = "/v1/persistence/integrity"
@@ -398,7 +400,27 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
 
     def _route_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path == _PERSISTENCE_INTEGRITY_HISTORY_PAGE_PATH:
+        if path == _EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH:
+            self._handle_event_gc_batch_cleanup_requests()
+        elif path.startswith(_EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH + "/"):
+            # {request_id} — split on raw slashes only; a percent-encoded
+            # slash inside the id segment is part of it. The segment must
+            # be non-empty and strictly percent-decodable as UTF-8; a bad
+            # escape or an invalid encoding is 400/field request_id.
+            suffix = path[len(_EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH) + 1:]
+            if suffix and "/" not in suffix:
+                request_id = _strict_percent_decode(suffix)
+                if request_id is None:
+                    self._send_json(400, {
+                        "message": "request_id has a malformed percent "
+                                   "escape or is not valid UTF-8",
+                        "field": "request_id"})
+                    return
+                self._handle_event_gc_batch_cleanup_request_get(request_id)
+            else:
+                self._send_json(404, {"message": "request not found",
+                                      "field": "request_id"})
+        elif path == _PERSISTENCE_INTEGRITY_HISTORY_PAGE_PATH:
             self._handle_persistence_integrity_history_page()
         elif path == _PERSISTENCE_INTEGRITY_HISTORY_PATH:
             self._handle_persistence_integrity_history()
@@ -1096,6 +1118,86 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(status_code, body)
+
+    def _handle_event_gc_batch_cleanup_request_get(
+            self, request_id: str) -> None:
+        # The idempotency-record detail takes no request body and no query
+        # parameters: a non-empty body is 400/request_body, any parameter
+        # is 400/query. The path identifier is already strictly
+        # percent-decoded as UTF-8 by the router (a bad escape is 400 with
+        # field request_id). keep_blank_values so a bare ``?foo`` flag is
+        # an actual (unknown) parameter rather than being silently dropped,
+        # while a trailing ``?`` with no parameter at all is accepted.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        try:
+            body = self.service.event_gc_batch_cleanup_request_get(
+                request_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_event_gc_batch_cleanup_requests(self) -> None:
+        # The idempotency-record audit page takes no request body: a
+        # non-empty one is 400/request_body. Only single-valued after/limit
+        # query parameters are accepted (defaults 0/100); anything else is
+        # 400/query. keep_blank_values so a bare ``?foo`` flag is an actual
+        # (unknown) parameter rather than being silently dropped, while a
+        # trailing ``?`` with no parameter at all is accepted.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name not in ("after", "limit")
+               for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        after = self._decimal_nonneg_param(query, "after", default=0,
+                                           maximum=2**63 - 1, max_digits=19)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.event_gc_batch_cleanup_requests_page(
+                after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
 
     def _handle_device_inbox_lease_renew(
             self, device_id: str, lease_id: str) -> None:

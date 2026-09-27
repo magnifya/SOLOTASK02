@@ -2277,6 +2277,64 @@ class DeviceService:
                     "payload", "request_id", status_code=409)
             raise
 
+    def event_gc_batch_cleanup_request_get(
+            self, request_id: str) -> Dict[str, Any]:
+        """Return one committed batch cleanup's idempotency record.
+
+        ``GET /v1/event-gc-batch/cleanup-expired/requests/{request_id}``.
+        The GET takes no request body (the HTTP layer rejects a non-empty
+        one with 400/field ``request_body``) and no query parameters (any
+        is 400/field ``query``); the path identifier is a single non-empty
+        segment strictly percent-decoded as UTF-8 by the HTTP layer (a bad
+        escape or an invalid encoding is 400/field ``request_id``). An
+        unknown ``request_id`` is 404/field ``request_id``. On success the
+        body keys are ``request_id``, ``device_ids``, ``after``, ``limit``,
+        ``status`` and ``response`` in that order — the record exactly as
+        persisted, with the frozen response's nested key order and values
+        unchanged. The lookup is purely read-only (no write, no
+        ``commit_seq`` change), so an unchanged state answers
+        byte-identically and a restart yields the same result.
+        """
+        body = self.store.event_gc_batch_cleanup_request_get(request_id)
+        if body is None:
+            raise ServiceError(f"request not found: {request_id}",
+                               "request_id", status_code=404)
+        return body
+
+    def event_gc_batch_cleanup_requests_page(
+            self, after: int, limit: int) -> Dict[str, Any]:
+        """Return one page of batch-cleanup idempotency records.
+
+        ``GET /v1/event-gc-batch/cleanup-expired/requests``. The GET takes
+        no request body (the HTTP layer rejects a non-empty one with
+        400/field ``request_body``) and only the single-valued query
+        parameters ``after`` and ``limit`` (any other parameter is
+        400/field ``query``): ``after`` defaults to 0 and is an unsigned
+        decimal integer in 0..2**63-1, ``limit`` defaults to 100 and is in
+        1..100 (the HTTP layer enforces the decimal shape and single
+        occurrence, answering 400 with the parameter name as ``field``).
+
+        The records are ordered by commit (submission) order; the page is
+        the records at the zero-based offset *after*, at most *limit* of
+        them, each with the keys ``request_id``, ``device_ids``, ``after``,
+        ``limit``, ``status`` and ``response`` in that order. On success
+        the body keys are ``requests``, ``next_after`` and ``has_more`` in
+        that order; ``next_after`` is *after* plus the page length (equal
+        to *after* for an empty page) and ``has_more`` says whether further
+        records follow. The lookup writes nothing and advances no
+        ``commit_seq``, so an unchanged state answers byte-identically and
+        a restart yields the same result.
+        """
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or not 0 <= after <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        return self.store.event_gc_batch_cleanup_requests_page(after, limit)
+
     def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
         """Return one redelivery job's detail with its recovery chain.
 

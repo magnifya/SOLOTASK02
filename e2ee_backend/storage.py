@@ -4492,6 +4492,72 @@ class DeviceStore:
             return body, status
 
     @staticmethod
+    def event_gc_batch_cleanup_request_view(
+            record: EventGcBatchCleanupRequest) -> Dict[str, Any]:
+        """The wire view of one batch-cleanup idempotency record.
+
+        Keys in response order: ``request_id``, ``device_ids``, ``after``,
+        ``limit``, ``status`` and ``response`` — exactly as persisted, with
+        the device id list and the frozen response deep-copied so their
+        types, array order, nested key order and values are kept and a
+        caller can never mutate the stored record.
+        """
+        return {
+            "request_id": record.request_id,
+            "device_ids": list(record.device_ids),
+            "after": record.after,
+            "limit": record.limit,
+            "status": record.status,
+            "response": copy.deepcopy(record.response),
+        }
+
+    def event_gc_batch_cleanup_request_get(
+            self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Read one committed batch cleanup's idempotency record (read-only).
+
+        ``GET /v1/event-gc-batch/cleanup-expired/requests/{request_id}``.
+        Under the one store lock (shared with the batch-cleanup commits
+        that write the records) an unknown *request_id* returns ``None``
+        (404/request_id at the service layer); otherwise the record's wire
+        view is returned. The lookup writes nothing and advances no commit
+        generation, so an unchanged state answers byte-identically and a
+        rebuild after restart yields the same result.
+        """
+        with self._lock:
+            record = self._event_gc_batch_cleanup_requests.get(request_id)
+            if record is None:
+                return None
+            return self.event_gc_batch_cleanup_request_view(record)
+
+    def event_gc_batch_cleanup_requests_page(
+            self, after: int, limit: int) -> Dict[str, Any]:
+        """Read one page of batch-cleanup idempotency records (read-only).
+
+        ``GET /v1/event-gc-batch/cleanup-expired/requests``. Under the one
+        store lock (shared with the batch-cleanup commits that append the
+        records) the records are kept in commit (submission) order; the
+        page is the records at the zero-based offset *after*, at most
+        *limit* of them, each in the
+        :meth:`event_gc_batch_cleanup_request_view` wire shape. On success
+        the body keys are ``requests``, ``next_after`` and ``has_more`` in
+        that order; ``next_after`` is *after* plus the page length (so it
+        equals *after* for an empty page) and ``has_more`` says whether
+        further records follow. The lookup writes nothing and advances no
+        commit generation, so an unchanged state answers byte-identically
+        and a rebuild after restart yields the same result.
+        """
+        with self._lock:
+            records = list(self._event_gc_batch_cleanup_requests.values())
+            page = records[after:after + limit]
+            next_after = after + len(page)
+            return {
+                "requests": [self.event_gc_batch_cleanup_request_view(record)
+                             for record in page],
+                "next_after": next_after,
+                "has_more": next_after < len(records),
+            }
+
+    @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
 
