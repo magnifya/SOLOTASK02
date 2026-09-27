@@ -436,6 +436,24 @@ class EventGcBatchCleanupRequest:
 
 
 @dataclass
+class CleanupCheckpoint:
+    """One consumer's read checkpoint on the batch-cleanup audit chain.
+
+    Records how many of the committed ``event_gc_batch_cleanup_requests``
+    audit records (in commit order) the named consumer has consumed
+    (``after``), together with the timestamp of the last forward
+    checkpoint (``updated_at``). Checkpoints are independent per
+    ``consumer_id`` and created lazily on the first forward advance; a
+    consumer that never advanced has no record and reads as ``after`` 0
+    with a null ``updated_at``.
+    """
+
+    consumer_id: str
+    after: int = 0
+    updated_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

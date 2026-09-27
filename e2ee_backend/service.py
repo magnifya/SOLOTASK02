@@ -33,6 +33,8 @@ from .storage import (
     CLAIM_SESSION_INITIATOR_UNKNOWN,
     CLAIM_SESSION_PREKEY_REVOKED,
     CLAIM_SESSION_RECIPIENT_REVOKED,
+    CLEANUP_CHECKPOINT_AFTER_CONFLICT,
+    CLEANUP_CHECKPOINT_EXPECTED_CONFLICT,
     DELIVERY_BAD_SEQUENCE,
     DELIVERY_DEVICE_INACTIVE,
     DELIVERY_DEVICE_MISMATCH,
@@ -2276,6 +2278,96 @@ class DeviceService:
                     "request_id was already committed with a different "
                     "payload", "request_id", status_code=409)
             raise
+
+    def event_gc_batch_checkpoint(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Read or advance one consumer's batch-cleanup audit checkpoint.
+
+        ``POST /v1/event-gc-batch/checkpoint``. The call takes no query
+        parameters (the HTTP layer rejects any with 400/field ``query``)
+        and the body must be a JSON object carrying exactly
+        ``consumer_id``, ``expected`` and ``after``; a bad/non-object body
+        is 400/field ``request_body``, a missing, wrongly typed or extra
+        field is 400 with that field (the first extra key, in payload
+        order). ``consumer_id`` must be a non-empty string. ``expected``
+        and ``after`` come as a pair: both ``null`` for a read-only query
+        or both non-boolean integers in 0..2^63-1 for a
+        compare-and-advance; exactly one of them ``null`` is 400/field
+        ``expected``.
+
+        A read-only query answers 200 with the stored checkpoint — a
+        consumer that never advanced reads as ``after`` 0 with a null
+        ``updated_at`` — and writes nothing. A compare-and-advance whose
+        ``expected`` differs from the consumer's current checkpoint (0
+        when none is stored) is 409/field ``expected``; an ``after``
+        below the current checkpoint or beyond the number of committed
+        batch-cleanup audit records is 409/field ``after``; an ``after``
+        equal to the current checkpoint is an idempotent no-op (200, the
+        timestamp untouched, nothing written); a strictly greater one
+        advances the checkpoint and refreshes ``updated_at`` (201). The
+        decision shares the one store lock with the batch cleanup commits,
+        so concurrent advances with the same ``expected`` linearize to at
+        most one 201; a data-file failure on the advance is
+        503/field ``data_file`` with the in-memory state, both files and
+        the commit generation rolled back. On success the body keys are
+        ``consumer_id``, ``after`` and ``updated_at`` in that order, with
+        ``updated_at`` null or a UTC ISO-8601 timestamp (six microsecond
+        digits, ``+00:00``).
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly consumer_id, expected and after; any
+        # other key is 400 with that field (the first extra key, in
+        # payload order).
+        extras = [key for key in payload
+                  if key not in ("consumer_id", "expected", "after")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("consumer_id", "expected", "after"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["consumer_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        expected = payload["expected"]
+        after = payload["after"]
+        if (expected is None) != (after is None):
+            # expected/after come as a pair: both null (read-only) or both
+            # integers (compare-and-advance); exactly one null is
+            # 400/expected.
+            raise ServiceError(
+                "expected and after must both be null or both be "
+                "integers", "expected")
+        if expected is not None:
+            # bool is a subclass of int; reject it explicitly.
+            if not isinstance(expected, int) or isinstance(expected, bool) \
+                    or not 0 <= expected <= 2**63 - 1:
+                raise ServiceError(
+                    "field must be an integer in 0..2^63-1 or null: "
+                    "expected", "expected")
+            if not isinstance(after, int) or isinstance(after, bool) \
+                    or not 0 <= after <= 2**63 - 1:
+                raise ServiceError(
+                    "field must be an integer in 0..2^63-1 or null: after",
+                    "after")
+        try:
+            view, advanced = self.store.cleanup_checkpoint(
+                payload["consumer_id"], expected, after)
+        except RedeliveryJobError as error:
+            if error.reason == CLEANUP_CHECKPOINT_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the consumer's current "
+                    "checkpoint", "expected", status_code=409)
+            if error.reason == CLEANUP_CHECKPOINT_AFTER_CONFLICT:
+                raise ServiceError(
+                    "after moves backwards or exceeds the number of "
+                    "committed batch-cleanup audit records",
+                    "after", status_code=409)
+            raise
+        return view, 201 if advanced else 200
 
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:
