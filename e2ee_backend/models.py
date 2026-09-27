@@ -454,6 +454,32 @@ class CleanupCheckpoint:
 
 
 @dataclass
+class CleanupLease:
+    """One non-empty claim lease on the batch-cleanup audit chain.
+
+    A successful non-empty ``POST /v1/event-gc-batch/claim`` freezes the
+    request's ``lease_id``/``consumer_id``/``expected``/``limit`` and the
+    audit position window ``next_after`` (strictly greater than
+    ``expected``; the claim reads without advancing the consumer's
+    checkpoint) plus the 30-second ``expires`` deadline. The first
+    response is not stored: its ``records`` page is the immutable audit
+    chain slice ``[expected, next_after)`` and is rebuilt
+    byte-identically on replay or after a restart. Expired or
+    acknowledged leases (a consumer whose checkpoint reached
+    ``next_after``) stay as history — their ids stay occupied and exact
+    replays still return the first response — and no longer block the
+    consumer from taking a new lease.
+    """
+
+    lease_id: str
+    consumer_id: str
+    expected: int
+    next_after: int
+    limit: int
+    expires: str
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

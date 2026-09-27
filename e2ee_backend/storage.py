@@ -21,6 +21,7 @@ from .models import (
     BatchClaimSessionEntry,
     ClaimSessionBinding,
     CleanupCheckpoint,
+    CleanupLease,
     Device,
     EventGcBatchCleanupRequest,
     Group,
@@ -302,6 +303,21 @@ CLEANUP_CHECKPOINT_EXPECTED_CONFLICT = "cleanup_checkpoint_expected_conflict"
 #: consumer's stored checkpoint or beyond the number of committed
 #: batch-cleanup audit records (409/after at the service layer).
 CLEANUP_CHECKPOINT_AFTER_CONFLICT = "cleanup_checkpoint_after_conflict"
+#: A batch-cleanup audit claim named a ``lease_id`` already committed by
+#: a different consumer or with a different ``expected``/``limit``
+#: (409/lease_id at the service layer). An exact replay of a lease owned
+#: by the same consumer returns the first response regardless of state.
+CLEANUP_LEASE_CONFLICT = "cleanup_lease_conflict"
+#: A batch-cleanup audit claim named an ``expected`` that is not the
+#: consumer's current checkpoint (409/expected at the service layer).
+CLEANUP_LEASE_EXPECTED_CONFLICT = "cleanup_lease_expected_conflict"
+#: A batch-cleanup audit claim for a consumer that already holds an
+#: unexpired, unacknowledged claim lease (409/consumer_id at the service
+#: layer). At most one live lease per consumer is allowed.
+CLEANUP_LEASE_CONSUMER_BUSY = "cleanup_lease_consumer_busy"
+
+#: Lifetime of one batch-cleanup audit claim lease, in seconds (30).
+CLEANUP_LEASE_SECONDS = 30
 
 #: Lifetime of one event-retention lease registered by an event-gc
 #: ``touch``, in seconds (30 days). While at least one valid lease
@@ -735,6 +751,7 @@ INTEGRITY_SECTION_KEYS = (
     "event_gc",
     "event_gc_batch_cleanup_requests",
     "cleanup_checkpoints",
+    "cleanup_leases",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -747,7 +764,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 23 canonical
+    """Project a store snapshot/document payload onto the 24 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -871,6 +888,13 @@ class DeviceStore:
         # checkpoints are persisted and rolled back together with the rest
         # of the state.
         self._cleanup_checkpoints: Dict[str, CleanupCheckpoint] = {}
+        # Non-empty batch-cleanup audit claim leases, keyed by lease_id in
+        # creation order. A claim reads audit records without advancing the
+        # consumer's checkpoint; it records a lease with a 30-second
+        # ``expires`` deadline. Acknowledged/expired leases stay as history
+        # (their ids remain occupied and exact replays return the first
+        # response) and no longer count toward the one-live-lease limit.
+        self._cleanup_leases: Dict[str, CleanupLease] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -4749,6 +4773,137 @@ class DeviceStore:
             }
 
     @staticmethod
+    def _cleanup_lease_is_live_locked(
+            lease: CleanupLease, checkpoint_after: int,
+            now: datetime) -> bool:
+        """Whether a claim lease is still unexpired and unacknowledged.
+
+        A lease is acknowledged once its consumer's checkpoint has reached
+        ``next_after`` (a later checkpoint/consume advanced past the leased
+        window); such a lease, like an expired one, stays as history but no
+        longer blocks the consumer from claiming with a new id. Deadlines
+        written by this server always parse as timezone-aware ISO
+        timestamps; an unparseable (legacy/tampered) value is treated as
+        expired rather than withholding leasing forever.
+        """
+        if checkpoint_after >= lease.next_after:
+            return False
+        try:
+            deadline = datetime.fromisoformat(lease.expires)
+        except (TypeError, ValueError):
+            return False
+        if deadline.tzinfo is None:
+            return False
+        return deadline > now
+
+    def _cleanup_claim_view_locked(
+            self, lease: CleanupLease) -> Dict[str, Any]:
+        """Rebuild the frozen first response of a committed claim lease.
+
+        The ``records`` page is the immutable audit chain slice
+        ``[expected, next_after)`` in commit order, so the response rebuilds
+        byte-identically on replay and after a restart without persisting
+        it. Response keys are ``consumer_id``, ``lease_id``, ``records``,
+        ``next_after`` and ``expires`` in that order.
+        """
+        records = list(self._event_gc_batch_cleanup_requests.values())
+        return {
+            "consumer_id": lease.consumer_id,
+            "lease_id": lease.lease_id,
+            "records": [
+                self.event_gc_batch_cleanup_request_view(record)
+                for record in records[lease.expected:lease.next_after]],
+            "next_after": lease.next_after,
+            "expires": lease.expires,
+        }
+
+    def cleanup_claim(
+            self, consumer_id: str, lease_id: str, expected: int,
+            limit: int) -> Tuple[Dict[str, Any], int, bool]:
+        """Claim one page of audit records under a 30-second lease.
+
+        ``POST /v1/event-gc-batch/claim``. *consumer_id*/*lease_id* are
+        non-empty strings, *expected* a non-boolean integer in
+        0..2**63-1 and *limit* one in 1..100, all already validated by
+        the service. Under the one store lock shared with the batch
+        cleanup commits, the checkpoint advances and every other
+        mutation, the ``lease_id`` is judged first: an id already
+        committed by the same consumer replays its first response with
+        status 200 and writes nothing — the same payload whether the
+        lease is still active, has since been acknowledged or has
+        expired (its records are rebuilt from the immutable audit
+        chain); an id committed by another consumer, or with a different
+        ``expected``/``limit``, raises ``cleanup_lease_conflict``
+        (409/lease_id).
+
+        For a fresh id, *expected* must equal the consumer's current
+        checkpoint or ``cleanup_lease_expected_conflict`` is raised
+        (409/expected); the consumer must not already hold another
+        unexpired, unacknowledged lease, otherwise
+        ``cleanup_lease_consumer_busy`` is raised (409/consumer_id). The
+        page is the committed audit records right after the checkpoint,
+        at most *limit* of them, but the checkpoint is not advanced:
+        reaching ``next_after`` via checkpoint/consume acknowledges the
+        claim; until then the lease is live. An empty page answers 200
+        and occupies no lease id (no write, no generation); a non-empty
+        page records the lease with ``expires`` 30 seconds ahead,
+        persists once and answers 201. Acknowledged or expired leases
+        may be replaced by a new claim with a new id. Returns
+        ``(body, status_code, leased)``.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            existing = self._cleanup_leases.get(lease_id)
+            if existing is not None:
+                if existing.consumer_id != consumer_id \
+                        or existing.expected != expected \
+                        or existing.limit != limit:
+                    raise RedeliveryJobError(CLEANUP_LEASE_CONFLICT)
+                # Exact replay: the first response, byte-identical, even
+                # if the lease was acknowledged or expired in the
+                # meantime; nothing is written.
+                return self._cleanup_claim_view_locked(existing), 200, False
+
+            record = self._cleanup_checkpoints.get(consumer_id)
+            current = record.after if record is not None else 0
+            if expected != current:
+                raise RedeliveryJobError(
+                    CLEANUP_LEASE_EXPECTED_CONFLICT)
+            for other in self._cleanup_leases.values():
+                if other.consumer_id != consumer_id:
+                    continue
+                if self._cleanup_lease_is_live_locked(other, current, now):
+                    raise RedeliveryJobError(CLEANUP_LEASE_CONSUMER_BUSY)
+
+            records = list(self._event_gc_batch_cleanup_requests.values())
+            page = records[current:current + limit]
+            if not page:
+                # Empty page: 200, no lease id occupied, no write and no
+                # generation consumed.
+                return ({
+                    "consumer_id": consumer_id,
+                    "lease_id": lease_id,
+                    "records": [],
+                    "next_after": current,
+                    "expires": (now + timedelta(
+                        seconds=CLEANUP_LEASE_SECONDS))
+                    .isoformat(timespec="microseconds"),
+                }, 200, False)
+
+            next_after = current + len(page)
+            expires = (now + timedelta(seconds=CLEANUP_LEASE_SECONDS)) \
+                .isoformat(timespec="microseconds")
+            lease = CleanupLease(
+                lease_id=lease_id, consumer_id=consumer_id,
+                expected=current, next_after=next_after, limit=limit,
+                expires=expires)
+            self._cleanup_leases[lease_id] = lease
+            # One persistence notification for the lease: it commits (or
+            # rolls back) with the rest of the state as one generation.
+            self._notify_change()
+            return self._cleanup_claim_view_locked(lease), 201, True
+
+    @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
 
@@ -6260,6 +6415,14 @@ class DeviceStore:
                 "after": record.after,
                 "updated_at": record.updated_at,
             } for record in self._cleanup_checkpoints.values()]
+            cleanup_leases = [{
+                "lease_id": record.lease_id,
+                "consumer_id": record.consumer_id,
+                "expected": record.expected,
+                "next_after": record.next_after,
+                "limit": record.limit,
+                "expires": record.expires,
+            } for record in self._cleanup_leases.values()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -6281,7 +6444,8 @@ class DeviceStore:
                         "event_gc": event_gc,
                         "event_gc_batch_cleanup_requests":
                             event_gc_batch_cleanup_requests,
-                        "cleanup_checkpoints": cleanup_checkpoints}
+                        "cleanup_checkpoints": cleanup_checkpoints,
+                        "cleanup_leases": cleanup_leases}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -6466,6 +6630,7 @@ class DeviceStore:
         raw_event_gc_batch_cleanup_requests = state.get(
             "event_gc_batch_cleanup_requests", [])
         raw_cleanup_checkpoints = state.get("cleanup_checkpoints", [])
+        raw_cleanup_leases = state.get("cleanup_leases", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -6487,7 +6652,8 @@ class DeviceStore:
                 and isinstance(raw_event_gc, list)
                 and isinstance(
                     raw_event_gc_batch_cleanup_requests, list)
-                and isinstance(raw_cleanup_checkpoints, list)):
+                and isinstance(raw_cleanup_checkpoints, list)
+                and isinstance(raw_cleanup_leases, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -8225,6 +8391,89 @@ class DeviceStore:
                 consumer_id=k_consumer_id, after=k_after,
                 updated_at=k_updated_at)
 
+        # Non-empty batch-cleanup audit claim leases. Older version-1 files
+        # predate the section: it is absent and treated as empty. A present
+        # section holds one record per non-empty claim (creation order);
+        # every record carries exactly lease_id/consumer_id/expected/
+        # next_after/limit/expires in that order, with unique non-empty
+        # lease_id/consumer_id strings, three non-boolean integers
+        # satisfying 0 <= expected < next_after <= the audit record count
+        # and next_after - expected <= limit (limit itself in 1..100, the
+        # only values a claim can write), and expires a canonical UTC
+        # ISO-8601 timestamp. A lease is acknowledged once its consumer's
+        # checkpoint reaches next_after; among the still-unacknowledged
+        # leases at most one per consumer may be unexpired at load time,
+        # the same at-most-one-live-lease invariant the live claim
+        # enforces. Any duplicate id, key-order/type error, window
+        # contradiction or two live leases for one consumer refuses
+        # startup and never overwrites the original file.
+        cleanup_leases: Dict[str, CleanupLease] = {}
+        load_now = datetime.now(timezone.utc)
+        live_lease_by_consumer: Dict[str, CleanupLease] = {}
+        for index, raw in enumerate(raw_cleanup_leases):
+            where = f"cleanup_leases[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["lease_id", "consumer_id", "expected",
+                             "next_after", "limit", "expires"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'lease_id', "
+                    f"'consumer_id', 'expected', 'next_after', 'limit', "
+                    f"'expires' in order")
+            l_lease_id = raw["lease_id"]
+            l_consumer_id = raw["consumer_id"]
+            l_expected = raw["expected"]
+            l_next_after = raw["next_after"]
+            l_limit = raw["limit"]
+            l_expires = raw["expires"]
+            if not (isinstance(l_lease_id, str) and l_lease_id):
+                raise ValueError(
+                    f"{where}.lease_id must be a non-empty string")
+            if not (isinstance(l_consumer_id, str) and l_consumer_id):
+                raise ValueError(
+                    f"{where}.consumer_id must be a non-empty string")
+            for counter, value in (("expected", l_expected),
+                                   ("next_after", l_next_after),
+                                   ("limit", l_limit)):
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise ValueError(
+                        f"{where}.{counter} must be a non-boolean integer")
+            if not 0 <= l_expected < l_next_after <= audit_count:
+                raise ValueError(
+                    f"{where} must satisfy 0 <= expected < next_after <= "
+                    f"the audit record count {audit_count}")
+            if not 1 <= l_limit <= 100:
+                raise ValueError(
+                    f"{where}.limit must be an integer in 1..100")
+            if l_next_after - l_expected > l_limit:
+                raise ValueError(
+                    f"{where} window (next_after - expected) must not "
+                    f"exceed limit")
+            if not _is_utc_microsecond_iso(l_expires):
+                raise ValueError(
+                    f"{where}.expires must be a UTC ISO-8601 timestamp "
+                    f"with microseconds and a +00:00 offset")
+            if l_lease_id in cleanup_leases:
+                raise ValueError(
+                    f"duplicate cleanup lease in state: {l_lease_id}")
+            lease = CleanupLease(
+                lease_id=l_lease_id, consumer_id=l_consumer_id,
+                expected=l_expected, next_after=l_next_after,
+                limit=l_limit, expires=l_expires)
+            cleanup_leases[l_lease_id] = lease
+            consumer_checkpoint = cleanup_checkpoints.get(l_consumer_id)
+            consumer_after = consumer_checkpoint.after \
+                if consumer_checkpoint is not None else 0
+            if consumer_after < l_next_after \
+                    and datetime.fromisoformat(l_expires) > load_now:
+                # Unexpired and unacknowledged: at most one such lease per
+                # consumer may exist.
+                if l_consumer_id in live_lease_by_consumer:
+                    raise ValueError(
+                        f"consumer {l_consumer_id} holds more than one "
+                        f"unexpired unacknowledged cleanup lease")
+                live_lease_by_consumer[l_consumer_id] = lease
+
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
         # job without any event is simply older than the section and stays
@@ -8757,6 +9006,7 @@ class DeviceStore:
             self._event_gc_batch_cleanup_requests = \
                 event_gc_batch_cleanup_requests
             self._cleanup_checkpoints = cleanup_checkpoints
+            self._cleanup_leases = cleanup_leases
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor
