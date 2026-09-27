@@ -4644,6 +4644,71 @@ class DeviceStore:
             return (self._cleanup_checkpoint_view(consumer_id, record),
                     True)
 
+    def cleanup_consume(
+            self, consumer_id: str, expected: int,
+            limit: int) -> Tuple[Dict[str, Any], bool]:
+        """Atomically pull one page of audit records and advance.
+
+        ``POST /v1/event-gc-batch/consume``. Under the one store lock
+        (shared with the batch cleanup-expired commits that append the
+        audit records, the checkpoint advances and every other
+        mutation), an *expected* differing from the consumer's current
+        checkpoint (0 when none is stored) raises
+        :class:`RedeliveryJobError` ``cleanup_checkpoint_expected_conflict``
+        (409/expected at the service layer), so concurrent consumes with
+        the same *expected* linearize to at most one non-empty page.
+
+        On a match the committed batch-cleanup audit records after the
+        checkpoint are read in commit order (the insertion order of
+        ``_event_gc_batch_cleanup_requests``, preserved across
+        save/load), at most *limit* of them, and the checkpoint
+        advances to the offset just past the last record of the page.
+        A non-empty page refreshes ``updated_at`` and persists through
+        the change hook, so a data-file failure rolls the checkpoint,
+        the commit generation and both files back; an empty page
+        writes nothing and leaves the offset and the timestamp
+        untouched. Returns ``(view, advanced)`` with the view keys
+        ``consumer_id``, ``records``, ``next_after``, ``has_more`` and
+        ``updated_at`` in that order; each record uses the wire view of
+        :meth:`event_gc_batch_cleanup_request_view`.
+        """
+        with self._lock:
+            record = self._cleanup_checkpoints.get(consumer_id)
+            current = record.after if record is not None else 0
+            if expected != current:
+                raise RedeliveryJobError(CLEANUP_CHECKPOINT_EXPECTED_CONFLICT)
+            records = list(self._event_gc_batch_cleanup_requests.values())
+            page = records[current:current + limit]
+            if not page:
+                # Empty page: the offset and the timestamp stay
+                # untouched and nothing is written.
+                return ({
+                    "consumer_id": consumer_id,
+                    "records": [],
+                    "next_after": current,
+                    "has_more": False,
+                    "updated_at": record.updated_at
+                    if record is not None else None,
+                }, False)
+            next_after = current + len(page)
+            if record is None:
+                record = CleanupCheckpoint(
+                    consumer_id=consumer_id, after=next_after)
+                self._cleanup_checkpoints[consumer_id] = record
+            else:
+                record.after = next_after
+                record.updated_at = utc_now_iso()
+            self._notify_change()
+            return ({
+                "consumer_id": consumer_id,
+                "records": [
+                    self.event_gc_batch_cleanup_request_view(item)
+                    for item in page],
+                "next_after": next_after,
+                "has_more": next_after < len(records),
+                "updated_at": record.updated_at,
+            }, True)
+
     def cleanup_checkpoints_page(
             self, after: int, limit: int) -> Dict[str, Any]:
         """Read one page of batch-cleanup audit checkpoints (read-only).

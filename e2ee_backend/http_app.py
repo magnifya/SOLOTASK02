@@ -21,6 +21,7 @@ _EVENT_GC_PATH = "/v1/event-gc"
 _EVENT_GC_BATCH_CLEANUP_PATH = "/v1/event-gc-batch/cleanup-expired"
 _EVENT_GC_BATCH_CHECKPOINT_PATH = "/v1/event-gc-batch/checkpoint"
 _EVENT_GC_BATCH_CHECKPOINTS_PATH = "/v1/event-gc-batch/checkpoints"
+_EVENT_GC_BATCH_CONSUME_PATH = "/v1/event-gc-batch/consume"
 _EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH = \
     _EVENT_GC_BATCH_CLEANUP_PATH + "/requests"
 _GROUPS_PATH = "/v1/groups"
@@ -122,6 +123,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_event_gc_cleanup_expired_batch()
         elif path == _EVENT_GC_BATCH_CHECKPOINT_PATH:
             self._handle_event_gc_batch_checkpoint()
+        elif path == _EVENT_GC_BATCH_CONSUME_PATH:
+            self._handle_event_gc_batch_consume()
         elif path.startswith(_EVENT_GC_PATH + "/"):
             self._route_event_gc(path)
         elif path == _INBOX_JOBS_PATH + "/recover-batch":
@@ -1151,26 +1154,46 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         self._send_json(status_code, body)
 
-    def _handle_event_gc_batch_checkpoints(self) -> None:
-        # The batch-cleanup audit checkpoint page takes no request body:
-        # a non-empty one is 400/request_body. Only single-valued
-        # after/limit query parameters are accepted (defaults 0/100)
-        # under the same paging contract as the request audit list;
-        # anything else is 400/query. Validation order is fixed:
-        # non-empty body (request_body), any other parameter (query),
-        # then after, then limit. keep_blank_values so a bare ``?foo``
-        # flag is an actual (unknown) parameter rather than being
+    def _handle_event_gc_batch_consume(self) -> None:
+        # The batch-cleanup audit consume takes no query parameters:
+        # any one is a 400 (field query). keep_blank_values so a bare
+        # ``?foo`` flag is an actual (unknown) parameter rather than being
         # silently dropped, while a trailing ``?`` with no parameter at
         # all is accepted.
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._send_json(400, {"message": "invalid Content-Length header",
-                                  "field": "Content-Length"})
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
             return
-        if length > 0:
-            # Drain the body so the connection stays usable, then reject.
-            self.rfile.read(length)
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.event_gc_batch_consume(
+                payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_event_gc_batch_checkpoints(self) -> None:
+        # The batch-cleanup audit checkpoint page takes no request body:
+        # a non-empty one is 400/request_body under any valid framing
+        # (a Content-Length body or a chunked one alike). Only
+        # single-valued after/limit query parameters are accepted
+        # (defaults 0/100) under the same paging contract as the
+        # request audit list; anything else is 400/query. Validation
+        # order is fixed: non-empty body (request_body), any other
+        # parameter (query), then after, then limit. keep_blank_values
+        # so a bare ``?foo`` flag is an actual (unknown) parameter
+        # rather than being silently dropped, while a trailing ``?``
+        # with no parameter at all is accepted.
+        body_bytes = self._read_request_body()
+        if body_bytes is None:
+            return  # a 400 response was already sent
+        if body_bytes:
             self._send_json(400, {"message": "request body must be empty",
                                   "field": "request_body"})
             return
@@ -1900,6 +1923,63 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         return value
 
     # -- plumbing ---------------------------------------------------------
+
+    def _read_request_body(self) -> Optional[bytes]:
+        """Read the raw request body honoring its framing.
+
+        A ``Transfer-Encoding: chunked`` body is reassembled chunk by
+        chunk; otherwise ``Content-Length`` governs (absent means an
+        empty body). Reading the body also drains it, so the connection
+        stays usable. Returns the body bytes, or ``None`` after sending
+        the 400 response itself when the framing is malformed.
+        """
+        transfer_encoding = self.headers.get("Transfer-Encoding")
+        if transfer_encoding is not None \
+                and transfer_encoding.strip().lower() == "chunked":
+            return self._read_chunked_body()
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return None
+        return self.rfile.read(length) if length > 0 else b""
+
+    def _read_chunked_body(self) -> Optional[bytes]:
+        """Reassemble a ``Transfer-Encoding: chunked`` request body.
+
+        Returns the decoded bytes, or ``None`` after sending a 400 when
+        the chunk framing is malformed (a bad chunk-size line or a
+        truncated chunk).
+        """
+        body = bytearray()
+        while True:
+            size_line = self.rfile.readline(65537)
+            try:
+                # Chunk extensions (``;...``) are legal and ignored.
+                size = int(size_line.split(b";", 1)[0].strip(), 16)
+            except ValueError:
+                self._send_json(400, {"message": "malformed chunked "
+                                                 "request body",
+                                      "field": "request_body"})
+                return None
+            if size == 0:
+                # The terminal chunk is followed by optional trailers
+                # and a blank line; consume them so the connection
+                # stays usable.
+                while True:
+                    trailer = self.rfile.readline(65537)
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                return bytes(body)
+            chunk = self.rfile.read(size)
+            if len(chunk) != size:
+                self._send_json(400, {"message": "malformed chunked "
+                                                 "request body",
+                                      "field": "request_body"})
+                return None
+            body += chunk
+            self.rfile.read(2)  # the CRLF terminating each chunk
 
     def _read_json_request(self) -> Any:
         """Read and decode a JSON request body.

@@ -2369,6 +2369,82 @@ class DeviceService:
             raise
         return view, 201 if advanced else 200
 
+    def event_gc_batch_consume(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Atomically pull one page of audit records and advance.
+
+        ``POST /v1/event-gc-batch/consume``. The call takes no query
+        parameters (the HTTP layer rejects any with 400/field ``query``)
+        and the body must be a JSON object carrying exactly
+        ``consumer_id``, ``expected`` and ``limit``; a bad/non-object
+        body is 400/field ``request_body``, a missing, wrongly typed or
+        extra field is 400 with that field (the first extra key, in
+        payload order). ``consumer_id`` must be a non-empty string,
+        ``expected`` a non-boolean integer in 0..2^63-1 and ``limit`` a
+        non-boolean integer in 1..100.
+
+        The consumer's checkpoint starts at 0; an ``expected``
+        differing from the current checkpoint is 409/field
+        ``expected``. On a match the committed batch-cleanup audit
+        records after the checkpoint are read in commit order, at most
+        ``limit`` of them, and the checkpoint advances to the offset
+        just past the last record: a non-empty page answers 201 with a
+        fresh UTC ISO-8601 ``updated_at`` (six microsecond digits,
+        ``+00:00``); an empty page answers 200 with the offset and the
+        timestamp untouched and writes nothing. The decision shares the
+        one store lock with the batch cleanup commits, so concurrent
+        consumes with the same ``expected`` linearize to at most one
+        201; a data-file failure on the advance is 503/field
+        ``data_file`` with the checkpoint, the commit generation and
+        both files rolled back. On success the body keys are
+        ``consumer_id``, ``records``, ``next_after``, ``has_more`` and
+        ``updated_at`` in that order; each record carries the audit
+        chain's six keys (``request_id``, ``device_ids``, ``after``,
+        ``limit``, ``status``, ``response``) with the nested key order
+        untouched, and ``has_more`` says whether further records
+        follow.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly consumer_id, expected and limit; any
+        # other key is 400 with that field (the first extra key, in
+        # payload order).
+        extras = [key for key in payload
+                  if key not in ("consumer_id", "expected", "limit")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("consumer_id", "expected", "limit"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["consumer_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        expected = payload["expected"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(expected, int) or isinstance(expected, bool) \
+                or not 0 <= expected <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: expected",
+                "expected")
+        limit = payload["limit"]
+        if (not isinstance(limit, int) or isinstance(limit, bool)
+                or not 1 <= limit <= 100):
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            view, advanced = self.store.cleanup_consume(
+                payload["consumer_id"], expected, limit)
+        except RedeliveryJobError as error:
+            if error.reason == CLEANUP_CHECKPOINT_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the consumer's current "
+                    "checkpoint", "expected", status_code=409)
+            raise
+        return view, 201 if advanced else 200
+
     def event_gc_batch_checkpoints(
             self, after: int, limit: int) -> Dict[str, Any]:
         """Page the batch-cleanup audit consumer checkpoints.

@@ -266,6 +266,27 @@ class CheckpointsHTTPTest(CheckpointsMixin, unittest.TestCase):
         self.assertEqual(body["field"], "request_body")
         self.assertEqual(list(body), ["message", "field"])
 
+    def test_nonempty_chunked_body_rejected(self) -> None:
+        # A non-empty body is 400/request_body under any valid framing,
+        # chunked transfer encoding included.
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", PATH, body=b"{}", encode_chunked=True)
+        response = conn.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        conn.close()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(body["field"], "request_body")
+        self.assertEqual(list(body), ["message", "field"])
+
+    def test_empty_chunked_body_accepted(self) -> None:
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", PATH, body=b"", encode_chunked=True)
+        response = conn.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        conn.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body["audit_count"], 0)
+
     def test_body_checked_before_query(self) -> None:
         status, body, _ = self._request(path=PATH + "?foo=1", raw="{}")
         self.assertEqual(status, 400)
