@@ -35,6 +35,8 @@ from .storage import (
     CLAIM_SESSION_RECIPIENT_REVOKED,
     CLEANUP_CHECKPOINT_AFTER_CONFLICT,
     CLEANUP_CHECKPOINT_EXPECTED_CONFLICT,
+    CLEANUP_LEASE_CONSUMER_BUSY,
+    CLEANUP_LEASE_ID_CONFLICT,
     DELIVERY_BAD_SEQUENCE,
     DELIVERY_DEVICE_INACTIVE,
     DELIVERY_DEVICE_MISMATCH,
@@ -2442,6 +2444,97 @@ class DeviceService:
                     "checkpoint", "expected", status_code=409)
             raise
         return view, 201 if consumed else 200
+
+    def event_gc_batch_claim(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Claim one non-advancing audit page under a 30-second lease.
+
+        ``POST /v1/event-gc-batch/claim``. The call takes no query
+        parameters (the HTTP layer rejects any with 400/field ``query``)
+        and the body must be a JSON object carrying exactly
+        ``consumer_id``, ``lease_id``, ``expected`` and ``limit``; a
+        bad/non-object body is 400/field ``request_body``, a missing,
+        wrongly typed or extra field is 400 with that field (the first
+        extra key, in payload order). ``consumer_id`` and ``lease_id``
+        must be non-empty strings, ``expected`` a non-boolean integer in
+        0..2^63-1 and ``limit`` a non-boolean integer in 1..100.
+
+        The ``lease_id`` is resolved first, under the one store lock: an
+        exact-payload replay (same consumer, expected and limit), whether
+        the lease is still active, already acknowledged or expired,
+        answers 200 with the byte-identical first response, while the id
+        committed with another payload is 409/field ``lease_id``. A new
+        id then requires ``expected`` to equal the consumer's current
+        checkpoint (0 when none is stored) — otherwise 409/field
+        ``expected`` — and the consumer must hold no other
+        unacknowledged, unexpired lease — otherwise 409/field
+        ``consumer_id``. The response keys are ``consumer_id``,
+        ``lease_id``, ``records`` (the six-key audit wire view of the up
+        to ``limit`` records starting at ``expected``), ``next_after``
+        and ``expires`` in that order; ``expires`` is the claim time
+        plus 30 seconds as a UTC ISO-8601 timestamp (six microsecond
+        digits, ``+00:00``). The checkpoint is never advanced: the lease
+        is acknowledged once a later checkpoint/consume move reaches
+        ``next_after``; before that and while unexpired it blocks
+        another claim by the same consumer, while an acknowledged or
+        expired lease lets the consumer claim again. An empty page
+        answers 200 and occupies neither the lease id nor a commit
+        generation; a non-empty page answers 201 and persists once, so a
+        data-file failure is 503/field ``data_file`` with the lease, the
+        commit generation and both files rolled back.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly consumer_id, lease_id, expected and
+        # limit; any other key is 400 with that field (the first extra
+        # key, in payload order).
+        extras = [key for key in payload
+                  if key not in ("consumer_id", "lease_id", "expected",
+                                 "limit")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("consumer_id", "lease_id", "expected", "limit"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["consumer_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        if not is_nonempty_string(payload["lease_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: lease_id", "lease_id")
+        expected = payload["expected"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(expected, int) or isinstance(expected, bool) \
+                or not 0 <= expected <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: expected",
+                "expected")
+        limit = payload["limit"]
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            return self.store.cleanup_claim(
+                payload["consumer_id"], payload["lease_id"], expected,
+                limit)
+        except RedeliveryJobError as error:
+            if error.reason == CLEANUP_LEASE_ID_CONFLICT:
+                raise ServiceError(
+                    "lease_id was already committed with a different "
+                    "payload", "lease_id", status_code=409)
+            if error.reason == CLEANUP_CHECKPOINT_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the consumer's current "
+                    "checkpoint", "expected", status_code=409)
+            if error.reason == CLEANUP_LEASE_CONSUMER_BUSY:
+                raise ServiceError(
+                    "the consumer already holds another unacknowledged, "
+                    "unexpired lease", "consumer_id", status_code=409)
+            raise
 
     def event_gc_batch_checkpoints(
             self, after: int, limit: int) -> Dict[str, Any]:

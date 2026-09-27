@@ -454,6 +454,35 @@ class CleanupCheckpoint:
 
 
 @dataclass
+class CleanupLease:
+    """One unacknowledged lease on the batch-cleanup audit chain.
+
+    ``POST /v1/event-gc-batch/claim`` hands the named consumer a non-
+    advancing view of up to ``limit`` committed
+    ``event_gc_batch_cleanup_requests`` audit records starting at
+    ``expected`` (the consumer's checkpoint at claim time). The lease is
+    keyed by the client-chosen ``lease_id`` (globally unique) and freezes
+    that starting offset, the exclusive ``next_after`` boundary
+    (``expected`` plus the page length), the request ``limit`` and the
+    UTC ``expires`` deadline (claim time plus 30 seconds). A lease is
+    acknowledged implicitly once the consumer's checkpoint reaches
+    ``next_after`` (via the checkpoint or consume endpoints); an
+    unacknowledged, unexpired lease is the only lease its consumer may
+    hold and makes a later claim by the same consumer conflict. An
+    acknowledged or expired lease stays on record as history (its replay
+    answers from it) but no longer blocks new claims, so the same
+    consumer can claim again.
+    """
+
+    lease_id: str
+    consumer_id: str
+    expected: int
+    next_after: int
+    limit: int
+    expires: str
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 
