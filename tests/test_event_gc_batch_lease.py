@@ -481,8 +481,10 @@ class LeasePersistenceTest(LeaseMixin, unittest.TestCase):
         self.assertEqual(len(section), 1)
         self.assertEqual(list(section[0]),
                          ["lease_id", "consumer_id", "expected",
-                          "next_after", "limit", "expires", "terminal"])
+                          "next_after", "limit", "expires", "terminal",
+                          "renewals"])
         self.assertEqual(section[0]["terminal"], "confirm")
+        self.assertEqual(section[0]["renewals"], [])
         checkpoints = self._document()["cleanup_checkpoints"]
         self.assertEqual(len(checkpoints), 1)
         self.assertEqual(checkpoints[0]["after"], 1)
@@ -530,6 +532,7 @@ class LeasePersistenceTest(LeaseMixin, unittest.TestCase):
         document = self._document()
         for lease in document["cleanup_leases"]:
             lease.pop("terminal")
+            lease.pop("renewals")
         document.pop("integrity_log_version", None)
         legacy_path = os.path.join(self.directory, "legacy.json")
         with open(legacy_path, "w", encoding="utf-8") as handle:

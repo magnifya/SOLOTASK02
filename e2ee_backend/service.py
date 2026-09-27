@@ -39,6 +39,7 @@ from .storage import (
     CLEANUP_LEASE_CONSUMER_MISMATCH,
     CLEANUP_LEASE_ID_CONFLICT,
     CLEANUP_LEASE_NOT_FOUND,
+    CLEANUP_LEASE_RENEW_CONFLICT,
     CLEANUP_LEASE_STATE_CONFLICT,
     DELIVERY_BAD_SEQUENCE,
     DELIVERY_DEVICE_INACTIVE,
@@ -2627,6 +2628,74 @@ class DeviceService:
                 raise ServiceError(
                     "the cleanup lease cannot be resolved with this op "
                     "in its current state", "lease_id", status_code=409)
+            raise
+
+    def event_gc_batch_lease_renew(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Renew one batch-cleanup audit claim lease for 30 seconds.
+
+        ``POST /v1/event-gc-batch/lease/renew``. The call takes no query
+        parameters (the HTTP layer rejects any with 400/field ``query``)
+        and the body must be a JSON object carrying exactly
+        ``consumer_id``, ``lease_id`` and ``renewal_id``; a
+        bad/non-object body is 400/field ``request_body``, a missing,
+        wrongly typed or extra field is 400 with that field (the first
+        extra key, in payload order). All three fields must be non-empty
+        strings.
+
+        Under the one store lock the lease is resolved first: an unknown
+        ``lease_id`` is 404/field ``lease_id`` and a lease owned by
+        another consumer is 409/field ``consumer_id``. The same
+        ``renewal_id`` on the same lease is an exact replay and answers
+        200 with the byte-identical first response (the id is scoped to
+        the lease and may recur on other leases). A first renewal
+        requires the lease to be unterminated, unexpired against its
+        current effective deadline and the consumer's checkpoint to
+        equal the lease's starting offset while still being below
+        ``next_after`` — otherwise 409/field ``lease_id``; the eleventh
+        renewal is likewise 409/field ``lease_id``. A first renewal
+        answers 201 and extends the effective ``expires`` deadline by
+        exactly 30 seconds (the claim deadline itself stays frozen, so
+        the claim replay keeps its first response). The response keys
+        are ``consumer_id``, ``lease_id``, ``renewal_id`` and
+        ``expires`` in that order; ``expires`` is a UTC ISO-8601
+        timestamp (six microsecond digits, ``+00:00``). A data-file
+        failure is 503/field ``data_file`` with everything rolled back.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly consumer_id, lease_id and
+        # renewal_id; any other key is 400 with that field (the first
+        # extra key, in payload order).
+        extras = [key for key in payload
+                  if key not in ("consumer_id", "lease_id", "renewal_id")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("consumer_id", "lease_id", "renewal_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        for name in ("consumer_id", "lease_id", "renewal_id"):
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        try:
+            return self.store.cleanup_lease_renew(
+                payload["consumer_id"], payload["lease_id"],
+                payload["renewal_id"])
+        except RedeliveryJobError as error:
+            if error.reason == CLEANUP_LEASE_NOT_FOUND:
+                raise ServiceError(
+                    "unknown cleanup lease", "lease_id", status_code=404)
+            if error.reason == CLEANUP_LEASE_CONSUMER_MISMATCH:
+                raise ServiceError(
+                    "the cleanup lease belongs to another consumer",
+                    "consumer_id", status_code=409)
+            if error.reason == CLEANUP_LEASE_RENEW_CONFLICT:
+                raise ServiceError(
+                    "the cleanup lease cannot be renewed in its current "
+                    "state", "lease_id", status_code=409)
             raise
 
     def event_gc_batch_checkpoints(
