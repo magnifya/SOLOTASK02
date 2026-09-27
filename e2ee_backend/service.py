@@ -2795,6 +2795,43 @@ class DeviceService:
                 "field must be an integer in 1..100: limit", "limit")
         return self.store.cleanup_leases_page(consumer_id, after, limit)
 
+    def event_gc_batch_lease_get(self, lease_id: str) -> Dict[str, Any]:
+        """Return one committed batch-cleanup audit claim lease.
+
+        ``GET /v1/event-gc-batch/leases/{lease_id}``. The GET takes no
+        request body (the HTTP layer rejects a non-empty one with
+        400/field ``request_body``) and no query parameters (any is
+        400/field ``query``); the path identifier is a single non-empty
+        segment strictly percent-decoded as UTF-8 by the HTTP layer (an
+        empty segment or a deeper path is 404/field ``lease_id`` and a
+        bad escape or invalid UTF-8 is 400/field ``lease_id``). An
+        uncommitted *lease_id* (only a non-empty claim ever occupies an
+        id) is 404/field ``lease_id``.
+
+        On success the body keys are ``lease_id``, ``consumer_id``,
+        ``expected``, ``next_after``, ``limit``, ``expires``,
+        ``renewals``, ``terminal``, ``checkpoint``,
+        ``effective_expires`` and ``state`` in that order:
+        ``expected``/``next_after``/``limit``/``checkpoint`` are
+        non-negative integers (``checkpoint`` is the owner consumer's
+        current value, 0 without a record), ``renewals`` keeps commit
+        order with each item ``renewal_id`` then ``expires`` (both
+        non-empty strings), ``terminal`` is ``None``/``confirm``/
+        ``release`` and ``state`` is the same single-instant
+        classification as the paged view. The lookup is purely read-only
+        (no write, no ``commit_seq`` change) and shares the store lock
+        with every mutation.
+        """
+        if not isinstance(lease_id, str) or not lease_id:
+            raise ServiceError(
+                "field must be a non-empty string: lease_id",
+                "lease_id", status_code=404)
+        body = self.store.cleanup_lease_get(lease_id)
+        if body is None:
+            raise ServiceError(f"lease not found: {lease_id}",
+                               "lease_id", status_code=404)
+        return body
+
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:
         """Return one committed batch cleanup idempotency record.
