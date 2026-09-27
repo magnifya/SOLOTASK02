@@ -91,7 +91,12 @@ from .storage import (
     REDELIVERY_JOB_CANCEL_PARTIAL_REPLAY,
     REDELIVERY_JOB_CANCEL_STATE,
     REDELIVERY_JOB_DISPATCH_PARTIAL_REPLAY,
+    REDELIVERY_JOB_EVENT_AFTER_BELOW_WATERMARK,
     REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT,
+    REDELIVERY_JOB_EVENT_CONSUMER_INVALID,
+    REDELIVERY_JOB_EVENT_GC_CONSUMER_UNKNOWN,
+    REDELIVERY_JOB_EVENT_GC_NO_VALID_CONSUMER,
+    REDELIVERY_JOB_EVENT_GC_SEQ_CONFLICT,
     REDELIVERY_JOB_RECOVERY_CONFLICT,
     REDELIVERY_JOB_RECOVERY_LEASE_ACTIVE,
     REDELIVERY_JOB_RECOVERY_PARTIAL_REPLAY,
@@ -1903,8 +1908,15 @@ class DeviceService:
                 or not 1 <= limit <= 100:
             raise ServiceError(
                 "field must be an integer in 1..100: limit", "limit")
-        page = self.store.redelivery_job_events_page(device_id, after,
-                                                     limit)
+        try:
+            page = self.store.redelivery_job_events_page(device_id, after,
+                                                         limit)
+        except RedeliveryJobError as error:
+            if error.reason == REDELIVERY_JOB_EVENT_AFTER_BELOW_WATERMARK:
+                raise ServiceError(
+                    "after is below the event retention watermark",
+                    "after", status_code=409)
+            raise
         if page is None:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
@@ -1972,12 +1984,133 @@ class DeviceService:
                 raise ServiceError(
                     "seq exceeds the last event seq or moves backwards",
                     "seq", status_code=409)
+            if error.reason == REDELIVERY_JOB_EVENT_CONSUMER_INVALID:
+                raise ServiceError(
+                    "consumer registration is revoked or expired",
+                    "consumer_id", status_code=409)
             raise
         if result is None:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
         view, advanced = result
         return view, 201 if advanced else 200
+
+    def event_gc(self, device_id: str,
+                 payload: object) -> Tuple[Dict[str, Any], int]:
+        """Touch, revoke or prune one device's job-event retention.
+
+        ``POST /v1/event-gc/{device_id}``. The body must be a JSON object
+        carrying exactly ``consumer``, ``op`` and ``seq``; a bad/non-object
+        body is 400/field ``request_body``, a missing, wrongly valued or
+        extra field is 400 with that field (the first extra key in payload
+        order). ``op`` is one of ``touch``/``revoke``/``prune``.
+
+        ``touch`` and ``revoke`` require a non-empty string ``consumer``
+        and a null ``seq``; ``prune`` requires a null ``consumer`` and a
+        non-boolean non-negative integer ``seq``. An unknown device is
+        404/field ``device_id``; a revoked device stays usable.
+
+        ``touch`` (re-)registers the consumer with its checkpoint at the
+        current retention watermark and a fresh thirty-day lease (201).
+        ``revoke`` deactivates the registration: an unknown consumer is
+        404/field ``consumer``, the first revoke is 201 and a replay 200.
+        ``prune`` deletes the device's events with ``seq <= seq``: with no
+        valid (active, unexpired) consumer it is 409/field ``consumer``; a
+        ``seq`` outside [watermark, minimum valid checkpoint] is 409/field
+        ``seq``; an equal ``seq`` is an idempotent 200, a greater one
+        advances the watermark (201). Touch/revoke responses carry
+        ``device_id``, ``consumer``, ``seq``, ``expires``; prune carries
+        ``device_id``, ``seq``, ``removed``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly consumer, op and seq; any other key is
+        # 400 with that field (the first extra key, in payload order).
+        extras = [key for key in payload
+                  if key not in ("consumer", "op", "seq")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        if "consumer" not in payload:
+            raise ServiceError(
+                "missing required field: consumer", "consumer")
+        consumer = payload["consumer"]
+        if consumer is not None and not is_nonempty_string(consumer):
+            raise ServiceError(
+                "field must be a non-empty string or null: consumer",
+                "consumer")
+        if "op" not in payload:
+            raise ServiceError("missing required field: op", "op")
+        op = payload["op"]
+        if op not in ("touch", "revoke", "prune"):
+            raise ServiceError(
+                "field must be one of 'touch', 'revoke', 'prune': op",
+                "op")
+        if "seq" not in payload:
+            raise ServiceError("missing required field: seq", "seq")
+        seq = payload["seq"]
+        if seq is not None:
+            # bool is a subclass of int; reject it explicitly.
+            if not isinstance(seq, int) or isinstance(seq, bool):
+                raise ServiceError(
+                    "field must be an integer or null: seq", "seq")
+            if seq < 0:
+                raise ServiceError(
+                    "field must be a non-negative integer or null: seq",
+                    "seq")
+        if op in ("touch", "revoke"):
+            if consumer is None:
+                raise ServiceError(
+                    "field must be a non-empty string: consumer",
+                    "consumer")
+            if seq is not None:
+                raise ServiceError(
+                    "field must be null: seq", "seq")
+        else:
+            if consumer is not None:
+                raise ServiceError(
+                    "field must be null: consumer", "consumer")
+            if seq is None:
+                raise ServiceError(
+                    "field must be a non-negative integer: seq", "seq")
+        if op == "touch":
+            view = self.store.event_gc_touch(device_id, consumer)
+            if view is None:
+                raise ServiceError(f"device not found: {device_id}",
+                                   "device_id", status_code=404)
+            return view, 201
+        if op == "revoke":
+            try:
+                result = self.store.event_gc_revoke(device_id, consumer)
+            except RedeliveryJobError as error:
+                if error.reason == REDELIVERY_JOB_EVENT_GC_CONSUMER_UNKNOWN:
+                    raise ServiceError(
+                        f"consumer not found: {consumer}",
+                        "consumer", status_code=404)
+                raise
+            if result is None:
+                raise ServiceError(f"device not found: {device_id}",
+                                   "device_id", status_code=404)
+            view, changed = result
+            return view, 201 if changed else 200
+        try:
+            result = self.store.event_gc_prune(device_id, seq)
+        except RedeliveryJobError as error:
+            if error.reason == REDELIVERY_JOB_EVENT_GC_NO_VALID_CONSUMER:
+                raise ServiceError(
+                    "no valid consumer registration retains events",
+                    "consumer", status_code=409)
+            if error.reason == REDELIVERY_JOB_EVENT_GC_SEQ_CONFLICT:
+                raise ServiceError(
+                    "seq is outside [watermark, minimum valid checkpoint]",
+                    "seq", status_code=409)
+            raise
+        if result is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        view, changed = result
+        return view, 201 if changed else 200
 
     def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
         """Return one redelivery job's detail with its recovery chain.
