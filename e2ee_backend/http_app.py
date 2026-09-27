@@ -309,14 +309,22 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                   "field": "device_id"})
 
     def _route_event_gc(self, path: str) -> None:
-        # /v1/event-gc/{device_id} — split on raw slashes only; a
-        # percent-encoded slash inside the id segment is part of it.
+        # /v1/event-gc/{device_id} and the POST-only
+        # /v1/event-gc/{device_id}/cleanup-expired sibling — split on raw
+        # slashes only; a percent-encoded slash inside the id segment is
+        # part of it.
         suffix = path[len(_EVENT_GC_PATH) + 1:]
         if suffix and "/" not in suffix:
             self._handle_event_gc(unquote(suffix))
-        else:
-            self._send_json(404, {"message": "device not found",
-                                  "field": "device_id"})
+            return
+        if suffix.endswith("/cleanup-expired"):
+            device_segment = suffix[:-len("/cleanup-expired")]
+            if device_segment and "/" not in device_segment:
+                self._handle_event_gc_cleanup_expired(
+                    unquote(device_segment))
+                return
+        self._send_json(404, {"message": "device not found",
+                              "field": "device_id"})
 
     def _route_device_inbox_lease_renew(self, path: str) -> None:
         # {device_id}/inbox/leases/{lease_id}/renew — split on raw slashes
@@ -415,6 +423,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                       "field": "session_id"})
                 return
             self._handle_show_group_session(unquote(suffix))
+        elif path.startswith(_EVENT_GC_PATH + "/"):
+            suffix = path[len(_EVENT_GC_PATH) + 1:]
+            # /v1/event-gc/{device_id} — split on raw slashes only; a
+            # percent-encoded slash inside the id segment is part of it.
+            # The cleanup-expired sibling is POST-only; a GET there (or any
+            # deeper path) is not this route.
+            if suffix and "/" not in suffix:
+                self._handle_event_gc_observe(unquote(suffix))
+            else:
+                self._send_json(404, {"message": "device not found",
+                                      "field": "device_id"})
         elif path.startswith(_DEVICES_PATH + "/"):
             suffix = path[len(_DEVICES_PATH) + 1:]
             # A real slash means a sub-path (…/devices/a/b); a percent-encoded
@@ -970,6 +989,83 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.event_gc(device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_event_gc_observe(self, device_id: str) -> None:
+        # The retention observation takes no request body: a non-empty one
+        # is 400/request_body. Only single-valued after/limit query
+        # parameters are accepted (defaults 0/100) under the same paging
+        # contract as the job-events page; anything else is 400/query.
+        # keep_blank_values so a bare ``?foo`` flag is an actual (unknown)
+        # parameter rather than being silently dropped, while a trailing
+        # ``?`` with no parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name not in ("after", "limit")
+               for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        after = self._decimal_nonneg_param(query, "after", default=0,
+                                           maximum=2**63 - 1, max_digits=19)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        try:
+            body = self.service.event_gc_observe(device_id, after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_event_gc_cleanup_expired(self, device_id: str) -> None:
+        # The expired-registration cleanup takes no query parameters and no
+        # request body: either one is a 400 (field query / request_body).
+        # keep_blank_values so a bare ``?foo`` flag is an actual (unknown)
+        # parameter rather than being silently dropped, while a trailing
+        # ``?`` with no parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        try:
+            body, status_code = self.service.event_gc_cleanup_expired(
+                device_id)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

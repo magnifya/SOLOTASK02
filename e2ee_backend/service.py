@@ -2091,6 +2091,76 @@ class DeviceService:
                                "device_id", status_code=404)
         return result
 
+    def event_gc_observe(self, device_id: str, after: int,
+                         limit: int) -> Dict[str, Any]:
+        """Return one page of a device's event-retention records.
+
+        ``GET /v1/event-gc/{device_id}``. The GET takes no request body
+        (the HTTP layer rejects a non-empty one with 400/field
+        ``request_body``) and only the single-valued query parameters
+        ``after`` and ``limit`` (any other parameter is 400/field
+        ``query``), using the same paging contract as the job-events
+        page: ``after`` defaults to 0 and is an unsigned decimal integer
+        in 0..2**63-1, ``limit`` defaults to 100 and is in 1..100 (the
+        HTTP layer enforces the decimal shape and single occurrence,
+        answering 400 with the parameter name as ``field``).
+
+        Under the store lock the device's retention registrations —
+        revoked and expired consumers included — are ordered by
+        ``consumer_id`` Unicode code point; the page is the records at
+        the zero-based offset *after*, at most *limit* of them. An
+        unknown device is 404/field ``device_id``; a revoked device
+        stays observable. On success the body keys are ``device_id``,
+        ``watermark``, ``first_seq``, ``last_seq``, ``consumers``,
+        ``next_after`` and ``has_more`` in that order; the two seqs are
+        the bounds of the surviving event chain and are both null when
+        it is empty. Each item is ``consumer_id``, ``seq``,
+        ``updated_at``, ``active`` and ``expires`` in that order, with
+        ``active`` true only for a lease that is neither revoked nor
+        expired and whose ``seq`` is at least the watermark.
+        ``next_after`` is *after* plus the page length (equal to *after*
+        for an empty page) and ``has_more`` says whether further
+        records follow. The lookup writes nothing and advances no
+        ``commit_seq``.
+        """
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or not 0 <= after <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        page = self.store.redelivery_job_event_gc_observe(
+            device_id, after, limit)
+        if page is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return page
+
+    def event_gc_cleanup_expired(
+            self, device_id: str) -> Tuple[Dict[str, Any], int]:
+        """Delete a device's expired event-retention registrations.
+
+        ``POST /v1/event-gc/{device_id}/cleanup-expired``. The call takes
+        no query parameters and no request body (the HTTP layer rejects
+        either with 400/field ``query`` or ``request_body``). An unknown
+        device is 404/field ``device_id``; a revoked device stays
+        cleanable. Every registration whose ``expires`` is non-null and
+        already due is deleted (a revoke record is kept — its
+        ``expires`` is null), after which the consumer is unregistered.
+        With nothing to delete the call writes nothing (200,
+        ``removed`` 0); otherwise the deletions commit once and the
+        answer is 201. On success the body keys are ``device_id`` and
+        ``removed`` in that order.
+        """
+        result = self.store.redelivery_job_event_gc_cleanup_expired(
+            device_id)
+        if result is None:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        return result
+
     def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
         """Return one redelivery job's detail with its recovery chain.
 
