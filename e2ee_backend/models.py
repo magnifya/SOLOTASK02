@@ -522,6 +522,28 @@ class CleanupLease:
 
 
 @dataclass
+class CleanupLeaseEvent:
+    """One committed lifecycle event of a batch-cleanup audit claim lease.
+
+    Appended in the same locked transaction as the mutation it records:
+    the first successful claim (``claim``), each first renewal
+    (``renew``), the first explicit confirmation/release
+    (``confirm``/``release``) and — when a checkpoint or consume advance
+    crosses a lease that was never explicitly resolved — one
+    ``implicit_confirm`` per such lease in lease creation order.
+    Idempotent replays, failed operations, empty no-ops and mere expiry
+    append nothing. The stream is global (not per consumer); ``seq``
+    runs consecutively from 1 across every lease. Only the two
+    identifiers and the event type are retained.
+    """
+
+    seq: int
+    lease_id: str
+    consumer_id: str
+    type: str
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

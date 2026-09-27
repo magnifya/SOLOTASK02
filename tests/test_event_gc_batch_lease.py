@@ -690,6 +690,9 @@ class LeaseRestoreValidationTest(unittest.TestCase):
             document["cleanup_leases"] = [
                 self._lease("L1", terminal="release"),
                 self._lease("L2", expected=1, next_after=2)]
+            # The hand-built seven-key leases stand for a legacy file
+            # that predates the lifecycle event stream section.
+            document.pop("cleanup_lease_events", None)
         path = self._document_with_lease(mutate, commits=2)
         service = DeviceService()
         attach_persistence(service, path)

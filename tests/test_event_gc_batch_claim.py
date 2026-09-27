@@ -639,6 +639,9 @@ class ClaimRestoreValidationTest(unittest.TestCase):
     def test_legacy_document_without_section_loads(self) -> None:
         def mutate(document):
             document.pop("cleanup_leases")
+            # A file predating cleanup_leases also predates its lifecycle
+            # event stream: both sections absent loads as empty.
+            document.pop("cleanup_lease_events", None)
         path = self._document_with_lease(mutate)
         service = DeviceService()
         attach_persistence(service, path)  # must not raise
@@ -718,6 +721,9 @@ class ClaimRestoreValidationTest(unittest.TestCase):
             document["cleanup_checkpoints"].append({
                 "consumer_id": "c1", "after": 1,
                 "updated_at": "2026-01-01T00:00:00.000000+00:00"})
+            # The hand-built six-key leases stand for a legacy file that
+            # predates the lifecycle event stream section.
+            document.pop("cleanup_lease_events", None)
         path = self._document_with_lease(mutate_ack)
         service = DeviceService()
         attach_persistence(service, path)
@@ -731,6 +737,7 @@ class ClaimRestoreValidationTest(unittest.TestCase):
                 self._lease("L1", expires=PAST),
                 self._lease("L2", expected=1, next_after=2,
                             expires=PAST)]
+            document.pop("cleanup_lease_events", None)
         path2 = self._document_with_lease(mutate_expired)
         service2 = DeviceService()
         attach_persistence(service2, path2)

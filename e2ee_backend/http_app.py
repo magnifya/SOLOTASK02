@@ -22,6 +22,7 @@ _EVENT_GC_BATCH_CLEANUP_PATH = "/v1/event-gc-batch/cleanup-expired"
 _EVENT_GC_BATCH_CHECKPOINT_PATH = "/v1/event-gc-batch/checkpoint"
 _EVENT_GC_BATCH_CHECKPOINTS_PATH = "/v1/event-gc-batch/checkpoints"
 _EVENT_GC_BATCH_LEASES_PATH = "/v1/event-gc-batch/leases"
+_EVENT_GC_BATCH_LEASE_EVENTS_PATH = "/v1/event-gc-batch/lease-events"
 _EVENT_GC_BATCH_CONSUME_PATH = "/v1/event-gc-batch/consume"
 _EVENT_GC_BATCH_CLAIM_PATH = "/v1/event-gc-batch/claim"
 _EVENT_GC_BATCH_LEASE_PATH = "/v1/event-gc-batch/lease"
@@ -427,6 +428,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_event_gc_batch_checkpoints()
         elif path == _EVENT_GC_BATCH_LEASES_PATH:
             self._handle_event_gc_batch_leases()
+        elif path == _EVENT_GC_BATCH_LEASE_EVENTS_PATH:
+            self._handle_event_gc_batch_lease_events()
         elif path.startswith(_EVENT_GC_BATCH_LEASES_PATH + "/"):
             suffix = path[len(_EVENT_GC_BATCH_LEASES_PATH) + 1:]
             # leases/{lease_id} — routing splits on raw slashes only; a
@@ -1381,6 +1384,56 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, body)
 
+    def _handle_event_gc_batch_lease_events(self) -> None:
+        # The cleanup audit lease event stream takes no request body:
+        # a non-empty one is 400/request_body, however it is legally
+        # framed (Content-Length or chunked transfer encoding). Only
+        # single-valued consumer_id/lease_id/after/limit query
+        # parameters are accepted (defaults omitted/0/100); anything
+        # else is 400/query. Validation order is fixed: non-empty body
+        # (request_body), any other parameter (query), then consumer_id,
+        # lease_id, after, limit. keep_blank_values so a bare ``?foo``
+        # flag is an actual (unknown) parameter and so an empty
+        # ``consumer_id=``/``lease_id=`` is seen, while a trailing ``?``
+        # with no parameter at all is accepted.
+        body = self._read_framed_body()
+        if body is None:
+            return  # a 400 response was already sent
+        if body:
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name not in ("consumer_id", "lease_id", "after", "limit")
+               for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        consumer_id = self._nonempty_single_param(query, "consumer_id")
+        if consumer_id is _BAD_REQUEST:
+            return
+        lease_id = self._nonempty_single_param(query, "lease_id")
+        if lease_id is _BAD_REQUEST:
+            return
+        after = self._decimal_nonneg_param(query, "after", default=0,
+                                           maximum=2**63 - 1, max_digits=19)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.event_gc_batch_lease_events(
+                consumer_id, lease_id, after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
     def _handle_event_gc_batch_lease_get(self, lease_id: str) -> None:
         # The single cleanup audit lease query takes no request body and
         # no query parameters: a non-empty body is 400/request_body,
@@ -2067,6 +2120,30 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                   "field": name})
             return None
         return value
+
+    def _nonempty_single_param(self, query: Dict[str, list],
+                               name: str) -> Any:
+        """Parse one optional single-valued non-empty string parameter.
+
+        An absent parameter yields ``None``; a single non-empty value
+        yields it; a repeated value or an empty one (``name=``) sends a
+        400 with *name* as ``field`` and returns the
+        :data:`_BAD_REQUEST` sentinel.
+        """
+        values = query.get(name, [])
+        if not values:
+            return None
+        if len(values) != 1:
+            self._send_json(400, {
+                "message": f"{name} must appear at most once",
+                "field": name})
+            return _BAD_REQUEST
+        if not values[0]:
+            self._send_json(400, {
+                "message": f"{name} must be a non-empty string",
+                "field": name})
+            return _BAD_REQUEST
+        return values[0]
 
     def _decimal_nonneg_param(self, query: Dict[str, list], name: str,
                               default: int, minimum: int = 0,
