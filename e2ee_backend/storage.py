@@ -4354,6 +4354,90 @@ class DeviceStore:
             return ({"device_id": device_id,
                      "removed": len(expired_keys)}, 201)
 
+    def redelivery_job_event_gc_cleanup_expired_batch(
+            self, mode: str, device_ids: List[str], after: int,
+            limit: int) -> Tuple[Dict[str, Any], int]:
+        """Preview or clean up expired retention registrations for a page.
+
+        ``POST /v1/event-gc-batch/cleanup-expired``; *mode* is ``preview``
+        or ``commit`` and *device_ids* are unique non-empty strings already
+        validated by the service. The whole batch runs under one store lock
+        acquisition against one instant (shared with the event-gc
+        touch/revoke/prune transactions, the checkpoint advances and the
+        job operations that append events), so a revoked device is handled
+        at that same instant and stays cleanable.
+
+        The page is *device_ids* sliced at the zero-based offset *after*,
+        at most *limit* entries, keeping input order. Each unknown device
+        answers ``watermark``, ``expired`` and ``removed`` all null with an
+        ``error`` of ``{"status": 404, "field": "device_id"}`` (keys in
+        that order); each known device reports its retention watermark and
+        the count of checkpoint records whose ``expires`` is non-null and
+        at or past the batch instant, ``error`` null. ``preview`` never
+        writes: ``removed`` is always 0. ``commit`` deletes every expired
+        record of every known device on the page and unregisters those
+        consumers; the deletions all persist through one change hook (one
+        commit), so a data-file failure rolls the entire batch back and
+        surfaces as 503/data_file.
+
+        Returns ``(body, status_code)``: body keys ``mode``, ``results``,
+        ``next_after`` and ``has_more`` in that order, each result item
+        ``device_id``, ``watermark``, ``expired``, ``removed`` and
+        ``error`` in that order. ``next_after`` is *after* plus the page
+        length and ``has_more`` says whether further input entries
+        follow. The status is 201 when a commit deleted at least one
+        record, otherwise 200.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            page = device_ids[after:after + limit]
+            results: List[Dict[str, Any]] = []
+            total_removed = 0
+            for device_id in page:
+                device = self._find_device(device_id)
+                if device is None:
+                    results.append({
+                        "device_id": device_id,
+                        "watermark": None,
+                        "expired": None,
+                        "removed": None,
+                        "error": {"status": 404, "field": "device_id"},
+                    })
+                    continue
+                watermark = self._redelivery_job_event_gc.get(device_id, 0)
+                expired_keys = [
+                    key for key, record
+                    in self._redelivery_job_event_checkpoints.items()
+                    if key[0] == device_id
+                    and record.expires is not None
+                    and datetime.fromisoformat(record.expires) <= now]
+                expired = len(expired_keys)
+                removed = 0
+                if mode == "commit" and expired_keys:
+                    for key in expired_keys:
+                        del self._redelivery_job_event_checkpoints[key]
+                    removed = expired
+                    total_removed += removed
+                results.append({
+                    "device_id": device_id,
+                    "watermark": watermark,
+                    "expired": expired,
+                    "removed": removed,
+                    "error": None,
+                })
+            next_after = after + len(page)
+            body = {
+                "mode": mode,
+                "results": results,
+                "next_after": next_after,
+                "has_more": next_after < len(device_ids),
+            }
+            if total_removed:
+                # Every deletion of the batch commits once; a hook failure
+                # restores the whole pre-batch state (rollback).
+                self._notify_change()
+            return body, 201 if total_removed else 200
+
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.

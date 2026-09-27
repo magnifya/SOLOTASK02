@@ -18,6 +18,7 @@ _MESSAGES_PATH = "/v1/messages"
 _MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
 _INBOX_JOBS_PATH = "/v1/inbox-jobs"
 _EVENT_GC_PATH = "/v1/event-gc"
+_EVENT_GC_BATCH_CLEANUP_PATH = "/v1/event-gc-batch/cleanup-expired"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 _PERSISTENCE_INTEGRITY_PATH = "/v1/persistence/integrity"
@@ -113,6 +114,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_submit_message()
         elif path == _INBOX_JOBS_PATH:
             self._handle_inbox_job()
+        elif path == _EVENT_GC_BATCH_CLEANUP_PATH:
+            self._handle_event_gc_cleanup_expired_batch()
         elif path.startswith(_EVENT_GC_PATH + "/"):
             self._route_event_gc(path)
         elif path == _INBOX_JOBS_PATH + "/recover-batch":
@@ -1066,6 +1069,29 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body, status_code = self.service.event_gc_cleanup_expired(
                 device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_event_gc_cleanup_expired_batch(self) -> None:
+        # The batch cleanup takes no query parameters: any one is a 400
+        # (field query). keep_blank_values so a bare ``?foo`` flag is an
+        # actual (unknown) parameter rather than being silently dropped,
+        # while a trailing ``?`` with no parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = \
+                self.service.event_gc_cleanup_expired_batch(payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

@@ -2161,6 +2161,89 @@ class DeviceService:
                                "device_id", status_code=404)
         return result
 
+    def event_gc_cleanup_expired_batch(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Preview or clean up expired retention registrations for a page.
+
+        ``POST /v1/event-gc-batch/cleanup-expired``. The call takes no
+        query parameters (the HTTP layer rejects any with 400/field
+        ``query``) and the body must be a JSON object carrying exactly
+        ``mode``, ``device_ids``, ``after`` and ``limit``; a bad/non-object
+        body is 400/field ``request_body``. ``mode`` must be one of
+        ``preview`` or ``commit``; ``device_ids`` must be a non-empty
+        array of unique non-empty strings; ``after`` must be a
+        non-negative, non-boolean integer and ``limit`` a non-boolean
+        integer in 1..100. A missing, wrongly typed or out-of-range field
+        is 400 with that field name, an extra top-level key is 400 with
+        that key (the first, in payload order), and an illegal
+        (non-string/empty) or repeated element is 400/field
+        ``device_ids[i]``.
+
+        The input list is paged from the zero-based offset ``after`` for
+        at most ``limit`` entries and the whole page is handled under the
+        one store lock at one instant, so a revoked device stays
+        cleanable. Each unknown device answers with the three counters
+        null and ``error`` ``{"status": 404, "field": "device_id"}``
+        (keys in that order); each known device answers with non-negative
+        integer counters and ``error`` null. ``preview`` only counts
+        registrations whose ``expires`` is non-null and due: ``removed``
+        is always 0, the call writes nothing and answers 200. ``commit``
+        deletes that set across the page in one transaction: with at
+        least one deletion the answer is 201, otherwise 200; a data-file
+        failure rolls the whole batch back and the HTTP layer answers
+        503/field ``data_file``. On success the body keys are ``mode``,
+        ``results``, ``next_after`` and ``has_more`` in that order;
+        results keep input order, each item ``device_id``,
+        ``watermark``, ``expired``, ``removed`` and ``error`` in that
+        order; ``next_after`` is ``after`` plus the page length and
+        ``has_more`` says whether further input entries follow.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly mode, device_ids, after and limit; any
+        # other key is 400 with that field (the first extra key, in
+        # payload order).
+        allowed = ("mode", "device_ids", "after", "limit")
+        extras = [key for key in payload if key not in allowed]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in allowed:
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        mode = payload["mode"]
+        if not is_nonempty_string(mode) or mode not in ("preview",
+                                                        "commit"):
+            raise ServiceError(
+                "field must be one of 'preview' or 'commit': mode", "mode")
+        raw_device_ids = payload["device_ids"]
+        if not isinstance(raw_device_ids, list) or not raw_device_ids:
+            raise ServiceError(
+                "field must be a non-empty array: device_ids", "device_ids")
+        after = payload["after"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(after, int) or isinstance(after, bool) or after < 0:
+            raise ServiceError(
+                "field must be a non-negative integer: after", "after")
+        limit = payload["limit"]
+        if (not isinstance(limit, int) or isinstance(limit, bool)
+                or not 1 <= limit <= 100):
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        device_ids: List[str] = []
+        seen_device_ids: set = set()
+        for index, element in enumerate(raw_device_ids):
+            item_field = f"device_ids[{index}]"
+            if not is_nonempty_string(element) or element in seen_device_ids:
+                raise ServiceError(
+                    "array elements must be unique non-empty strings: "
+                    f"{item_field}", item_field)
+            seen_device_ids.add(element)
+            device_ids.append(element)
+        return self.store.redelivery_job_event_gc_cleanup_expired_batch(
+            mode, device_ids, after, limit)
+
     def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
         """Return one redelivery job's detail with its recovery chain.
 
