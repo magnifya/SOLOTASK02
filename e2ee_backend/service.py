@@ -2161,6 +2161,83 @@ class DeviceService:
                                "device_id", status_code=404)
         return result
 
+    def event_gc_batch_cleanup_expired(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Preview or delete expired retention registrations across devices.
+
+        ``POST /v1/event-gc-batch/cleanup-expired``. The body must be a
+        JSON object carrying exactly ``mode``, ``device_ids``, ``after``
+        and ``limit``: a bad/non-object body is 400/field
+        ``request_body``, a missing, wrongly typed or out-of-range field
+        is 400 with that field, and the first extra top-level key (in
+        payload order) is 400 with that key. ``mode`` is ``preview`` or
+        ``commit``; ``device_ids`` is a non-empty array of unique
+        non-empty strings (an invalid or repeated item is
+        400/``device_ids[i]``); ``after`` is a non-negative, non-boolean
+        integer and ``limit`` a non-boolean integer in 1..100.
+
+        The page is the device ids at the zero-based offset ``after``,
+        at most ``limit`` of them, processed in input order at one
+        instant under the store lock; revoked devices stay cleanable.
+        Results keep the page order, each item ``device_id``,
+        ``watermark``, ``expired``, ``removed``, ``error`` in that order:
+        a known device reports non-negative integers and a null error,
+        an unknown device nulls and ``{"status": 404, "field":
+        "device_id"}``. ``preview`` only counts the due registrations
+        (``removed`` 0, 200, no write); ``commit`` deletes them across
+        the page in one commit (201 when anything was removed, else
+        200). The body keys are ``mode``, ``results``, ``next_after``
+        and ``has_more`` in that order.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("mode", "device_ids", "after", "limit"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        # The body carries exactly mode, device_ids, after and limit; any
+        # other top-level key is 400 with that key (the first extra key,
+        # in payload order).
+        extras = [key for key in payload
+                  if key not in ("mode", "device_ids", "after", "limit")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        mode = payload["mode"]
+        if mode not in ("preview", "commit"):
+            raise ServiceError(
+                "field must be one of 'preview' or 'commit': mode", "mode")
+        raw_ids = payload["device_ids"]
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ServiceError(
+                "field must be a non-empty array: device_ids", "device_ids")
+        device_ids: List[str] = []
+        seen_ids: set = set()
+        for index, element in enumerate(raw_ids):
+            item_field = f"device_ids[{index}]"
+            if not is_nonempty_string(element):
+                raise ServiceError(
+                    "array element must be a non-empty string: "
+                    f"{item_field}", item_field)
+            if element in seen_ids:
+                raise ServiceError(
+                    f"duplicate device_id in device_ids: {element}",
+                    item_field)
+            seen_ids.add(element)
+            device_ids.append(element)
+        after = payload["after"]
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or after < 0:
+            raise ServiceError(
+                "field must be a non-negative integer: after", "after")
+        limit = payload["limit"]
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        return self.store.redelivery_job_event_gc_cleanup_expired_batch(
+            mode, device_ids, after, limit)
+
     def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
         """Return one redelivery job's detail with its recovery chain.
 

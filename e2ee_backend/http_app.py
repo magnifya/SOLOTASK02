@@ -18,6 +18,7 @@ _MESSAGES_PATH = "/v1/messages"
 _MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
 _INBOX_JOBS_PATH = "/v1/inbox-jobs"
 _EVENT_GC_PATH = "/v1/event-gc"
+_EVENT_GC_BATCH_PATH = "/v1/event-gc-batch"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 _PERSISTENCE_INTEGRITY_PATH = "/v1/persistence/integrity"
@@ -115,6 +116,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_inbox_job()
         elif path.startswith(_EVENT_GC_PATH + "/"):
             self._route_event_gc(path)
+        elif path == _EVENT_GC_BATCH_PATH + "/cleanup-expired":
+            self._handle_event_gc_batch_cleanup_expired()
         elif path == _INBOX_JOBS_PATH + "/recover-batch":
             self._handle_inbox_job_recover_batch()
         elif path == _INBOX_JOBS_PATH + "/dispatch-batch":
@@ -1066,6 +1069,28 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body, status_code = self.service.event_gc_cleanup_expired(
                 device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_event_gc_batch_cleanup_expired(self) -> None:
+        # The batch expired-registration cleanup takes no query
+        # parameters: any (a bare ``?foo`` flag included) is 400/query,
+        # while a trailing ``?`` with no parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.event_gc_batch_cleanup_expired(
+                payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

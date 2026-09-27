@@ -4354,6 +4354,82 @@ class DeviceStore:
             return ({"device_id": device_id,
                      "removed": len(expired_keys)}, 201)
 
+    def redelivery_job_event_gc_cleanup_expired_batch(
+            self, mode: str, device_ids: List[str], after: int,
+            limit: int) -> Tuple[Dict[str, Any], int]:
+        """Preview or delete expired retention registrations across devices.
+
+        ``POST /v1/event-gc-batch/cleanup-expired``. Under the one store
+        lock (shared with the event-gc touch/revoke/prune transactions,
+        the checkpoint advances and the job operations that append
+        events), the page is the *device_ids* at the zero-based offset
+        *after*, at most *limit* of them, all evaluated at one instant;
+        a revoked device stays cleanable.
+
+        Each page item reports ``device_id``, ``watermark``, ``expired``,
+        ``removed`` and ``error`` in that order: a known device carries
+        its retention watermark, the count of its registrations whose
+        ``expires`` is non-null and due, the count this call removed
+        (always 0 for ``preview``) and a null ``error``; an unknown
+        device carries nulls and ``error`` ``{"status": 404, "field":
+        "device_id"}``. ``commit`` deletes exactly the counted sets —
+        revoke records and lease-less checkpoints (``expires`` null) are
+        never deleted, as in the single-device entry — with one
+        persistence notification for the whole batch (201 when anything
+        was removed, else 200; a durable write failure rolls every
+        device back); ``preview`` writes nothing (200). The body keys
+        are ``mode``, ``results``, ``next_after`` and ``has_more`` in
+        that order, with ``next_after`` *after* plus the page length and
+        ``has_more`` marking a tail.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            page = device_ids[after:after + limit]
+            results: List[Dict[str, Any]] = []
+            expired_keys: List[Tuple[str, str]] = []
+            for device_id in page:
+                device = self._find_device(device_id)
+                if device is None:
+                    results.append({
+                        "device_id": device_id,
+                        "watermark": None,
+                        "expired": None,
+                        "removed": None,
+                        "error": {"status": 404, "field": "device_id"},
+                    })
+                    continue
+                due = [key for key, record
+                       in self._redelivery_job_event_checkpoints.items()
+                       if key[0] == device_id
+                       and record.expires is not None
+                       and datetime.fromisoformat(record.expires) <= now]
+                if mode == "commit":
+                    expired_keys.extend(due)
+                results.append({
+                    "device_id": device_id,
+                    "watermark": self._redelivery_job_event_gc.get(
+                        device_id, 0),
+                    "expired": len(due),
+                    "removed": len(due) if mode == "commit" else 0,
+                    "error": None,
+                })
+            status = 200
+            if expired_keys:
+                for key in expired_keys:
+                    del self._redelivery_job_event_checkpoints[key]
+                # One persistence notification for the whole batch: every
+                # deletion commits (or rolls back) together and the
+                # generation advances exactly once.
+                self._notify_change()
+                status = 201
+            next_after = after + len(page)
+            return {
+                "mode": mode,
+                "results": results,
+                "next_after": next_after,
+                "has_more": next_after < len(device_ids),
+            }, status
+
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
