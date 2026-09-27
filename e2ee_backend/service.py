@@ -40,6 +40,7 @@ from .storage import (
     DELIVERY_SESSION_UNKNOWN,
     DEVICE_REVOKED,
     DEVICE_UNKNOWN,
+    EVENT_GC_BATCH_REQUEST_ID_CONFLICT,
     GROUP_ACTOR_NOT_CREATOR,
     GROUP_ACTOR_REVOKED,
     GROUP_ACTOR_UNKNOWN,
@@ -125,6 +126,7 @@ from .storage import (
     BatchClaimSessionError,
     ClaimSessionError,
     DeliveryError,
+    EventGcBatchCleanupRequestError,
     GroupError,
     GroupSessionRotationError,
     GroupSyncError,
@@ -2167,17 +2169,19 @@ class DeviceService:
 
         ``POST /v1/event-gc-batch/cleanup-expired``. The call takes no
         query parameters (the HTTP layer rejects any with 400/field
-        ``query``) and the body must be a JSON object carrying exactly
-        ``mode``, ``device_ids``, ``after`` and ``limit``; a bad/non-object
-        body is 400/field ``request_body``. ``mode`` must be one of
-        ``preview`` or ``commit``; ``device_ids`` must be a non-empty
-        array of unique non-empty strings; ``after`` must be a
-        non-negative, non-boolean integer and ``limit`` a non-boolean
-        integer in 1..100. A missing, wrongly typed or out-of-range field
-        is 400 with that field name, an extra top-level key is 400 with
-        that key (the first, in payload order), and an illegal
-        (non-string/empty) or repeated element is 400/field
-        ``device_ids[i]``.
+        ``query``) and the body must be a JSON object carrying ``mode``,
+        ``device_ids``, ``after`` and ``limit`` plus, for ``commit`` only,
+        an optional ``request_id``; a bad/non-object body is 400/field
+        ``request_body``. ``mode`` must be one of ``preview`` or
+        ``commit``; ``device_ids`` must be a non-empty array of unique
+        non-empty strings; ``after`` must be a non-negative, non-boolean
+        integer and ``limit`` a non-boolean integer in 1..100. A missing,
+        wrongly typed or out-of-range field is 400 with that field name,
+        an extra top-level key is 400 with that key (the first, in payload
+        order), and an illegal (non-string/empty) or repeated element is
+        400/field ``device_ids[i]``. ``request_id`` must be a non-empty
+        string (anything else, or its presence on a ``preview``, is
+        400/field ``request_id``).
 
         The input list is paged from the zero-based offset ``after`` for
         at most ``limit`` entries and the whole page is handled under the
@@ -2197,19 +2201,29 @@ class DeviceService:
         ``watermark``, ``expired``, ``removed`` and ``error`` in that
         order; ``next_after`` is ``after`` plus the page length and
         ``has_more`` says whether further input entries follow.
+
+        A ``commit`` carrying ``request_id`` is idempotent across retries
+        and restarts: a first-seen id commits the deletions, the frozen
+        response and the idempotency record in the one locked transaction
+        (a delete-nothing commit included — exactly one ``commit_seq``
+        advance); a replay with the identical paged input (``device_ids``
+        in order, ``after``, ``limit``) returns the first status code and
+        the byte-identical first response without writing or advancing
+        ``commit_seq``, even if the state has since changed; the same id
+        with any differing input field is a 409 naming ``request_id``.
         """
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object",
                                "request_body")
-        # The body carries exactly mode, device_ids, after and limit; any
-        # other key is 400 with that field (the first extra key, in
-        # payload order).
-        allowed = ("mode", "device_ids", "after", "limit")
+        # The body carries mode, device_ids, after and limit plus the
+        # optional (commit-only) request_id; any other key is 400 with
+        # that field (the first extra key, in payload order).
+        allowed = ("mode", "device_ids", "after", "limit", "request_id")
         extras = [key for key in payload if key not in allowed]
         if extras:
             raise ServiceError(
                 f"unexpected field: {extras[0]}", extras[0])
-        for name in allowed:
+        for name in ("mode", "device_ids", "after", "limit"):
             if name not in payload:
                 raise ServiceError(f"missing required field: {name}", name)
         mode = payload["mode"]
@@ -2241,8 +2255,26 @@ class DeviceService:
                     f"{item_field}", item_field)
             seen_device_ids.add(element)
             device_ids.append(element)
-        return self.store.redelivery_job_event_gc_cleanup_expired_batch(
-            mode, device_ids, after, limit)
+        request_id: Optional[str] = None
+        if "request_id" in payload:
+            if mode != "commit":
+                raise ServiceError(
+                    "field is only accepted for commit: request_id",
+                    "request_id")
+            if not is_nonempty_string(payload["request_id"]):
+                raise ServiceError(
+                    "field must be a non-empty string: request_id",
+                    "request_id")
+            request_id = payload["request_id"]
+        try:
+            return self.store.redelivery_job_event_gc_cleanup_expired_batch(
+                mode, device_ids, after, limit, request_id)
+        except EventGcBatchCleanupRequestError as error:
+            if error.reason == EVENT_GC_BATCH_REQUEST_ID_CONFLICT:
+                raise ServiceError(
+                    "request_id was already used with different fields: "
+                    f"{request_id}", "request_id", status_code=409)
+            raise  # pragma: no cover - defensive
 
     def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
         """Return one redelivery job's detail with its recovery chain.

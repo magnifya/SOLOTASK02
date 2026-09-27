@@ -21,6 +21,7 @@ from .models import (
     BatchClaimSessionEntry,
     ClaimSessionBinding,
     Device,
+    EventGcBatchCleanupRequest,
     Group,
     GroupSession,
     GroupSessionRotation,
@@ -93,6 +94,9 @@ MESSAGE_BAD_SEQUENCE = "bad_sequence"
 MESSAGE_DUPLICATE_NONCE = "duplicate_nonce"
 #: A request_id already committed with different envelope fields.
 MESSAGE_REQUEST_ID_CONFLICT = "request_id_conflict"
+
+#: A batch-cleanup request_id already committed with a different paged input.
+EVENT_GC_BATCH_REQUEST_ID_CONFLICT = "request_id_conflict"
 
 #: Outcome code for a failed message listing.
 MESSAGE_DEVICE_INACTIVE = "device_inactive"
@@ -380,6 +384,14 @@ class MessageCreateError(Exception):
 
 class MessageListError(Exception):
     """An atomic message listing check failed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class EventGcBatchCleanupRequestError(Exception):
+    """An idempotent batch-cleanup commit conflicted (nothing was written)."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -718,6 +730,7 @@ INTEGRITY_SECTION_KEYS = (
     "redelivery_job_events",
     "redelivery_job_event_checkpoints",
     "event_gc",
+    "event_gc_batch_cleanup_requests",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -730,7 +743,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 21 canonical
+    """Project a store snapshot/document payload onto the 22 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -840,6 +853,12 @@ class DeviceStore:
         # keep their original seqs — the chain simply starts at
         # watermark + 1 — and new events continue past the last seq.
         self._redelivery_job_event_gc: Dict[str, int] = {}
+        # Committed idempotent batch cleanups, keyed by the client-chosen
+        # request_id (globally unique), in commit order. Each record freezes
+        # the paged input and the full first response so a replay returns it
+        # byte-identically without touching the state.
+        self._event_gc_batch_cleanup_requests: \
+            Dict[str, EventGcBatchCleanupRequest] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -4356,7 +4375,8 @@ class DeviceStore:
 
     def redelivery_job_event_gc_cleanup_expired_batch(
             self, mode: str, device_ids: List[str], after: int,
-            limit: int) -> Tuple[Dict[str, Any], int]:
+            limit: int, request_id: Optional[str] = None
+            ) -> Tuple[Dict[str, Any], int]:
         """Preview or clean up expired retention registrations for a page.
 
         ``POST /v1/event-gc-batch/cleanup-expired``; *mode* is ``preview``
@@ -4380,6 +4400,21 @@ class DeviceStore:
         commit), so a data-file failure rolls the entire batch back and
         surfaces as 503/data_file.
 
+        A ``commit`` may carry a client-chosen *request_id* (a non-empty
+        string, validated by the service) making it idempotent across
+        retries and restarts. The id is looked up first: a record whose
+        paged input (``device_ids`` in order, ``after``, ``limit``) matches
+        the request replays the frozen first response with its original
+        status — writing nothing and advancing no ``commit_seq``, even if
+        the underlying state has since changed; a record with any differing
+        input field raises :class:`EventGcBatchCleanupRequestError`
+        (``request_id_conflict``, 409 at the service layer). A fresh id
+        commits the deletions, the frozen response and the idempotency
+        record in this one locked transaction (a single change hook, so a
+        concurrent identical commit linearizes to exactly one execution and
+        even a delete-nothing commit advances ``commit_seq`` exactly once);
+        a data-file failure rolls all three back together.
+
         Returns ``(body, status_code)``: body keys ``mode``, ``results``,
         ``next_after`` and ``has_more`` in that order, each result item
         ``device_id``, ``watermark``, ``expired``, ``removed`` and
@@ -4389,6 +4424,18 @@ class DeviceStore:
         record, otherwise 200.
         """
         with self._lock:
+            if mode == "commit" and request_id is not None:
+                record = self._event_gc_batch_cleanup_requests.get(
+                    request_id)
+                if record is not None:
+                    if (record.device_ids == list(device_ids)
+                            and record.after == after
+                            and record.limit == limit):
+                        # Idempotent replay: the frozen first response and
+                        # its status, with no write and no generation.
+                        return copy.deepcopy(record.response), record.status
+                    raise EventGcBatchCleanupRequestError(
+                        EVENT_GC_BATCH_REQUEST_ID_CONFLICT)
             now = datetime.now(timezone.utc)
             page = device_ids[after:after + limit]
             results: List[Dict[str, Any]] = []
@@ -4432,11 +4479,25 @@ class DeviceStore:
                 "next_after": next_after,
                 "has_more": next_after < len(device_ids),
             }
-            if total_removed:
+            status = 201 if total_removed else 200
+            if mode == "commit" and request_id is not None:
+                # The deletions, the frozen response and the idempotency
+                # record commit together through one change hook — even a
+                # delete-nothing commit persists its record (one generation).
+                self._event_gc_batch_cleanup_requests[request_id] = \
+                    EventGcBatchCleanupRequest(
+                        request_id=request_id,
+                        device_ids=list(device_ids),
+                        after=after,
+                        limit=limit,
+                        status=status,
+                        response=copy.deepcopy(body))
+                self._notify_change()
+            elif total_removed:
                 # Every deletion of the batch commits once; a hook failure
                 # restores the whole pre-batch state (rollback).
                 self._notify_change()
-            return body, 201 if total_removed else 200
+            return body, status
 
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
@@ -5937,6 +5998,14 @@ class DeviceStore:
                 "seq": gc_seq,
             } for gc_device_id, gc_seq in
                 self._redelivery_job_event_gc.items()]
+            event_gc_batch_cleanup_requests = [{
+                "request_id": r.request_id,
+                "device_ids": list(r.device_ids),
+                "after": r.after,
+                "limit": r.limit,
+                "status": r.status,
+                "response": copy.deepcopy(r.response),
+            } for r in self._event_gc_batch_cleanup_requests.values()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -5955,7 +6024,9 @@ class DeviceStore:
                         "redelivery_job_events": redelivery_job_events,
                         "redelivery_job_event_checkpoints":
                             redelivery_job_event_checkpoints,
-                        "event_gc": event_gc}
+                        "event_gc": event_gc,
+                        "event_gc_batch_cleanup_requests":
+                            event_gc_batch_cleanup_requests}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -6137,6 +6208,8 @@ class DeviceStore:
         raw_redelivery_job_event_checkpoints = state.get(
             "redelivery_job_event_checkpoints", [])
         raw_event_gc = state.get("event_gc", [])
+        raw_event_gc_batch_cleanup_requests = state.get(
+            "event_gc_batch_cleanup_requests", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -6155,7 +6228,9 @@ class DeviceStore:
                 and isinstance(raw_redelivery_jobs, list)
                 and isinstance(raw_redelivery_job_events, list)
                 and isinstance(raw_redelivery_job_event_checkpoints, list)
-                and isinstance(raw_event_gc, list)):
+                and isinstance(raw_event_gc, list)
+                and isinstance(
+                    raw_event_gc_batch_cleanup_requests, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -7689,6 +7764,163 @@ class DeviceStore:
                     f"duplicate event_gc record in state: {g_device_id}")
             redelivery_job_event_gc[g_device_id] = g_seq
 
+        # Idempotent batch-cleanup commits. Older version-1 files predate
+        # the section: it is absent and treated as empty. A present section
+        # holds one record per committed request_id, in commit order; every
+        # record carries exactly request_id/device_ids/after/limit/status/
+        # response in that order, with the first four typed as the request
+        # fields (device_ids a non-empty array of unique non-empty strings,
+        # after a non-negative non-boolean integer, limit a non-boolean
+        # integer in 1..100), status 200 or 201, and response the frozen
+        # commit response (exactly mode/results/next_after/has_more with
+        # mode "commit" and the per-item key order and types of the live
+        # response). The frozen response must agree with the paged input:
+        # the results carry exactly the page device_ids[after:after+limit]
+        # in order, next_after is after plus the page length, has_more says
+        # whether further input entries follow, and the status is 201
+        # exactly when some item removed at least one record. A duplicated
+        # request_id, a field, type or key-order error, or a paging or
+        # device-order contradiction refuses startup rather than silently
+        # dropping the idempotency guarantee.
+        event_gc_batch_cleanup_requests: \
+            Dict[str, EventGcBatchCleanupRequest] = {}
+        for index, raw in enumerate(raw_event_gc_batch_cleanup_requests):
+            where = f"event_gc_batch_cleanup_requests[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["request_id", "device_ids", "after", "limit",
+                             "status", "response"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'request_id', "
+                    f"'device_ids', 'after', 'limit', 'status', 'response' "
+                    f"in order")
+            r_request_id = raw["request_id"]
+            r_device_ids = raw["device_ids"]
+            r_after = raw["after"]
+            r_limit = raw["limit"]
+            r_status = raw["status"]
+            r_response = raw["response"]
+            if not (isinstance(r_request_id, str) and r_request_id):
+                raise ValueError(
+                    f"{where}.request_id must be a non-empty string")
+            if r_request_id in event_gc_batch_cleanup_requests:
+                raise ValueError(
+                    f"duplicate event_gc_batch_cleanup_requests record in "
+                    f"state: {r_request_id}")
+            if not isinstance(r_device_ids, list) or not r_device_ids:
+                raise ValueError(
+                    f"{where}.device_ids must be a non-empty array")
+            for element_index, element in enumerate(r_device_ids):
+                if not (isinstance(element, str) and element):
+                    raise ValueError(
+                        f"{where}.device_ids[{element_index}] must be a "
+                        f"non-empty string")
+            if len(set(r_device_ids)) != len(r_device_ids):
+                raise ValueError(
+                    f"{where}.device_ids must not contain duplicates")
+            if not isinstance(r_after, int) or isinstance(r_after, bool) \
+                    or r_after < 0:
+                raise ValueError(
+                    f"{where}.after must be a non-negative integer")
+            if not isinstance(r_limit, int) or isinstance(r_limit, bool) \
+                    or not 1 <= r_limit <= 100:
+                raise ValueError(
+                    f"{where}.limit must be an integer in 1..100")
+            if not isinstance(r_status, int) or isinstance(r_status, bool) \
+                    or r_status not in (200, 201):
+                raise ValueError(f"{where}.status must be 200 or 201")
+            if not isinstance(r_response, dict):
+                raise ValueError(f"{where}.response must be an object")
+            if list(r_response) != ["mode", "results", "next_after",
+                                    "has_more"]:
+                raise ValueError(
+                    f"{where}.response must have exactly the keys 'mode', "
+                    f"'results', 'next_after', 'has_more' in order")
+            if r_response["mode"] != "commit":
+                raise ValueError(
+                    f"{where}.response.mode must be 'commit'")
+            r_results = r_response["results"]
+            if not isinstance(r_results, list):
+                raise ValueError(f"{where}.response.results must be a list")
+            r_next_after = r_response["next_after"]
+            if not isinstance(r_next_after, int) \
+                    or isinstance(r_next_after, bool) or r_next_after < 0:
+                raise ValueError(
+                    f"{where}.response.next_after must be a non-negative "
+                    f"integer")
+            if not isinstance(r_response["has_more"], bool):
+                raise ValueError(
+                    f"{where}.response.has_more must be a boolean")
+            # The frozen response must be the one the paged input produces:
+            # exactly the page slice, in order, with consistent cursors.
+            page = r_device_ids[r_after:r_after + r_limit]
+            if len(r_results) != len(page):
+                raise ValueError(
+                    f"{where}.response.results contradicts the paged device "
+                    f"list")
+            if r_next_after != r_after + len(page):
+                raise ValueError(
+                    f"{where}.response.next_after contradicts the paged "
+                    f"device list")
+            if r_response["has_more"] != (r_next_after < len(r_device_ids)):
+                raise ValueError(
+                    f"{where}.response.has_more contradicts the paged "
+                    f"device list")
+            any_removed = False
+            for item_index, item in enumerate(r_results):
+                item_where = f"{where}.response.results[{item_index}]"
+                if not isinstance(item, dict):
+                    raise ValueError(f"{item_where} must be an object")
+                if list(item) != ["device_id", "watermark", "expired",
+                                  "removed", "error"]:
+                    raise ValueError(
+                        f"{item_where} must have exactly the keys "
+                        f"'device_id', 'watermark', 'expired', 'removed', "
+                        f"'error' in order")
+                if item["device_id"] != page[item_index]:
+                    raise ValueError(
+                        f"{item_where}.device_id contradicts the paged "
+                        f"device order")
+                item_error = item["error"]
+                if item_error is None:
+                    for counter in ("watermark", "expired", "removed"):
+                        value = item[counter]
+                        if not isinstance(value, int) \
+                                or isinstance(value, bool) or value < 0:
+                            raise ValueError(
+                                f"{item_where}.{counter} must be a "
+                                f"non-negative integer")
+                    if item["removed"]:
+                        any_removed = True
+                else:
+                    if not isinstance(item_error, dict) \
+                            or list(item_error) != ["status", "field"]:
+                        raise ValueError(
+                            f"{item_where}.error must have exactly the keys "
+                            f"'status', 'field' in order")
+                    if item_error["status"] != 404 \
+                            or item_error["field"] != "device_id":
+                        raise ValueError(
+                            f"{item_where}.error must be the 404/device_id "
+                            f"shape")
+                    if item["watermark"] is not None \
+                            or item["expired"] is not None \
+                            or item["removed"] is not None:
+                        raise ValueError(
+                            f"{item_where} with an error must carry null "
+                            f"counters")
+            if r_status != (201 if any_removed else 200):
+                raise ValueError(
+                    f"{where}.status contradicts the frozen response")
+            event_gc_batch_cleanup_requests[r_request_id] = \
+                EventGcBatchCleanupRequest(
+                    request_id=r_request_id,
+                    device_ids=list(r_device_ids),
+                    after=r_after,
+                    limit=r_limit,
+                    status=r_status,
+                    response=copy.deepcopy(r_response))
+
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
         # job without any event is simply older than the section and stays
@@ -8218,6 +8450,8 @@ class DeviceStore:
             self._redelivery_job_event_checkpoints = \
                 redelivery_job_event_checkpoints
             self._redelivery_job_event_gc = redelivery_job_event_gc
+            self._event_gc_batch_cleanup_requests = \
+                event_gc_batch_cleanup_requests
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor
