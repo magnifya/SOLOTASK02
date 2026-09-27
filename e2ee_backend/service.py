@@ -95,6 +95,8 @@ from .storage import (
     REDELIVERY_JOB_EVENT_CHECKPOINT_CONSUMER_INVALID,
     REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT,
     REDELIVERY_JOB_EVENT_GC_BATCH_REQUEST_ID_CONFLICT,
+    EVENT_GC_BATCH_CHECKPOINT_AFTER_CONFLICT,
+    EVENT_GC_BATCH_CHECKPOINT_EXPECTED_CONFLICT,
     REDELIVERY_JOB_EVENT_GC_CONSUMER_UNKNOWN,
     REDELIVERY_JOB_EVENT_GC_NO_VALID_CONSUMER,
     REDELIVERY_JOB_EVENT_GC_SEQ_CONFLICT,
@@ -2275,6 +2277,82 @@ class DeviceService:
                 raise ServiceError(
                     "request_id was already committed with a different "
                     "payload", "request_id", status_code=409)
+            raise
+
+    def event_gc_batch_checkpoint(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Read or advance one consumer's batch-cleanup audit checkpoint.
+
+        ``POST /v1/event-gc-batch/checkpoint``. The call takes no query
+        parameters (the HTTP layer rejects any with 400/field ``query``)
+        and the body must be a JSON object carrying exactly
+        ``consumer_id``, ``expected`` and ``after``; a bad/non-object body
+        is 400/field ``request_body``, a missing, wrongly typed or extra
+        field is 400 with that field (the first extra key, in payload
+        order). ``consumer_id`` must be a non-empty string; ``expected``
+        and ``after`` must both be ``null`` (a read-only query) or both be
+        non-boolean integers in 0..2**63-1 — exactly one of them ``null``
+        is 400/field ``expected``.
+
+        A read-only query answers 200 with the stored checkpoint (a
+        consumer that never advanced reads as ``after`` 0 with a null
+        ``updated_at``). Otherwise ``expected`` must equal the consumer's
+        current checkpoint (0 with no record): a mismatch is 409/field
+        ``expected``. An ``after`` below the current checkpoint or beyond
+        the number of committed audit records is 409/field ``after``; an
+        equal ``after`` is an idempotent no-op (200, nothing written); a
+        strictly greater one advances the checkpoint and refreshes
+        ``updated_at`` (201). On success the body keys are
+        ``consumer_id``, ``after`` and ``updated_at`` in that order, with
+        ``updated_at`` null or a UTC ISO-8601 timestamp (six microsecond
+        digits, ``+00:00``).
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly consumer_id, expected and after; any
+        # other key is 400 with that field (the first extra key, in
+        # payload order).
+        allowed = ("consumer_id", "expected", "after")
+        extras = [key for key in payload if key not in allowed]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in allowed:
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["consumer_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        expected = payload["expected"]
+        after = payload["after"]
+        for name, value in (("expected", expected), ("after", after)):
+            if value is None:
+                continue
+            # bool is a subclass of int; reject it explicitly.
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or not 0 <= value <= 2**63 - 1:
+                raise ServiceError(
+                    f"field must be null or an integer in 0..2^63-1: "
+                    f"{name}", name)
+        if (expected is None) != (after is None):
+            raise ServiceError(
+                "expected and after must both be null or both be "
+                "integers: expected", "expected")
+        try:
+            return self.store.event_gc_batch_checkpoint(
+                payload["consumer_id"], expected, after)
+        except RedeliveryJobError as error:
+            if error.reason == EVENT_GC_BATCH_CHECKPOINT_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the consumer's current "
+                    "checkpoint", "expected", status_code=409)
+            if error.reason == EVENT_GC_BATCH_CHECKPOINT_AFTER_CONFLICT:
+                raise ServiceError(
+                    "after moves backwards or exceeds the number of "
+                    "committed batch cleanup records", "after",
+                    status_code=409)
             raise
 
     def event_gc_batch_cleanup_request_get(

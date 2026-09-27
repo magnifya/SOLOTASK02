@@ -21,6 +21,7 @@ from .models import (
     BatchClaimSessionEntry,
     ClaimSessionBinding,
     Device,
+    EventGcBatchCleanupCheckpoint,
     EventGcBatchCleanupRequest,
     Group,
     GroupSession,
@@ -292,6 +293,14 @@ REDELIVERY_JOB_EVENT_GC_SEQ_CONFLICT = "gc_seq_conflict"
 #: with a different payload (409/request_id).
 REDELIVERY_JOB_EVENT_GC_BATCH_REQUEST_ID_CONFLICT = \
     "gc_batch_request_id_conflict"
+#: A batch-cleanup audit checkpoint advance named an ``expected`` that is
+#: not the consumer's current checkpoint (409/expected).
+EVENT_GC_BATCH_CHECKPOINT_EXPECTED_CONFLICT = \
+    "gc_batch_checkpoint_expected_conflict"
+#: A batch-cleanup audit checkpoint advance named an ``after`` below the
+#: consumer's current checkpoint or beyond the audit chain (409/after).
+EVENT_GC_BATCH_CHECKPOINT_AFTER_CONFLICT = \
+    "gc_batch_checkpoint_after_conflict"
 
 #: Lifetime of one event-retention lease registered by an event-gc
 #: ``touch``, in seconds (30 days). While at least one valid lease
@@ -724,6 +733,7 @@ INTEGRITY_SECTION_KEYS = (
     "redelivery_job_event_checkpoints",
     "event_gc",
     "event_gc_batch_cleanup_requests",
+    "cleanup_checkpoints",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -736,7 +746,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 22 canonical
+    """Project a store snapshot/document payload onto the 23 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -852,6 +862,15 @@ class DeviceStore:
         # replay returns the first response byte-identically.
         self._event_gc_batch_cleanup_requests: \
             Dict[str, EventGcBatchCleanupRequest] = {}
+        # Per-consumer read checkpoints on the batch-cleanup audit chain
+        # (the committed _event_gc_batch_cleanup_requests records, whose
+        # count bounds every checkpoint), keyed by consumer_id in creation
+        # order; created lazily on the first forward advance. Each
+        # committed advance happens inside the same locked transaction as
+        # every other mutation, so the checkpoints are persisted and
+        # rolled back together with the rest of the state.
+        self._cleanup_checkpoints: \
+            Dict[str, EventGcBatchCleanupCheckpoint] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -4561,6 +4580,76 @@ class DeviceStore:
             }
 
     @staticmethod
+    def _cleanup_checkpoint_view(
+            consumer_id: str,
+            record: Optional[EventGcBatchCleanupCheckpoint]
+    ) -> Dict[str, Any]:
+        """Copy one batch-cleanup audit checkpoint into its public view.
+
+        A consumer that never advanced has no record and reads as
+        ``after`` 0 with a null ``updated_at``.
+        """
+        return {
+            "consumer_id": consumer_id,
+            "after": record.after if record is not None else 0,
+            "updated_at": record.updated_at if record is not None else None,
+        }
+
+    def event_gc_batch_checkpoint(
+            self, consumer_id: str, expected: Optional[int],
+            after: Optional[int]) -> Tuple[Dict[str, Any], int]:
+        """Read or advance one consumer's batch-cleanup audit checkpoint.
+
+        ``POST /v1/event-gc-batch/checkpoint``. Under the one store lock
+        (shared with the batch cleanup commits that append the audit
+        records and every other mutation), a ``None`` *expected*/*after*
+        pair is a read-only query: it returns the stored checkpoint (or
+        ``after`` 0 / ``updated_at`` null when the consumer never
+        advanced) and writes nothing. Otherwise *expected* must equal the
+        consumer's current checkpoint (0 when no record exists) — a
+        mismatch raises :class:`RedeliveryJobError`
+        ``gc_batch_checkpoint_expected_conflict`` (409/expected at the
+        service layer), so two concurrent advances carrying the same
+        expectation linearize to at most one 201. *after* must not move
+        backwards and must not exceed the number of committed audit
+        records — either raises ``gc_batch_checkpoint_after_conflict``
+        (409/after). An *after* equal to the current checkpoint is an
+        idempotent no-op (200, nothing written, the timestamp untouched);
+        a strictly greater one creates/advances the record with a fresh
+        ``updated_at`` (201) and persists through the change hook, so a
+        data-file failure rolls the advance back with the rest of the
+        state. Returns ``(view, status_code)`` with the view keys
+        ``consumer_id``, ``after`` and ``updated_at`` in that order.
+        """
+        with self._lock:
+            record = self._cleanup_checkpoints.get(consumer_id)
+            current = record.after if record is not None else 0
+            if expected is None:
+                # Read-only query: no write, no commit generation.
+                return (self._cleanup_checkpoint_view(consumer_id, record),
+                        200)
+            if expected != current:
+                raise RedeliveryJobError(
+                    EVENT_GC_BATCH_CHECKPOINT_EXPECTED_CONFLICT)
+            if after < current \
+                    or after > len(self._event_gc_batch_cleanup_requests):
+                raise RedeliveryJobError(
+                    EVENT_GC_BATCH_CHECKPOINT_AFTER_CONFLICT)
+            if after == current:
+                # Idempotent no-op: the timestamp is untouched.
+                return (self._cleanup_checkpoint_view(consumer_id, record),
+                        200)
+            if record is None:
+                record = EventGcBatchCleanupCheckpoint(
+                    consumer_id=consumer_id, after=after)
+                self._cleanup_checkpoints[consumer_id] = record
+            else:
+                record.after = after
+                record.updated_at = utc_now_iso()
+            self._notify_change()
+            return (self._cleanup_checkpoint_view(consumer_id, record), 201)
+
+    @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
 
@@ -6067,6 +6156,11 @@ class DeviceStore:
                 "status": record.status,
                 "response": copy.deepcopy(record.response),
             } for record in self._event_gc_batch_cleanup_requests.values()]
+            cleanup_checkpoints = [{
+                "consumer_id": record.consumer_id,
+                "after": record.after,
+                "updated_at": record.updated_at,
+            } for record in self._cleanup_checkpoints.values()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -6087,7 +6181,8 @@ class DeviceStore:
                             redelivery_job_event_checkpoints,
                         "event_gc": event_gc,
                         "event_gc_batch_cleanup_requests":
-                            event_gc_batch_cleanup_requests}
+                            event_gc_batch_cleanup_requests,
+                        "cleanup_checkpoints": cleanup_checkpoints}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -6271,6 +6366,7 @@ class DeviceStore:
         raw_event_gc = state.get("event_gc", [])
         raw_event_gc_batch_cleanup_requests = state.get(
             "event_gc_batch_cleanup_requests", [])
+        raw_cleanup_checkpoints = state.get("cleanup_checkpoints", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -6291,7 +6387,8 @@ class DeviceStore:
                 and isinstance(raw_redelivery_job_event_checkpoints, list)
                 and isinstance(raw_event_gc, list)
                 and isinstance(
-                    raw_event_gc_batch_cleanup_requests, list)):
+                    raw_event_gc_batch_cleanup_requests, list)
+                and isinstance(raw_cleanup_checkpoints, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -7982,6 +8079,55 @@ class DeviceStore:
                     status=b_status,
                     response=copy.deepcopy(b_response))
 
+        # Per-consumer batch-cleanup audit checkpoints. Older version-1
+        # files predate the section: it is absent and treated as empty
+        # (every consumer reads as after 0 with a null updated_at). A
+        # present section holds one record per consumer (unique, creation
+        # order); every record carries exactly consumer_id/after/
+        # updated_at in that order, after is a non-boolean integer in
+        # 0..2**63-1 that does not exceed the number of committed audit
+        # records, and updated_at is a non-empty UTC ISO-8601 timestamp
+        # (six microsecond digits, +00:00). A duplicated consumer, a
+        # key-order/type error, an empty timestamp or an out-of-range
+        # after refuses startup rather than silently dropping or clamping
+        # the record.
+        cleanup_checkpoints: Dict[str, EventGcBatchCleanupCheckpoint] = {}
+        for index, raw in enumerate(raw_cleanup_checkpoints):
+            where = f"cleanup_checkpoints[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["consumer_id", "after", "updated_at"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'consumer_id', "
+                    f"'after', 'updated_at' in order")
+            k_consumer_id = raw["consumer_id"]
+            k_after = raw["after"]
+            k_updated_at = raw["updated_at"]
+            if not (isinstance(k_consumer_id, str) and k_consumer_id):
+                raise ValueError(
+                    f"{where}.consumer_id must be a non-empty string")
+            if not isinstance(k_after, int) or isinstance(k_after, bool) \
+                    or not 0 <= k_after <= 2**63 - 1:
+                raise ValueError(
+                    f"{where}.after must be an integer in 0..2^63-1")
+            if k_after > len(event_gc_batch_cleanup_requests):
+                raise ValueError(
+                    f"{where}.after {k_after} exceeds the number of "
+                    f"committed batch cleanup records "
+                    f"{len(event_gc_batch_cleanup_requests)}")
+            if not _is_utc_microsecond_iso(k_updated_at):
+                raise ValueError(
+                    f"{where}.updated_at must be a UTC ISO-8601 timestamp "
+                    f"with microseconds and a +00:00 offset")
+            if k_consumer_id in cleanup_checkpoints:
+                raise ValueError(
+                    f"duplicate cleanup_checkpoints record in state: "
+                    f"{k_consumer_id}")
+            cleanup_checkpoints[k_consumer_id] = \
+                EventGcBatchCleanupCheckpoint(
+                    consumer_id=k_consumer_id, after=k_after,
+                    updated_at=k_updated_at)
+
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
         # job without any event is simply older than the section and stays
@@ -8513,6 +8659,7 @@ class DeviceStore:
             self._redelivery_job_event_gc = redelivery_job_event_gc
             self._event_gc_batch_cleanup_requests = \
                 event_gc_batch_cleanup_requests
+            self._cleanup_checkpoints = cleanup_checkpoints
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor
