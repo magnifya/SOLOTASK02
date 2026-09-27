@@ -314,6 +314,18 @@ CLEANUP_LEASE_ID_CONFLICT = "cleanup_lease_id_conflict"
 #: (409/expected or 409/consumer_id at the service layer).
 CLEANUP_LEASE_EXPECTED_CONFLICT = "cleanup_lease_expected_conflict"
 CLEANUP_LEASE_CONSUMER_BUSY = "cleanup_lease_consumer_busy"
+#: An explicit cleanup lease confirmation/release named an unknown
+#: ``lease_id`` (404/lease_id at the service layer).
+CLEANUP_LEASE_NOT_FOUND = "cleanup_lease_not_found"
+#: An explicit cleanup lease confirmation/release named a lease owned
+#: by another consumer (409/consumer_id at the service layer).
+CLEANUP_LEASE_CONSUMER_MISMATCH = "cleanup_lease_consumer_mismatch"
+#: An explicit cleanup lease operation conflicts with the lease's
+#: current resolution: a different op than the one already terminal,
+#: or a first op on an unacknowledged, expired lease, or a release
+#: after the checkpoint already reached next_after (409/lease_id at
+#: the service layer).
+CLEANUP_LEASE_STATE_CONFLICT = "cleanup_lease_state_conflict"
 
 #: Lifetime of one batch-cleanup audit claim lease, in seconds. A
 #: non-empty claim reserves the page for 30 seconds: the lease is
@@ -4804,14 +4816,17 @@ class DeviceStore:
 
         A lease blocks a new claim while it is both unacknowledged — the
         consumer's checkpoint has not reached its ``next_after`` — and
-        unexpired (its ``expires`` deadline is strictly after *now*).
-        Acknowledged or expired leases stay on record as replay history
-        but never block. Restore validation guarantees at most one open
-        lease per consumer; the first match in creation order is
-        authoritative.
+        unexpired (its ``expires`` deadline is strictly after *now*),
+        unless it was explicitly released early (``terminal ==
+        "release"``). Acknowledged, released or expired leases stay on
+        record as replay history but never block. Restore validation
+        guarantees at most one open lease per consumer; the first match
+        in creation order is authoritative.
         """
         for lease in self._cleanup_leases.values():
             if lease.consumer_id != consumer_id:
+                continue
+            if lease.terminal == "release":
                 continue
             if checkpoint >= lease.next_after:
                 continue
@@ -4911,6 +4926,138 @@ class DeviceStore:
             # rolls back) together with the rest of the state.
             self._notify_change()
             return self._cleanup_lease_view(lease, page), 201
+
+    @staticmethod
+    def _cleanup_lease_op_view(
+            lease: CleanupLease, op: str) -> Dict[str, Any]:
+        """The wire view of one explicit cleanup lease resolution.
+
+        Keys are ``consumer_id``, ``lease_id``, ``op`` and ``after`` in
+        that order. A confirmation answers with the lease's
+        ``next_after`` (the checkpoint the first confirmation advanced
+        to); a release answers with the lease's ``expected`` (the
+        checkpoint never moved). Both values are frozen lease fields, so
+        a replay rebuilds the byte-identical first response.
+        """
+        return {
+            "consumer_id": lease.consumer_id,
+            "lease_id": lease.lease_id,
+            "op": op,
+            "after": lease.next_after if op == "confirm"
+            else lease.expected,
+        }
+
+    def cleanup_lease_op(
+            self, consumer_id: str, lease_id: str, expected: int,
+            op: str) -> Tuple[Dict[str, Any], int]:
+        """Confirm or release one batch-cleanup audit claim lease.
+
+        ``POST /v1/event-gc-batch/lease``. All decisions are made under
+        the one store lock, shared with the claims, checkpoint advances
+        and batch cleanup commits. Resolution order is fixed:
+
+        * an unknown *lease_id* (never committed by a non-empty claim)
+          raises :class:`RedeliveryJobError`
+          ``cleanup_lease_not_found`` (404/lease_id at the service
+          layer);
+        * a lease owned by another consumer raises
+          ``cleanup_lease_consumer_mismatch`` (409/consumer_id);
+        * a lease already resolved with the same op replays its frozen
+          first response with 200 and writes nothing; a lease resolved
+          with the other op raises ``cleanup_lease_state_conflict``
+          (409/lease_id);
+        * an unacknowledged lease whose 30-second deadline has already
+          passed raises ``cleanup_lease_state_conflict`` (409/lease_id)
+          for either op, before the compare-and-set is evaluated;
+        * once the checkpoint has already reached ``next_after`` a
+          confirmation is a read-only 200 (the lease keeps no terminal
+          marker and nothing is written) while a release is
+          ``cleanup_lease_state_conflict`` (409/lease_id);
+        * a first resolution on an active, unacknowledged lease
+          requires *expected* to equal both the lease's starting offset
+          and the consumer's current checkpoint, otherwise
+          ``cleanup_checkpoint_expected_conflict`` (409/expected);
+        * the first confirmation moves the consumer's checkpoint to
+          ``next_after`` and marks the lease ``terminal="confirm"`` in
+          one commit (201, one persistence notification), while the
+          first release marks the lease ``terminal="release"`` without
+          moving the checkpoint (201), so the lease stops blocking a
+          new claim by the consumer.
+
+        On success the body keys are ``consumer_id``, ``lease_id``,
+        ``op`` and ``after`` in that order; ``after`` is ``next_after``
+        for a confirmation and ``expected`` for a release. A data-file
+        failure rolls the terminal marker, the checkpoint advance, the
+        commit generation and both files back.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+
+            lease = self._cleanup_leases.get(lease_id)
+            if lease is None:
+                raise RedeliveryJobError(CLEANUP_LEASE_NOT_FOUND)
+            if lease.consumer_id != consumer_id:
+                raise RedeliveryJobError(CLEANUP_LEASE_CONSUMER_MISMATCH)
+
+            # An already terminal lease is resolved first: the same op is
+            # an idempotent replay of the frozen first response (200, no
+            # write, no expected check); the other op can never follow
+            # (409/lease_id).
+            if lease.terminal is not None:
+                if lease.terminal != op:
+                    raise RedeliveryJobError(CLEANUP_LEASE_STATE_CONFLICT)
+                return self._cleanup_lease_op_view(lease, op), 200
+
+            record = self._cleanup_checkpoints.get(consumer_id)
+            current = record.after if record is not None else 0
+            acknowledged = current >= lease.next_after
+            deadline = datetime.fromisoformat(lease.expires)
+            expired = deadline <= now
+
+            if acknowledged:
+                if op == "release":
+                    # The lease was already acknowledged implicitly; it
+                    # cannot be released afterwards.
+                    raise RedeliveryJobError(CLEANUP_LEASE_STATE_CONFLICT)
+                # The checkpoint already reached next_after: confirming is
+                # a read-only no-op (200), with no terminal marker, no
+                # expected check and no commit generation consumed.
+                return self._cleanup_lease_op_view(lease, op), 200
+            if expired:
+                # An unacknowledged lease whose deadline has passed can
+                # neither be confirmed nor released; the consumer claims
+                # again once it is out of the way. This state conflict is
+                # reported before the compare-and-set.
+                raise RedeliveryJobError(CLEANUP_LEASE_STATE_CONFLICT)
+
+            # First resolution on an active, unacknowledged lease:
+            # expected must be both the lease's starting offset and the
+            # consumer's current checkpoint.
+            if expected != lease.expected or expected != current:
+                raise RedeliveryJobError(
+                    CLEANUP_CHECKPOINT_EXPECTED_CONFLICT)
+
+            if op == "confirm":
+                # The confirmation advances the consumer's checkpoint to
+                # next_after (the lease is acknowledged) and records the
+                # terminal resolution in the same transaction.
+                if record is None:
+                    record = CleanupCheckpoint(
+                        consumer_id=consumer_id, after=lease.next_after)
+                    self._cleanup_checkpoints[consumer_id] = record
+                else:
+                    record.after = lease.next_after
+                    record.updated_at = utc_now_iso()
+                lease.terminal = "confirm"
+            else:
+                # A release moves no checkpoint; the marker alone unblocks
+                # a later claim by this consumer.
+                lease.terminal = "release"
+            # One persistence notification for the resolution (and, for a
+            # confirmation, the checkpoint advance): they commit or roll
+            # back together with the rest of the state.
+            self._notify_change()
+            return self._cleanup_lease_op_view(lease, op), 201
 
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
@@ -6431,6 +6578,7 @@ class DeviceStore:
                 "next_after": record.next_after,
                 "limit": record.limit,
                 "expires": record.expires,
+                "terminal": record.terminal,
             } for record in self._cleanup_leases.values()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
@@ -8421,12 +8569,27 @@ class DeviceStore:
             where = f"cleanup_leases[{index}]"
             if not isinstance(raw, dict):
                 raise ValueError(f"{where} must be an object")
-            if list(raw) != ["lease_id", "consumer_id", "expected",
-                             "next_after", "limit", "expires"]:
+            keys = list(raw)
+            legacy_six = ["lease_id", "consumer_id", "expected",
+                          "next_after", "limit", "expires"]
+            seven = legacy_six + ["terminal"]
+            if keys == legacy_six:
+                # Older version-1 files predate explicit lease
+                # resolution: the six-key record loads with terminal
+                # null exactly like a never-resolved lease.
+                l_terminal = None
+            elif keys == seven:
+                l_terminal = raw["terminal"]
+                if l_terminal is not None and l_terminal not in \
+                        ("confirm", "release"):
+                    raise ValueError(
+                        f"{where}.terminal must be null, 'confirm' or "
+                        f"'release'")
+            else:
                 raise ValueError(
                     f"{where} must have exactly the keys 'lease_id', "
                     f"'consumer_id', 'expected', 'next_after', 'limit', "
-                    f"'expires' in order")
+                    f"'expires' and optionally 'terminal' in order")
             l_lease_id = raw["lease_id"]
             l_consumer_id = raw["consumer_id"]
             l_expected = raw["expected"]
@@ -8466,9 +8629,16 @@ class DeviceStore:
                     f"duplicate cleanup lease in state: {l_lease_id}")
             stored = cleanup_checkpoints.get(l_consumer_id)
             stored_after = stored.after if stored is not None else 0
+            # An explicitly confirmed lease is only legal once the
+            # consumer's checkpoint has actually reached next_after; a
+            # release needs no checkpoint condition (it unblocks early).
+            if l_terminal == "confirm" and stored_after < l_next_after:
+                raise ValueError(
+                    f"{where} is marked confirmed but the consumer's "
+                    f"checkpoint has not reached next_after")
             unacknowledged = stored_after < l_next_after
             unexpired = datetime.fromisoformat(l_expires) > restore_now
-            if unacknowledged and unexpired:
+            if unacknowledged and unexpired and l_terminal != "release":
                 if l_consumer_id in open_lease_by_consumer:
                     raise ValueError(
                         f"consumer {l_consumer_id} holds more than one "
@@ -8477,7 +8647,7 @@ class DeviceStore:
             cleanup_leases[l_lease_id] = CleanupLease(
                 lease_id=l_lease_id, consumer_id=l_consumer_id,
                 expected=l_expected, next_after=l_next_after,
-                limit=l_limit, expires=l_expires)
+                limit=l_limit, expires=l_expires, terminal=l_terminal)
 
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a

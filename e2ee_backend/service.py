@@ -36,7 +36,10 @@ from .storage import (
     CLEANUP_CHECKPOINT_AFTER_CONFLICT,
     CLEANUP_CHECKPOINT_EXPECTED_CONFLICT,
     CLEANUP_LEASE_CONSUMER_BUSY,
+    CLEANUP_LEASE_CONSUMER_MISMATCH,
     CLEANUP_LEASE_ID_CONFLICT,
+    CLEANUP_LEASE_NOT_FOUND,
+    CLEANUP_LEASE_STATE_CONFLICT,
     DELIVERY_BAD_SEQUENCE,
     DELIVERY_DEVICE_INACTIVE,
     DELIVERY_DEVICE_MISMATCH,
@@ -2534,6 +2537,96 @@ class DeviceService:
                 raise ServiceError(
                     "the consumer already holds another unacknowledged, "
                     "unexpired lease", "consumer_id", status_code=409)
+            raise
+
+    def event_gc_batch_lease_op(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Confirm or release one batch-cleanup audit claim lease.
+
+        ``POST /v1/event-gc-batch/lease``. The call takes no query
+        parameters (the HTTP layer rejects any with 400/field ``query``)
+        and the body must be a JSON object carrying exactly
+        ``consumer_id``, ``lease_id``, ``expected`` and ``op``; a
+        bad/non-object body is 400/field ``request_body``, a missing,
+        wrongly typed or extra field is 400 with that field (the first
+        extra key, in payload order). ``consumer_id`` and ``lease_id``
+        must be non-empty strings, ``expected`` a non-boolean integer in
+        0..2^63-1 and ``op`` exactly ``confirm`` or ``release``.
+
+        Under the one store lock the lease is resolved first: an unknown
+        ``lease_id`` is 404/field ``lease_id`` and a lease owned by
+        another consumer is 409/field ``consumer_id``. An
+        unacknowledged lease whose 30-second deadline has passed is
+        409/field ``lease_id`` for either op, before the
+        compare-and-set; once the checkpoint has already reached
+        ``next_after`` a confirm is a read-only 200 (regardless of
+        ``expected``) and a release is 409/lease_id. A first
+        resolution on an active, unacknowledged lease requires
+        ``expected`` to equal both the lease's starting offset and the
+        consumer's current checkpoint (else 409/field ``expected``).
+        The same op replayed answers 200 with the byte-identical first
+        response; the other op after a terminal resolution is
+        409/lease_id. A first confirm advances the checkpoint to
+        ``next_after`` (201); a first release leaves the checkpoint
+        untouched and unblocks a later claim (201). The response keys
+        are ``consumer_id``, ``lease_id``, ``op`` and ``after`` in that
+        order; ``after`` is ``next_after`` for a confirm and
+        ``expected`` for a release. A data-file failure is
+        503/field ``data_file`` with everything rolled back.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly consumer_id, lease_id, expected and
+        # op; any other key is 400 with that field (the first extra key,
+        # in payload order).
+        extras = [key for key in payload
+                  if key not in ("consumer_id", "lease_id", "expected",
+                                 "op")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("consumer_id", "lease_id", "expected", "op"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["consumer_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        if not is_nonempty_string(payload["lease_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: lease_id", "lease_id")
+        expected = payload["expected"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(expected, int) or isinstance(expected, bool) \
+                or not 0 <= expected <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: expected",
+                "expected")
+        op = payload["op"]
+        if op not in ("confirm", "release"):
+            raise ServiceError(
+                "field must be 'confirm' or 'release': op", "op")
+        try:
+            return self.store.cleanup_lease_op(
+                payload["consumer_id"], payload["lease_id"], expected, op)
+        except RedeliveryJobError as error:
+            if error.reason == CLEANUP_LEASE_NOT_FOUND:
+                raise ServiceError(
+                    "unknown cleanup lease", "lease_id", status_code=404)
+            if error.reason == CLEANUP_LEASE_CONSUMER_MISMATCH:
+                raise ServiceError(
+                    "the cleanup lease belongs to another consumer",
+                    "consumer_id", status_code=409)
+            if error.reason == CLEANUP_CHECKPOINT_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the lease's starting offset "
+                    "and the consumer's current checkpoint",
+                    "expected", status_code=409)
+            if error.reason == CLEANUP_LEASE_STATE_CONFLICT:
+                raise ServiceError(
+                    "the cleanup lease cannot be resolved with this op "
+                    "in its current state", "lease_id", status_code=409)
             raise
 
     def event_gc_batch_checkpoints(
