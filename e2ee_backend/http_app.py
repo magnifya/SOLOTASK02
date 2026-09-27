@@ -20,6 +20,7 @@ _INBOX_JOBS_PATH = "/v1/inbox-jobs"
 _EVENT_GC_PATH = "/v1/event-gc"
 _EVENT_GC_BATCH_CLEANUP_PATH = "/v1/event-gc-batch/cleanup-expired"
 _EVENT_GC_BATCH_CHECKPOINT_PATH = "/v1/event-gc-batch/checkpoint"
+_EVENT_GC_BATCH_CHECKPOINTS_PATH = "/v1/event-gc-batch/checkpoints"
 _EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH = \
     _EVENT_GC_BATCH_CLEANUP_PATH + "/requests"
 _GROUPS_PATH = "/v1/groups"
@@ -409,6 +410,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_persistence_integrity_history()
         elif path == _PERSISTENCE_INTEGRITY_PATH:
             self._handle_persistence_integrity()
+        elif path == _EVENT_GC_BATCH_CHECKPOINTS_PATH:
+            self._handle_event_gc_batch_checkpoint_list()
         elif path == _EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH:
             self._handle_event_gc_batch_cleanup_request_list()
         elif path.startswith(
@@ -1223,6 +1226,52 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body = self.service.event_gc_batch_cleanup_request_list(
                 after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_event_gc_batch_checkpoint_list(self) -> None:
+        # The checkpoint page takes no request body: a non-empty one is
+        # 400/request_body. Only single-valued after/limit query
+        # parameters are accepted (defaults 0/100) under the same paging
+        # contract as the cleanup-request audit page; anything else is
+        # 400/query. Validation order is fixed: non-empty body
+        # (request_body), any other parameter (query), then after, then
+        # limit. keep_blank_values so a bare ``?foo`` flag is an actual
+        # (unknown) parameter rather than being silently dropped, while a
+        # trailing ``?`` with no parameter at all is accepted.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name not in ("after", "limit")
+               for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        after = self._decimal_nonneg_param(query, "after", default=0,
+                                           maximum=2**63 - 1, max_digits=19)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.event_gc_batch_checkpoint_list(after, limit)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
