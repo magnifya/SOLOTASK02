@@ -2369,6 +2369,44 @@ class DeviceService:
             raise
         return view, 201 if advanced else 200
 
+    def event_gc_batch_checkpoints(
+            self, after: int, limit: int) -> Dict[str, Any]:
+        """Page the batch-cleanup audit consumer checkpoints.
+
+        ``GET /v1/event-gc-batch/checkpoints``. The GET takes no request
+        body (the HTTP layer rejects a non-empty one with 400/field
+        ``request_body``) and only the single-valued query parameters
+        ``after`` and ``limit`` (any other parameter is 400/field
+        ``query``), using the same paging contract as the request audit
+        list: ``after`` defaults to 0 and is an unsigned decimal integer
+        in 0..2**63-1, ``limit`` defaults to 100 and is in 1..100 (the
+        HTTP layer enforces the decimal shape and single occurrence,
+        answering 400 with the parameter name as ``field``).
+
+        Under the store lock the checkpoint records are taken in
+        creation order; the page is the records at the zero-based
+        offset *after*, at most *limit* of them (consumers that never
+        advanced have no record and are not listed). On success the
+        body keys are ``audit_count``, ``checkpoints``, ``next_after``
+        and ``has_more`` in that order; ``audit_count`` is the number
+        of committed batch-cleanup audit records and each item is
+        ``consumer_id``, ``after``, ``updated_at`` (the checkpoint
+        view) plus ``pending`` — ``audit_count`` minus the item's
+        ``after``. ``next_after`` is *after* plus the page length
+        (equal to *after* for an empty page) and ``has_more`` says
+        whether further records follow. The lookup writes nothing and
+        advances no ``commit_seq``.
+        """
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or not 0 <= after <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        return self.store.cleanup_checkpoints_page(after, limit)
+
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:
         """Return one committed batch cleanup idempotency record.

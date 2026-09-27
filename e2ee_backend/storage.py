@@ -4644,6 +4644,46 @@ class DeviceStore:
             return (self._cleanup_checkpoint_view(consumer_id, record),
                     True)
 
+    def cleanup_checkpoints_page(
+            self, after: int, limit: int) -> Dict[str, Any]:
+        """Read one page of batch-cleanup audit checkpoints (read-only).
+
+        ``GET /v1/event-gc-batch/checkpoints``. Under the one store lock
+        shared with the batch cleanup commits and the checkpoint
+        advances, the checkpoint records are taken in creation order
+        (the insertion order of ``_cleanup_checkpoints``, preserved
+        across save/load) and the page is the records at the zero-based
+        offset *after*, at most *limit* of them; consumers that never
+        advanced have no record and are not listed.
+
+        On success the body keys are ``audit_count``, ``checkpoints``,
+        ``next_after`` and ``has_more`` in that order; ``audit_count``
+        is the number of committed batch-cleanup audit records and each
+        item carries ``consumer_id``, ``after``, ``updated_at`` (the
+        checkpoint view) plus ``pending`` — ``audit_count`` minus the
+        item's ``after``. ``next_after`` is *after* plus the page
+        length (so it equals *after* for an empty page) and ``has_more``
+        says whether further records follow. The lookup writes nothing
+        and advances no commit generation.
+        """
+        with self._lock:
+            audit_count = len(self._event_gc_batch_cleanup_requests)
+            records = list(self._cleanup_checkpoints.values())
+            page = records[after:after + limit]
+            checkpoints_view = [{
+                "consumer_id": record.consumer_id,
+                "after": record.after,
+                "updated_at": record.updated_at,
+                "pending": audit_count - record.after,
+            } for record in page]
+            next_after = after + len(page)
+            return {
+                "audit_count": audit_count,
+                "checkpoints": checkpoints_view,
+                "next_after": next_after,
+                "has_more": next_after < len(records),
+            }
+
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
