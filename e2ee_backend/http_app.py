@@ -25,6 +25,7 @@ _EVENT_GC_BATCH_CONSUME_PATH = "/v1/event-gc-batch/consume"
 _EVENT_GC_BATCH_CLAIM_PATH = "/v1/event-gc-batch/claim"
 _EVENT_GC_BATCH_LEASE_PATH = "/v1/event-gc-batch/lease"
 _EVENT_GC_BATCH_LEASE_RENEW_PATH = _EVENT_GC_BATCH_LEASE_PATH + "/renew"
+_EVENT_GC_BATCH_LEASES_PATH = "/v1/event-gc-batch/leases"
 _EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH = \
     _EVENT_GC_BATCH_CLEANUP_PATH + "/requests"
 _GROUPS_PATH = "/v1/groups"
@@ -424,6 +425,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_persistence_integrity()
         elif path == _EVENT_GC_BATCH_CHECKPOINTS_PATH:
             self._handle_event_gc_batch_checkpoints()
+        elif path == _EVENT_GC_BATCH_LEASES_PATH:
+            self._handle_event_gc_batch_leases()
         elif path == _EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH:
             self._handle_event_gc_batch_cleanup_request_list()
         elif path.startswith(
@@ -1296,6 +1299,63 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return  # a 400 response was already sent
         try:
             body = self.service.event_gc_batch_checkpoints(after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_event_gc_batch_leases(self) -> None:
+        # The batch-cleanup audit lease page takes no request body: a
+        # non-empty one is 400/request_body, however it is legally
+        # framed (Content-Length or chunked transfer encoding). Only
+        # single-valued consumer_id/after/limit query parameters are
+        # accepted (consumer_id omitted means every consumer; after and
+        # limit default to 0/100) under the same paging contract as the
+        # checkpoint page; anything else is 400/query. Validation order
+        # is fixed: non-empty body (request_body), any other parameter
+        # (query), then consumer_id, then after, then limit.
+        # keep_blank_values so a bare ``?foo`` flag is an actual
+        # (unknown) parameter rather than being silently dropped, while
+        # a trailing ``?`` with no parameter at all is accepted.
+        body = self._read_framed_body()
+        if body is None:
+            return  # a 400 response was already sent
+        if body:
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name not in ("consumer_id", "after", "limit")
+               for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        consumer_values = query.get("consumer_id", [])
+        if len(consumer_values) > 1:
+            self._send_json(400, {"message": "consumer_id must appear at "
+                                             "most once",
+                                  "field": "consumer_id"})
+            return
+        consumer_id = consumer_values[0] if consumer_values else None
+        if consumer_id is not None and not consumer_id:
+            self._send_json(400, {"message": "consumer_id must be a "
+                                             "non-empty string",
+                                  "field": "consumer_id"})
+            return
+        after = self._decimal_nonneg_param(query, "after", default=0,
+                                           maximum=2**63 - 1, max_digits=19)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.event_gc_batch_leases(
+                consumer_id, after, limit)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

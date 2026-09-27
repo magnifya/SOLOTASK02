@@ -2744,6 +2744,50 @@ class DeviceService:
                 "field must be an integer in 1..100: limit", "limit")
         return self.store.cleanup_checkpoints_page(after, limit)
 
+    def event_gc_batch_leases(
+            self, consumer_id: Optional[str], after: int,
+            limit: int) -> Dict[str, Any]:
+        """Page the batch-cleanup audit claim leases.
+
+        ``GET /v1/event-gc-batch/leases``. The GET takes no request body
+        (the HTTP layer rejects a non-empty one with 400/field
+        ``request_body``) and only the single-valued query parameters
+        ``consumer_id``, ``after`` and ``limit`` (any other parameter is
+        400/field ``query``): ``consumer_id`` may be omitted to list
+        every consumer's leases and must otherwise be a non-empty
+        string; ``after`` defaults to 0 and is an unsigned decimal
+        integer in 0..2**63-1; ``limit`` defaults to 100 and is in
+        1..100 (the HTTP layer enforces the decimal shape and single
+        occurrence, answering 400 with the parameter name as ``field``).
+
+        Under the store lock the leases are taken in creation order,
+        filtered to the consumer when one is given, and the page is the
+        leases at the zero-based offset *after*, at most *limit* of
+        them. On success the body keys are ``leases``, ``next_after``
+        and ``has_more`` in that order; each item is ``lease_id``,
+        ``consumer_id``, ``expected``, ``next_after``, ``expires``,
+        ``effective_expires``, ``renewal_count`` and ``state`` in that
+        order, with ``state`` decided at the lock-held instant
+        (released/confirmed/expired/active). ``next_after`` is *after*
+        plus the page length (equal to *after* for an empty page) and
+        ``has_more`` says whether further leases follow. The lookup is
+        purely read-only: it writes nothing and advances no
+        ``commit_seq``.
+        """
+        if consumer_id is not None and not is_nonempty_string(consumer_id):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or not 0 <= after <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        return self.store.cleanup_leases_page(consumer_id, after, limit)
+
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:
         """Return one committed batch cleanup idempotency record.

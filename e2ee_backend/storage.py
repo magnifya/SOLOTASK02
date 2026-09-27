@@ -5196,6 +5196,80 @@ class DeviceStore:
             return self._cleanup_lease_renew_view(
                 lease, renewal_id, expires), 201
 
+    def cleanup_leases_page(
+            self, consumer_id: Optional[str], after: int,
+            limit: int) -> Dict[str, Any]:
+        """Read one page of batch-cleanup audit claim leases (read-only).
+
+        ``GET /v1/event-gc-batch/leases``. Under the one store lock
+        shared with the claims, renewals, confirmations/releases,
+        checkpoint advances and every other mutation, the leases are
+        taken in creation order (the insertion order of
+        ``_cleanup_leases``, preserved across save/load), filtered to
+        *consumer_id* when one is given (all consumers otherwise), and
+        the page is the leases at the zero-based offset *after*, at most
+        *limit* of them.
+
+        Each item's ``state`` is decided at the single lock-held instant
+        in a fixed order: ``released`` once the lease was explicitly
+        released (``terminal == "release"``); ``confirmed`` once it was
+        explicitly confirmed (``terminal == "confirm"``) or its
+        consumer's checkpoint (0 when none is stored) has reached its
+        ``next_after``; ``expired`` once its current effective deadline
+        (the last renewal's ``expires``, the claim ``expires`` when
+        never renewed) is at or before now; otherwise ``active``. The
+        item keys are ``lease_id``, ``consumer_id``, ``expected``,
+        ``next_after``, ``expires`` (the frozen claim deadline),
+        ``effective_expires``, ``renewal_count`` and ``state`` in that
+        order.
+
+        On success the body keys are ``leases``, ``next_after`` and
+        ``has_more`` in that order; ``next_after`` is *after* plus the
+        page length (so it equals *after* for an empty page) and
+        ``has_more`` says whether further leases follow. The lookup
+        writes nothing and advances no commit generation.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            leases = [lease for lease in self._cleanup_leases.values()
+                      if consumer_id is None
+                      or lease.consumer_id == consumer_id]
+            page = leases[after:after + limit]
+            items = []
+            for lease in page:
+                record = self._cleanup_checkpoints.get(lease.consumer_id)
+                checkpoint = record.after if record is not None else 0
+                effective_expires = self._cleanup_lease_effective_expires(
+                    lease)
+                if lease.terminal == "release":
+                    state = "released"
+                elif lease.terminal == "confirm" \
+                        or checkpoint >= lease.next_after:
+                    state = "confirmed"
+                else:
+                    try:
+                        deadline = datetime.fromisoformat(
+                            effective_expires)
+                    except ValueError:  # pragma: no cover - canonical
+                        deadline = now
+                    state = "expired" if deadline <= now else "active"
+                items.append({
+                    "lease_id": lease.lease_id,
+                    "consumer_id": lease.consumer_id,
+                    "expected": lease.expected,
+                    "next_after": lease.next_after,
+                    "expires": lease.expires,
+                    "effective_expires": effective_expires,
+                    "renewal_count": len(lease.renewals),
+                    "state": state,
+                })
+            next_after = after + len(page)
+            return {
+                "leases": items,
+                "next_after": next_after,
+                "has_more": next_after < len(leases),
+            }
+
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
