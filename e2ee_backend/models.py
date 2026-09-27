@@ -393,14 +393,26 @@ class RedeliveryJobEventCheckpoint:
     timestamp of the last forward checkpoint (``updated_at``). Checkpoints
     are independent per ``(device_id, consumer_id)`` pair and created
     lazily on the first advance; a pair that never advanced has no record
-    and reads as ``seq`` 0 with a null ``updated_at``. Only the integer
-    cursor and its timestamp are kept.
+    and reads as ``seq`` 0 with a null ``updated_at``. A record may also
+    carry a retention lease registered by ``POST /v1/event-gc/{device_id}``
+    with ``op=touch``: ``expires`` is the lease deadline (a UTC ISO-8601
+    timestamp, six microsecond digits, ``+00:00``) or ``None`` when the
+    checkpoint carries no lease (legacy records and checkpoints written
+    without a touch), and ``active`` is ``False`` once the consumer's
+    retention was revoked (``op=revoke``); a revoked lease also clears
+    ``expires``. A record whose lease was revoked or let expire, or whose
+    ``seq`` fell below the device's retention watermark, is invalid: the
+    checkpoint endpoint rejects it until a fresh ``touch`` re-registers
+    the consumer. Only the integer cursor, its timestamp and the lease
+    fields are kept.
     """
 
     device_id: str
     consumer_id: str
     seq: int = 0
     updated_at: str = field(default_factory=utc_now_iso)
+    expires: Optional[str] = None
+    active: bool = True
 
 
 @dataclass

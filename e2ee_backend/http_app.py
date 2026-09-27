@@ -17,6 +17,7 @@ _SESSIONS_FROM_BATCH_CLAIM_PATH = "/v1/sessions/from-batch-claim"
 _MESSAGES_PATH = "/v1/messages"
 _MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
 _INBOX_JOBS_PATH = "/v1/inbox-jobs"
+_EVENT_GC_PATH = "/v1/event-gc"
 _GROUPS_PATH = "/v1/groups"
 _GROUP_SESSIONS_PATH = "/v1/group-sessions"
 _PERSISTENCE_INTEGRITY_PATH = "/v1/persistence/integrity"
@@ -112,6 +113,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_submit_message()
         elif path == _INBOX_JOBS_PATH:
             self._handle_inbox_job()
+        elif path.startswith(_EVENT_GC_PATH + "/"):
+            self._route_event_gc(path)
         elif path == _INBOX_JOBS_PATH + "/recover-batch":
             self._handle_inbox_job_recover_batch()
         elif path == _INBOX_JOBS_PATH + "/dispatch-batch":
@@ -301,6 +304,16 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                       -len("/inbox-job-events/checkpoint")]
         if suffix and "/" not in suffix:
             self._handle_device_inbox_job_event_checkpoint(unquote(suffix))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_event_gc(self, path: str) -> None:
+        # /v1/event-gc/{device_id} — split on raw slashes only; a
+        # percent-encoded slash inside the id segment is part of it.
+        suffix = path[len(_EVENT_GC_PATH) + 1:]
+        if suffix and "/" not in suffix:
+            self._handle_event_gc(unquote(suffix))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -946,6 +959,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body, status_code = self.service.inbox_job_event_checkpoint(
                 device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_event_gc(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.event_gc(device_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

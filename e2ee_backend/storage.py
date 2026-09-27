@@ -270,6 +270,29 @@ REDELIVERY_JOB_EVENT_TYPES = frozenset({
 #: A job-event checkpoint move was rejected: the requested seq exceeds the
 #: device's last event seq or moves backwards for that consumer.
 REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT = "checkpoint_seq_conflict"
+#: A job-event checkpoint read/advance named a consumer whose retention
+#: lease was revoked or let expire, or whose stored seq fell below the
+#: device's retention watermark (409/consumer_id at the service layer).
+REDELIVERY_JOB_EVENT_CHECKPOINT_CONSUMER_INVALID = \
+    "checkpoint_consumer_invalid"
+#: An inbox-job-events page requested an ``after`` below the device's
+#: retention watermark: those events were already pruned (409/after).
+REDELIVERY_JOB_EVENT_AFTER_CONFLICT = "event_after_conflict"
+#: An event-gc ``revoke`` named a consumer with no checkpoint record on
+#: the device (404/consumer).
+REDELIVERY_JOB_EVENT_GC_CONSUMER_UNKNOWN = "gc_consumer_unknown"
+#: An event-gc ``prune`` found no valid (active, unexpired) consumer lease
+#: on the device (409/consumer).
+REDELIVERY_JOB_EVENT_GC_NO_VALID_CONSUMER = "gc_no_valid_consumer"
+#: An event-gc ``prune`` named a seq outside the inclusive range
+#: [retention watermark, minimum valid consumer checkpoint] (409/seq).
+REDELIVERY_JOB_EVENT_GC_SEQ_CONFLICT = "gc_seq_conflict"
+
+#: Lifetime of one event-retention lease registered by an event-gc
+#: ``touch``, in seconds (30 days). While at least one valid lease
+#: remains, events up to the minimum valid consumer checkpoint may be
+#: pruned; a revoked or expired lease stops withholding events.
+REDELIVERY_JOB_EVENT_GC_LEASE_SECONDS = 30 * 24 * 60 * 60
 
 
 def _is_utc_microsecond_iso(value: Any) -> bool:
@@ -694,6 +717,7 @@ INTEGRITY_SECTION_KEYS = (
     "redelivery_jobs",
     "redelivery_job_events",
     "redelivery_job_event_checkpoints",
+    "event_gc",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -706,7 +730,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 20 canonical
+    """Project a store snapshot/document payload onto the 21 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -810,6 +834,12 @@ class DeviceStore:
         # persisted and rolled back together with the rest of the state.
         self._redelivery_job_event_checkpoints: \
             Dict[Tuple[str, str], RedeliveryJobEventCheckpoint] = {}
+        # Per-device event-retention watermarks, keyed by device_id: the
+        # highest event seq pruned by an event-gc ``prune`` (0 when the
+        # device was never pruned and no event_gc record exists). Events
+        # keep their original seqs — the chain simply starts at
+        # watermark + 1 — and new events continue past the last seq.
+        self._redelivery_job_event_gc: Dict[str, int] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -869,14 +899,17 @@ class DeviceStore:
         """Append one lifecycle event to a device's job-event chain.
 
         Lock required. The event's ``seq`` continues the device's chain
-        (starting at 1); ``state`` freezes the job's state right after the
-        mutation being recorded. The caller appends only for real
-        transitions — idempotent replays and failed operations add nothing.
+        (starting at 1, or past the retention watermark when earlier
+        events were pruned — pruning never renumbers the survivors);
+        ``state`` freezes the job's state right after the mutation being
+        recorded. The caller appends only for real transitions —
+        idempotent replays and failed operations add nothing.
         """
         chain = self._redelivery_job_events.setdefault(job.device_id, [])
+        base = self._redelivery_job_event_gc.get(job.device_id, 0)
         event = RedeliveryJobEvent(
-            device_id=job.device_id, seq=len(chain) + 1, job_id=job.job_id,
-            type=event_type, state=job.state)
+            device_id=job.device_id, seq=base + len(chain) + 1,
+            job_id=job.job_id, type=event_type, state=job.state)
         chain.append(event)
         return event
 
@@ -3961,11 +3994,14 @@ class DeviceStore:
         operations, lease claims/renewals/releases/completions, acks and
         revocation), an unknown *device_id* returns ``None``
         (404/device_id at the service layer); a revoked device's chain
-        stays readable. The device's events are taken in chain order
-        (``seq`` ascending from 1): the page is the events with
-        ``seq > after``, at most *limit* of them. The query writes nothing
-        and advances no commit generation, so an unchanged state answers
-        byte-identically.
+        stays readable. An *after* below the device's retention watermark
+        raises :class:`RedeliveryJobError` ``event_after_conflict``
+        (409/after at the service layer): events up to the watermark were
+        pruned and can no longer be paged. The device's events are taken
+        in chain order (``seq`` ascending, contiguous from the watermark
+        + 1): the page is the events with ``seq > after``, at most
+        *limit* of them. The query writes nothing and advances no commit
+        generation, so an unchanged state answers byte-identically.
 
         On success the body keys are ``device_id``, ``events``,
         ``next_after`` and ``has_more`` in that order; each event item is
@@ -3978,6 +4014,9 @@ class DeviceStore:
             device = self._find_device(device_id)
             if device is None:
                 return None
+            watermark = self._redelivery_job_event_gc.get(device_id, 0)
+            if after < watermark:
+                raise RedeliveryJobError(REDELIVERY_JOB_EVENT_AFTER_CONFLICT)
             chain = self._redelivery_job_events.get(device_id, [])
             page = [event for event in chain if event.seq > after][:limit]
             next_after = page[-1].seq if page else after
@@ -4019,16 +4058,22 @@ class DeviceStore:
         cancel operations that append the events, the lease operations,
         acks and revocation), an unknown *device_id* returns ``None``
         (404/device_id at the service layer); a revoked device stays
-        checkpointable. A ``None`` *seq* is a read-only query: it returns
-        the stored checkpoint (or ``seq`` 0 / ``updated_at`` null when the
-        pair never advanced) and writes nothing. An integer *seq* must not
-        exceed the device's last event seq and must not move backwards for
-        this consumer — either raises :class:`RedeliveryJobError`
-        ``checkpoint_seq_conflict`` (409/seq at the service layer). An
-        equal *seq* is an idempotent no-op (200, the timestamp untouched);
-        a strictly greater one creates/advances the record with a fresh
-        ``updated_at`` (201) and persists through the change hook. Returns
-        ``(view, advanced)``.
+        checkpointable. A consumer whose checkpoint record is invalid —
+        its retention lease was revoked (``active`` false) or let expire
+        (``expires`` at or past now), or its stored ``seq`` fell below the
+        device's retention watermark — raises :class:`RedeliveryJobError`
+        ``checkpoint_consumer_invalid`` (409/consumer_id at the service
+        layer) for reads and advances alike, until a fresh event-gc
+        ``touch`` re-registers the consumer. A ``None`` *seq* is a
+        read-only query: it returns the stored checkpoint (or ``seq`` 0 /
+        ``updated_at`` null when the pair never advanced) and writes
+        nothing. An integer *seq* must not exceed the device's last event
+        seq and must not move backwards for this consumer — either raises
+        :class:`RedeliveryJobError` ``checkpoint_seq_conflict`` (409/seq
+        at the service layer). An equal *seq* is an idempotent no-op (200,
+        the timestamp untouched); a strictly greater one creates/advances
+        the record with a fresh ``updated_at`` (201) and persists through
+        the change hook. Returns ``(view, advanced)``.
         """
         with self._lock:
             device = self._find_device(device_id)
@@ -4036,12 +4081,17 @@ class DeviceStore:
                 return None
             key = (device_id, consumer_id)
             record = self._redelivery_job_event_checkpoints.get(key)
+            if record is not None and not self._job_event_consumer_valid_locked(
+                    record, datetime.now(timezone.utc)):
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_EVENT_CHECKPOINT_CONSUMER_INVALID)
             if seq is None:
                 # Read-only: no write, no commit generation.
                 return (self._redelivery_job_event_checkpoint_view(
                     device_id, consumer_id, record), False)
             chain = self._redelivery_job_events.get(device_id, [])
-            max_seq = chain[-1].seq if chain else 0
+            watermark = self._redelivery_job_event_gc.get(device_id, 0)
+            max_seq = chain[-1].seq if chain else watermark
             if seq > max_seq:
                 raise RedeliveryJobError(
                     REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT)
@@ -4063,6 +4113,137 @@ class DeviceStore:
             self._notify_change()
             return (self._redelivery_job_event_checkpoint_view(
                 device_id, consumer_id, record), True)
+
+    def _job_event_consumer_valid_locked(
+            self, record: RedeliveryJobEventCheckpoint, now: datetime
+            ) -> bool:
+        """Whether one job-event checkpoint record is currently valid.
+
+        Lock required. A record stays valid while its retention lease is
+        active (``active`` true) and unexpired (``expires`` null — no
+        lease, the legacy default — or still in the future) and its stored
+        ``seq`` has not fallen below the device's retention watermark.
+        """
+        if not record.active:
+            return False
+        if record.expires is not None and \
+                datetime.fromisoformat(record.expires) <= now:
+            return False
+        watermark = self._redelivery_job_event_gc.get(record.device_id, 0)
+        return record.seq >= watermark
+
+    def redelivery_job_event_gc(
+            self, device_id: str, op: str, consumer: Optional[str],
+            seq: Optional[int]) -> Optional[Tuple[Dict[str, Any], int]]:
+        """Touch/revoke a consumer's retention lease or prune events.
+
+        ``POST /v1/event-gc/{device_id}``. Under the one store lock
+        (shared with the job operations that append the events, the
+        checkpoint advances, the lease operations, acks and revocation),
+        an unknown *device_id* returns ``None`` (404/device_id at the
+        service layer); a revoked device stays usable. The service layer
+        has already validated the body shape per *op*.
+
+        ``touch`` (non-empty *consumer*, *seq* null) registers or renews
+        the consumer's 30-day retention lease: a consumer with no record
+        (or one whose stored seq fell below the current watermark) is
+        registered at the watermark, an up-to-date consumer keeps its
+        checkpoint; the lease deadline is refreshed and the record
+        re-activated. Always 201, one commit.
+
+        ``revoke`` (same parameters) drops the consumer's lease: a
+        consumer with no record raises :class:`RedeliveryJobError`
+        ``gc_consumer_unknown`` (404/consumer); the first revoke clears
+        ``expires`` and flips ``active`` false (201), a replay of an
+        already revoked consumer is 200 and writes nothing.
+
+        ``prune`` (*consumer* null, non-negative integer *seq*) deletes
+        the device's events with ``seq <= *seq*`` and advances the
+        retention watermark: with no valid consumer lease on the device it
+        raises ``gc_no_valid_consumer`` (409/consumer); a *seq* outside
+        the inclusive range [watermark, minimum valid consumer checkpoint]
+        raises ``gc_seq_conflict`` (409/seq); a *seq* equal to the
+        watermark is an idempotent no-op (200, ``removed`` 0, nothing
+        written); a strictly greater one prunes (201, ``removed`` counts
+        the deleted events) and persists through the change hook. Pruning
+        never renumbers the surviving events. Returns ``(body, status)``.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                return None
+            now = datetime.now(timezone.utc)
+            watermark = self._redelivery_job_event_gc.get(device_id, 0)
+            if op == "touch":
+                key = (device_id, consumer)
+                record = self._redelivery_job_event_checkpoints.get(key)
+                # timespec="microseconds" always emits six fractional
+                # digits; isoformat() on a whole-microsecond value would
+                # otherwise drop the fraction entirely.
+                expires = (now + timedelta(
+                    seconds=REDELIVERY_JOB_EVENT_GC_LEASE_SECONDS)
+                ).isoformat(timespec="microseconds")
+                if record is None:
+                    record = RedeliveryJobEventCheckpoint(
+                        device_id=device_id, consumer_id=consumer,
+                        seq=watermark,
+                        updated_at=now.isoformat(timespec="microseconds"),
+                        expires=expires, active=True)
+                    self._redelivery_job_event_checkpoints[key] = record
+                else:
+                    if record.seq < watermark:
+                        # Re-register a consumer whose checkpoint fell
+                        # below the watermark at the watermark itself.
+                        record.seq = watermark
+                        record.updated_at = now.isoformat(
+                            timespec="microseconds")
+                    record.expires = expires
+                    record.active = True
+                self._notify_change()
+                return ({"device_id": device_id, "consumer": consumer,
+                         "seq": record.seq, "expires": expires}, 201)
+            if op == "revoke":
+                record = self._redelivery_job_event_checkpoints.get(
+                    (device_id, consumer))
+                if record is None:
+                    raise RedeliveryJobError(
+                        REDELIVERY_JOB_EVENT_GC_CONSUMER_UNKNOWN)
+                body = {"device_id": device_id, "consumer": consumer,
+                        "seq": record.seq, "expires": None}
+                if not record.active:
+                    # Replay of an already revoked consumer: no write, no
+                    # commit generation.
+                    return (body, 200)
+                record.active = False
+                record.expires = None
+                self._notify_change()
+                return (body, 201)
+            # op == "prune"
+            valid = [
+                record for key, record
+                in self._redelivery_job_event_checkpoints.items()
+                if key[0] == device_id
+                and self._job_event_consumer_valid_locked(record, now)]
+            if not valid:
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_EVENT_GC_NO_VALID_CONSUMER)
+            floor = min(record.seq for record in valid)
+            if not watermark <= seq <= floor:
+                raise RedeliveryJobError(
+                    REDELIVERY_JOB_EVENT_GC_SEQ_CONFLICT)
+            if seq == watermark:
+                # Idempotent no-op: no write, no commit generation.
+                return ({"device_id": device_id, "seq": seq,
+                         "removed": 0}, 200)
+            chain = self._redelivery_job_events.get(device_id, [])
+            kept = [event for event in chain if event.seq > seq]
+            removed = len(chain) - len(kept)
+            if chain:
+                self._redelivery_job_events[device_id] = kept
+            self._redelivery_job_event_gc[device_id] = seq
+            self._notify_change()
+            return ({"device_id": device_id, "seq": seq,
+                     "removed": removed}, 201)
 
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
@@ -5553,9 +5734,16 @@ class DeviceStore:
                     "consumer_id": record.consumer_id,
                     "seq": record.seq,
                     "updated_at": record.updated_at,
+                    "expires": record.expires,
+                    "active": record.active,
                 }
                 for record in self._redelivery_job_event_checkpoints.values()
             ]
+            event_gc = [{
+                "device_id": gc_device_id,
+                "seq": gc_seq,
+            } for gc_device_id, gc_seq in
+                self._redelivery_job_event_gc.items()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -5573,7 +5761,8 @@ class DeviceStore:
                         "redelivery_jobs": redelivery_jobs,
                         "redelivery_job_events": redelivery_job_events,
                         "redelivery_job_event_checkpoints":
-                            redelivery_job_event_checkpoints}
+                            redelivery_job_event_checkpoints,
+                        "event_gc": event_gc}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -5754,6 +5943,7 @@ class DeviceStore:
         raw_redelivery_job_events = state.get("redelivery_job_events", [])
         raw_redelivery_job_event_checkpoints = state.get(
             "redelivery_job_event_checkpoints", [])
+        raw_event_gc = state.get("event_gc", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -5771,7 +5961,8 @@ class DeviceStore:
                 and isinstance(raw_message_submissions, list)
                 and isinstance(raw_redelivery_jobs, list)
                 and isinstance(raw_redelivery_job_events, list)
-                and isinstance(raw_redelivery_job_event_checkpoints, list)):
+                and isinstance(raw_redelivery_job_event_checkpoints, list)
+                and isinstance(raw_event_gc, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -7268,6 +7459,43 @@ class DeviceStore:
                 cancellation_id=j_cancellation_id,
                 cancelled_at=j_cancelled_at)
 
+        # Per-device event-retention watermarks. Older version-1 files
+        # predate the section: it is absent and every device's watermark
+        # loads as 0 (its chain must run from seq 1). A present section
+        # holds one record per pruned device; every record carries exactly
+        # device_id/seq in that order, references a registered device, and
+        # its seq is a non-negative, non-boolean integer. A duplicated
+        # device, an unknown device, or a field, type or key-order error
+        # refuses startup rather than silently dropping or clamping the
+        # record. The chain-consistency checks below use the watermark:
+        # the surviving events of a pruned device must run consecutively
+        # from its watermark + 1.
+        redelivery_job_event_gc: Dict[str, int] = {}
+        for index, raw in enumerate(raw_event_gc):
+            where = f"event_gc[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["device_id", "seq"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'device_id', "
+                    f"'seq' in order")
+            g_device_id = raw["device_id"]
+            g_seq = raw["seq"]
+            if not (isinstance(g_device_id, str) and g_device_id):
+                raise ValueError(
+                    f"{where}.device_id must be a non-empty string")
+            if not isinstance(g_seq, int) or isinstance(g_seq, bool) \
+                    or g_seq < 0:
+                raise ValueError(
+                    f"{where}.seq must be a non-negative integer")
+            if g_device_id not in device_index:
+                raise ValueError(
+                    f"{where} references an unknown device: {g_device_id}")
+            if g_device_id in redelivery_job_event_gc:
+                raise ValueError(
+                    f"duplicate event_gc record in state: {g_device_id}")
+            redelivery_job_event_gc[g_device_id] = g_seq
+
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
         # job without any event is simply older than the section and stays
@@ -7347,12 +7575,13 @@ class DeviceStore:
             redelivery_job_events.setdefault(e_device_id, []).append(event)
         for event_device_id, chain in redelivery_job_events.items():
             chain.sort(key=lambda event: event.seq)
+            event_base = redelivery_job_event_gc.get(event_device_id, 0)
             for position, event in enumerate(chain):
-                if event.seq != position + 1:
+                if event.seq != event_base + position + 1:
                     raise ValueError(
                         f"redelivery_job_events chain of device "
                         f"{event_device_id} must run consecutively from "
-                        f"seq 1")
+                        f"its retention watermark + 1")
                 last_event_by_job[event.job_id] = event
         for event_job_id, last_event in last_event_by_job.items():
             current_state = redelivery_jobs[event_job_id].state
@@ -7366,23 +7595,49 @@ class DeviceStore:
         # version-1 files predate the section: it is absent and treated as
         # empty (every pair reads as seq 0 with a null updated_at). A
         # present section holds one record per (device_id, consumer_id)
-        # pair; every record carries exactly device_id/consumer_id/seq/
-        # updated_at in that order, references a registered device, and its
-        # seq must not exceed that device's last event seq. A duplicated
-        # pair, an unknown device, an out-of-range seq, or a field, type or
-        # key-order error refuses startup rather than silently dropping or
-        # clamping the record.
+        # pair; every record carries either the legacy four keys
+        # device_id/consumer_id/seq/updated_at in that order (loaded with
+        # expires null and active true — a lease-less, valid checkpoint)
+        # or the current six keys with expires (a UTC timestamp or null)
+        # and active (a boolean) appended in that order, references a
+        # registered device, and its seq must not exceed that device's
+        # last event seq (the retention watermark when the chain was
+        # pruned empty). A revoked (inactive) record must carry a null
+        # expires, exactly as the live revoke writes it. A duplicated
+        # pair, an unknown device, an out-of-range seq, or a field, type
+        # or key-order error refuses startup rather than silently dropping
+        # or clamping the record.
         redelivery_job_event_checkpoints: \
             Dict[Tuple[str, str], RedeliveryJobEventCheckpoint] = {}
         for index, raw in enumerate(raw_redelivery_job_event_checkpoints):
             where = f"redelivery_job_event_checkpoints[{index}]"
             if not isinstance(raw, dict):
                 raise ValueError(f"{where} must be an object")
-            if list(raw) != ["device_id", "consumer_id", "seq",
+            if list(raw) == ["device_id", "consumer_id", "seq",
                              "updated_at"]:
+                c_expires = None
+                c_active = True
+            elif list(raw) == ["device_id", "consumer_id", "seq",
+                               "updated_at", "expires", "active"]:
+                c_expires = raw["expires"]
+                c_active = raw["active"]
+                if c_expires is not None \
+                        and not _is_utc_microsecond_iso(c_expires):
+                    raise ValueError(
+                        f"{where}.expires must be null or a UTC ISO-8601 "
+                        f"timestamp with microseconds and a +00:00 offset")
+                if not isinstance(c_active, bool):
+                    raise ValueError(
+                        f"{where}.active must be a boolean")
+                if not c_active and c_expires is not None:
+                    raise ValueError(
+                        f"{where} is inactive but carries a non-null "
+                        f"expires")
+            else:
                 raise ValueError(
                     f"{where} must have exactly the keys 'device_id', "
-                    f"'consumer_id', 'seq', 'updated_at' in order")
+                    f"'consumer_id', 'seq', 'updated_at' in order, "
+                    f"optionally followed by 'expires', 'active'")
             c_device_id = raw["device_id"]
             c_consumer_id = raw["consumer_id"]
             c_seq = raw["seq"]
@@ -7411,7 +7666,8 @@ class DeviceStore:
                     f"{ckey}")
             checkpoint_chain = redelivery_job_events.get(c_device_id, [])
             max_event_seq = checkpoint_chain[-1].seq \
-                if checkpoint_chain else 0
+                if checkpoint_chain \
+                else redelivery_job_event_gc.get(c_device_id, 0)
             if c_seq > max_event_seq:
                 raise ValueError(
                     f"{where}.seq {c_seq} exceeds the device's last event "
@@ -7419,7 +7675,8 @@ class DeviceStore:
             redelivery_job_event_checkpoints[ckey] = \
                 RedeliveryJobEventCheckpoint(
                     device_id=c_device_id, consumer_id=c_consumer_id,
-                    seq=c_seq, updated_at=c_updated_at)
+                    seq=c_seq, updated_at=c_updated_at,
+                    expires=c_expires, active=c_active)
 
         # Per-device group-session delivery records. Older version-1 files
         # predate the section: it is absent and treated as empty. A present
@@ -7767,6 +8024,7 @@ class DeviceStore:
             self._redelivery_job_events = redelivery_job_events
             self._redelivery_job_event_checkpoints = \
                 redelivery_job_event_checkpoints
+            self._redelivery_job_event_gc = redelivery_job_event_gc
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor

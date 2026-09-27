@@ -293,10 +293,11 @@ class CheckpointPersistenceTest(CheckpointMixin, unittest.TestCase):
         self.assertEqual(document["redelivery_job_event_checkpoints"], [
             {"device_id": "bob", "consumer_id": "c1", "seq": 1,
              "updated_at": document["redelivery_job_event_checkpoints"]
-             [0]["updated_at"]}])
+             [0]["updated_at"], "expires": None, "active": True}])
         item = document["redelivery_job_event_checkpoints"][0]
         self.assertEqual(list(item),
-                         ["device_id", "consumer_id", "seq", "updated_at"])
+                         ["device_id", "consumer_id", "seq", "updated_at",
+                          "expires", "active"])
 
     def test_advance_consumes_a_generation_reads_do_not(self) -> None:
         self._op("J1", "queue")
