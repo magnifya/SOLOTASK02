@@ -416,6 +416,26 @@ class RedeliveryJobEventCheckpoint:
 
 
 @dataclass
+class EventGcBatchCleanupRequest:
+    """The durable idempotency record of one committed batch cleanup.
+
+    Written together with the deletions it performed (same locked
+    transaction), keyed by the client-chosen ``request_id`` (globally
+    unique). The record freezes the request's ``device_ids`` (order
+    included), ``after`` and ``limit`` plus the answered ``status`` and the
+    full response body, so a replayed commit returns the first response
+    byte-identically even if the underlying state has since changed.
+    """
+
+    request_id: str
+    device_ids: List[str]
+    after: int
+    limit: int
+    status: int
+    response: Dict[str, Any]
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

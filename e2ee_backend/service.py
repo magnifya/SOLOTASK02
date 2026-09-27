@@ -94,6 +94,7 @@ from .storage import (
     REDELIVERY_JOB_EVENT_AFTER_CONFLICT,
     REDELIVERY_JOB_EVENT_CHECKPOINT_CONSUMER_INVALID,
     REDELIVERY_JOB_EVENT_CHECKPOINT_SEQ_CONFLICT,
+    REDELIVERY_JOB_EVENT_GC_BATCH_REQUEST_ID_CONFLICT,
     REDELIVERY_JOB_EVENT_GC_CONSUMER_UNKNOWN,
     REDELIVERY_JOB_EVENT_GC_NO_VALID_CONSUMER,
     REDELIVERY_JOB_EVENT_GC_SEQ_CONFLICT,
@@ -2167,17 +2168,19 @@ class DeviceService:
 
         ``POST /v1/event-gc-batch/cleanup-expired``. The call takes no
         query parameters (the HTTP layer rejects any with 400/field
-        ``query``) and the body must be a JSON object carrying exactly
-        ``mode``, ``device_ids``, ``after`` and ``limit``; a bad/non-object
-        body is 400/field ``request_body``. ``mode`` must be one of
-        ``preview`` or ``commit``; ``device_ids`` must be a non-empty
-        array of unique non-empty strings; ``after`` must be a
-        non-negative, non-boolean integer and ``limit`` a non-boolean
-        integer in 1..100. A missing, wrongly typed or out-of-range field
-        is 400 with that field name, an extra top-level key is 400 with
-        that key (the first, in payload order), and an illegal
-        (non-string/empty) or repeated element is 400/field
-        ``device_ids[i]``.
+        ``query``) and the body must be a JSON object carrying ``mode``,
+        ``device_ids``, ``after`` and ``limit``, plus an optional
+        ``request_id`` for a ``commit``; a bad/non-object body is
+        400/field ``request_body``. ``mode`` must be one of ``preview``
+        or ``commit``; ``device_ids`` must be a non-empty array of unique
+        non-empty strings; ``after`` must be a non-negative, non-boolean
+        integer and ``limit`` a non-boolean integer in 1..100. A missing,
+        wrongly typed or out-of-range field is 400 with that field name,
+        an extra top-level key is 400 with that key (the first, in payload
+        order), and an illegal (non-string/empty) or repeated element is
+        400/field ``device_ids[i]``. A ``request_id`` is only accepted on
+        ``commit`` and must be a non-empty string (400/field
+        ``request_id`` otherwise, including on ``preview``).
 
         The input list is paged from the zero-based offset ``after`` for
         at most ``limit`` entries and the whole page is handled under the
@@ -2191,7 +2194,19 @@ class DeviceService:
         deletes that set across the page in one transaction: with at
         least one deletion the answer is 201, otherwise 200; a data-file
         failure rolls the whole batch back and the HTTP layer answers
-        503/field ``data_file``. On success the body keys are ``mode``,
+        503/field ``data_file``.
+
+        A ``commit`` carrying ``request_id`` is idempotent across
+        restarts: a replay with the same id and the same ``device_ids``
+        (order included), ``after`` and ``limit`` returns the first
+        status code and a byte-identical frozen response without writing
+        or consuming a commit generation, even if the state has since
+        changed; the same id with a different payload is 409/field
+        ``request_id``; concurrent commits with the same id execute
+        exactly once. The deletions, the frozen response and the
+        idempotency record commit in the one locked transaction, so even
+        a deletion-less idempotent commit persists exactly once
+        (``commit_seq`` plus one). On success the body keys are ``mode``,
         ``results``, ``next_after`` and ``has_more`` in that order;
         results keep input order, each item ``device_id``,
         ``watermark``, ``expired``, ``removed`` and ``error`` in that
@@ -2201,15 +2216,15 @@ class DeviceService:
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object",
                                "request_body")
-        # The body carries exactly mode, device_ids, after and limit; any
-        # other key is 400 with that field (the first extra key, in
-        # payload order).
-        allowed = ("mode", "device_ids", "after", "limit")
+        # The body carries exactly mode, device_ids, after, limit and the
+        # optional request_id; any other key is 400 with that field (the
+        # first extra key, in payload order).
+        allowed = ("mode", "device_ids", "after", "limit", "request_id")
         extras = [key for key in payload if key not in allowed]
         if extras:
             raise ServiceError(
                 f"unexpected field: {extras[0]}", extras[0])
-        for name in allowed:
+        for name in ("mode", "device_ids", "after", "limit"):
             if name not in payload:
                 raise ServiceError(f"missing required field: {name}", name)
         mode = payload["mode"]
@@ -2217,6 +2232,15 @@ class DeviceService:
                                                         "commit"):
             raise ServiceError(
                 "field must be one of 'preview' or 'commit': mode", "mode")
+        request_id = payload.get("request_id")
+        if "request_id" in payload:
+            # request_id is a commit-only option: on preview it stays the
+            # 400 it was as an extra key; on commit it must be a non-empty
+            # string.
+            if mode != "commit" or not is_nonempty_string(request_id):
+                raise ServiceError(
+                    "field must be a non-empty string: request_id",
+                    "request_id")
         raw_device_ids = payload["device_ids"]
         if not isinstance(raw_device_ids, list) or not raw_device_ids:
             raise ServiceError(
@@ -2241,8 +2265,17 @@ class DeviceService:
                     f"{item_field}", item_field)
             seen_device_ids.add(element)
             device_ids.append(element)
-        return self.store.redelivery_job_event_gc_cleanup_expired_batch(
-            mode, device_ids, after, limit)
+        try:
+            return self.store.redelivery_job_event_gc_cleanup_expired_batch(
+                mode, device_ids, after, limit,
+                request_id if mode == "commit" else None)
+        except RedeliveryJobError as error:
+            if error.reason == \
+                    REDELIVERY_JOB_EVENT_GC_BATCH_REQUEST_ID_CONFLICT:
+                raise ServiceError(
+                    "request_id was already committed with a different "
+                    "payload", "request_id", status_code=409)
+            raise
 
     def inbox_job_get(self, device_id: str, job_id: str) -> Dict[str, Any]:
         """Return one redelivery job's detail with its recovery chain.
