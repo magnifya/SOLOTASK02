@@ -4802,6 +4802,90 @@ class DeviceStore:
             }
 
     @staticmethod
+    def _cleanup_lease_state_locked(
+            lease: CleanupLease, checkpoint: int, now: datetime) -> str:
+        """Classify one cleanup audit lease at a single query instant.
+
+        The states are decided in this order: a lease whose terminal
+        resolution is ``release`` is ``released``; one explicitly
+        confirmed (``terminal == "confirm"``) or implicitly acknowledged
+        (its consumer's checkpoint has reached ``next_after``) is
+        ``confirmed``; otherwise a lease whose current effective deadline
+        (the claim ``expires`` initially, the last renewal's afterwards)
+        is at or before *now* is ``expired``; anything else is
+        ``active``. A canonical timestamp is guaranteed by restore; a
+        non-parseable value is treated as expired rather than active.
+        """
+        if lease.terminal == "release":
+            return "released"
+        if lease.terminal == "confirm" or checkpoint >= lease.next_after:
+            return "confirmed"
+        try:
+            deadline = datetime.fromisoformat(
+                DeviceStore._cleanup_lease_effective_expires(lease))
+        except ValueError:
+            return "expired"
+        if deadline <= now:
+            return "expired"
+        return "active"
+
+    def cleanup_leases_page(
+            self, consumer_id: Optional[str], after: int,
+            limit: int) -> Dict[str, Any]:
+        """Read one page of batch-cleanup audit claim leases (read-only).
+
+        ``GET /v1/event-gc-batch/leases``. Under the one store lock
+        shared with the claims, lease confirmations/releases/renewals,
+        checkpoint advances and batch cleanup commits, the committed
+        leases are taken in creation order (the insertion order of
+        ``_cleanup_leases``, preserved across save/load) and, when
+        *consumer_id* is given, filtered to that consumer (an omitted
+        *consumer_id* lists every consumer); the page is the matching
+        leases at the zero-based offset *after*, at most *limit* of
+        them. Each lease's state is decided at one shared query instant
+        by :meth:`_cleanup_lease_state_locked`.
+
+        On success the body keys are ``leases``, ``next_after`` and
+        ``has_more`` in that order; each item carries ``lease_id``,
+        ``consumer_id``, ``expected``, ``next_after``, ``expires`` (the
+        frozen claim deadline), ``effective_expires`` (the current
+        effective deadline — the last renewal's value, falling back to
+        the claim value), ``renewal_count`` and ``state`` in that
+        order. ``next_after`` is *after* plus the page length (equal to
+        *after* for an empty page) and ``has_more`` says whether
+        further matching leases follow. The lookup writes nothing and
+        advances no commit generation.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            leases = [lease for lease in self._cleanup_leases.values()
+                      if consumer_id is None
+                      or lease.consumer_id == consumer_id]
+            page = leases[after:after + limit]
+            leases_view = []
+            for lease in page:
+                record = self._cleanup_checkpoints.get(lease.consumer_id)
+                checkpoint = record.after if record is not None else 0
+                leases_view.append({
+                    "lease_id": lease.lease_id,
+                    "consumer_id": lease.consumer_id,
+                    "expected": lease.expected,
+                    "next_after": lease.next_after,
+                    "expires": lease.expires,
+                    "effective_expires":
+                        self._cleanup_lease_effective_expires(lease),
+                    "renewal_count": len(lease.renewals),
+                    "state": self._cleanup_lease_state_locked(
+                        lease, checkpoint, now),
+                })
+            next_after = after + len(page)
+            return {
+                "leases": leases_view,
+                "next_after": next_after,
+                "has_more": next_after < len(leases),
+            }
+
+    @staticmethod
     def _cleanup_lease_view(
             lease: CleanupLease,
             records: List[EventGcBatchCleanupRequest]) -> Dict[str, Any]:

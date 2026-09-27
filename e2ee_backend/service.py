@@ -2744,6 +2744,57 @@ class DeviceService:
                 "field must be an integer in 1..100: limit", "limit")
         return self.store.cleanup_checkpoints_page(after, limit)
 
+    def event_gc_batch_leases(
+            self, consumer_id: Optional[str], after: int,
+            limit: int) -> Dict[str, Any]:
+        """Page the batch-cleanup audit claim leases.
+
+        ``GET /v1/event-gc-batch/leases``. The GET takes no request
+        body (the HTTP layer rejects a non-empty one with 400/field
+        ``request_body``) and only the single-valued query parameters
+        ``consumer_id``, ``after`` and ``limit`` (any other parameter
+        is 400/field ``query``). ``consumer_id`` is optional: omitted,
+        every consumer's leases are listed; given, it must be a
+        non-empty string (a repeated or empty value is 400/field
+        ``consumer_id``). ``after`` defaults to 0 and is an ASCII
+        decimal integer in 0..2**63-1 and ``limit`` defaults to 100 and
+        is in 1..100 (the HTTP layer enforces the decimal shape and
+        single occurrence, answering 400 with the parameter name as
+        ``field``).
+
+        Under the store lock the committed leases are taken in creation
+        order, filtered to *consumer_id* when one is given, and the page
+        is the matches at the zero-based offset *after*, at most
+        *limit* of them. On success the body keys are ``leases``,
+        ``next_after`` and ``has_more`` in that order; each item is
+        ``lease_id``, ``consumer_id``, ``expected``, ``next_after``,
+        ``expires``, ``effective_expires``, ``renewal_count`` and
+        ``state`` in that order. The state is decided at one query
+        instant: a released lease is ``released``; an explicitly
+        confirmed one or one whose consumer checkpoint has reached
+        ``next_after`` is ``confirmed``; a lease whose effective
+        deadline (last renewal value, else the claim ``expires``) is at
+        or before now is ``expired``; otherwise ``active``.
+        ``next_after`` is *after* plus the page length (equal to
+        *after* for an empty page) and ``has_more`` says whether
+        further matching leases follow. The lookup writes nothing and
+        advances no ``commit_seq``.
+        """
+        if consumer_id is not None and (
+                not isinstance(consumer_id, str) or not consumer_id):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or not 0 <= after <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        return self.store.cleanup_leases_page(consumer_id, after, limit)
+
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:
         """Return one committed batch cleanup idempotency record.
