@@ -476,15 +476,18 @@ class ClaimPersistenceTest(ClaimMixin, unittest.TestCase):
         self.assertEqual(len(section), 1)
         self.assertEqual(list(section[0]),
                          ["lease_id", "consumer_id", "expected",
-                          "next_after", "limit", "expires", "terminal"])
+                          "next_after", "limit", "expires", "terminal",
+                          "renewals"])
         self.assertEqual(
             {k: section[0][k] for k in
              ("lease_id", "consumer_id", "expected", "next_after",
               "limit")},
             {"lease_id": "L1", "consumer_id": "c1", "expected": 0,
              "next_after": 1, "limit": 1})
-        # A freshly claimed lease carries no explicit resolution.
+        # A freshly claimed lease carries no explicit resolution and no
+        # renewals yet (new writes always carry all eight keys).
         self.assertIsNone(section[0]["terminal"])
+        self.assertEqual(section[0]["renewals"], [])
 
     def test_empty_page_writes_no_section_entries(self) -> None:
         _body, status = self._claim()

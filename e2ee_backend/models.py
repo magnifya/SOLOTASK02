@@ -454,6 +454,24 @@ class CleanupCheckpoint:
 
 
 @dataclass
+class CleanupLeaseRenewal:
+    """One committed renewal of a batch-cleanup audit claim lease.
+
+    ``POST /v1/event-gc-batch/lease/renew`` extends the lease's
+    effective deadline by exactly 30 seconds per renewal. The record
+    freezes the client-chosen ``renewal_id`` (unique within one lease,
+    but reusable across different leases) together with the new
+    effective ``expires`` deadline produced by that renewal, so a
+    replayed renewal returns its first response byte-identically. At
+    most ten renewals may ever be attached to one lease (the eleventh
+    request conflicts).
+    """
+
+    renewal_id: str
+    expires: str
+
+
+@dataclass
 class CleanupLease:
     """One unacknowledged lease on the batch-cleanup audit chain.
 
@@ -480,6 +498,17 @@ class CleanupLease:
     ``next_after``) and ``"release"`` once the consumer released it early
     (the lease stops blocking before the checkpoint moves). Both
     terminal operations are idempotent replays of their first response.
+
+    ``renewals`` records each committed
+    ``POST .../lease/renew`` in order; the lease's effective deadline is
+    its claim ``expires`` plus one 30-second extension per renewal (i.e.
+    the last renewal's ``expires``). The claim deadline itself stays
+    frozen, so replaying the original claim still returns its first
+    response. A first renewal is only allowed while the lease is not
+    terminal, not expired, still unacknowledged (the checkpoint equals
+    ``expected``) and holds fewer than ten renewals; a replay of the same
+    ``renewal_id`` on the same lease always answers from the frozen
+    record.
     """
 
     lease_id: str
@@ -489,6 +518,7 @@ class CleanupLease:
     limit: int
     expires: str
     terminal: Optional[str] = None
+    renewals: List[CleanupLeaseRenewal] = field(default_factory=list)
 
 
 @dataclass

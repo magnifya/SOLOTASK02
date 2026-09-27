@@ -22,6 +22,7 @@ from .models import (
     ClaimSessionBinding,
     CleanupCheckpoint,
     CleanupLease,
+    CleanupLeaseRenewal,
     Device,
     EventGcBatchCleanupRequest,
     Group,
@@ -326,12 +327,24 @@ CLEANUP_LEASE_CONSUMER_MISMATCH = "cleanup_lease_consumer_mismatch"
 #: after the checkpoint already reached next_after (409/lease_id at
 #: the service layer).
 CLEANUP_LEASE_STATE_CONFLICT = "cleanup_lease_state_conflict"
+#: A first cleanup lease renewal conflicts with the lease's current
+#: state: the lease is already terminal, its effective deadline has
+#: passed, the consumer's checkpoint has moved off the lease's start
+#: offset, or ten renewals already exist (409/lease_id at the service
+#: layer).
+CLEANUP_LEASE_RENEW_CONFLICT = "cleanup_lease_renew_conflict"
 
 #: Lifetime of one batch-cleanup audit claim lease, in seconds. A
 #: non-empty claim reserves the page for 30 seconds: the lease is
 #: acknowledged once the consumer's checkpoint reaches its ``next_after``
 #: and otherwise stops blocking new claims when this deadline passes.
 CLEANUP_LEASE_SECONDS = 30
+
+#: Maximum number of committed renewals one batch-cleanup audit claim
+#: lease may ever carry: the first ten ``.../lease/renew`` calls each
+#: extend the effective deadline by :data:`CLEANUP_LEASE_SECONDS`
+#: seconds, the eleventh conflicts.
+CLEANUP_LEASE_MAX_RENEWALS = 10
 
 #: Lifetime of one event-retention lease registered by an event-gc
 #: ``touch``, in seconds (30 days). While at least one valid lease
@@ -4809,6 +4822,20 @@ class DeviceStore:
             "expires": lease.expires,
         }
 
+    @staticmethod
+    def _cleanup_lease_effective_expires(lease: CleanupLease) -> str:
+        """The lease's current effective deadline as an ISO-8601 string.
+
+        Initially the claim ``expires``; after one or more renewals the
+        last renewal's ``expires`` (each renewal extends the previous
+        effective deadline by exactly 30 seconds). The claim value
+        itself stays frozen, so a claim replay answers with it while all
+        liveness decisions use this effective value.
+        """
+        if lease.renewals:
+            return lease.renewals[-1].expires
+        return lease.expires
+
     def _cleanup_lease_open_locked(
             self, consumer_id: str, checkpoint: int,
             now: datetime) -> Optional[CleanupLease]:
@@ -4816,12 +4843,12 @@ class DeviceStore:
 
         A lease blocks a new claim while it is both unacknowledged — the
         consumer's checkpoint has not reached its ``next_after`` — and
-        unexpired (its ``expires`` deadline is strictly after *now*),
-        unless it was explicitly released early (``terminal ==
-        "release"``). Acknowledged, released or expired leases stay on
-        record as replay history but never block. Restore validation
-        guarantees at most one open lease per consumer; the first match
-        in creation order is authoritative.
+        unexpired (its current effective deadline, after renewals, is
+        strictly after *now*), unless it was explicitly released early
+        (``terminal == "release"``). Acknowledged, released or expired
+        leases stay on record as replay history but never block.
+        Restore validation guarantees at most one open lease per
+        consumer; the first match in creation order is authoritative.
         """
         for lease in self._cleanup_leases.values():
             if lease.consumer_id != consumer_id:
@@ -4831,7 +4858,8 @@ class DeviceStore:
             if checkpoint >= lease.next_after:
                 continue
             try:
-                deadline = datetime.fromisoformat(lease.expires)
+                deadline = datetime.fromisoformat(
+                    self._cleanup_lease_effective_expires(lease))
             except ValueError:
                 # A canonical timestamp is guaranteed by restore; treat
                 # anything else as expired rather than blocking forever.
@@ -5011,7 +5039,8 @@ class DeviceStore:
             record = self._cleanup_checkpoints.get(consumer_id)
             current = record.after if record is not None else 0
             acknowledged = current >= lease.next_after
-            deadline = datetime.fromisoformat(lease.expires)
+            deadline = datetime.fromisoformat(
+                self._cleanup_lease_effective_expires(lease))
             expired = deadline <= now
 
             if acknowledged:
@@ -5058,6 +5087,114 @@ class DeviceStore:
             # back together with the rest of the state.
             self._notify_change()
             return self._cleanup_lease_op_view(lease, op), 201
+
+    @staticmethod
+    def _cleanup_lease_renew_view(
+            lease: CleanupLease, renewal_id: str,
+            expires: str) -> Dict[str, Any]:
+        """The wire view of one cleanup lease renewal.
+
+        Keys are ``consumer_id``, ``lease_id``, ``renewal_id`` and
+        ``expires`` in that order; ``expires`` is the renewed effective
+        deadline (a frozen value for replays).
+        """
+        return {
+            "consumer_id": lease.consumer_id,
+            "lease_id": lease.lease_id,
+            "renewal_id": renewal_id,
+            "expires": expires,
+        }
+
+    def cleanup_lease_renew(
+            self, consumer_id: str, lease_id: str, renewal_id: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Renew one batch-cleanup audit claim lease for another 30 seconds.
+
+        ``POST /v1/event-gc-batch/lease/renew``. All decisions are made
+        under the one store lock, shared with the claims, lease
+        confirmations/releases, checkpoint advances and batch cleanup
+        commits. Resolution order is fixed:
+
+        * an unknown *lease_id* (never committed by a non-empty claim)
+          raises :class:`RedeliveryJobError`
+          ``cleanup_lease_not_found`` (404/lease_id at the service
+          layer);
+        * a lease owned by another consumer raises
+          ``cleanup_lease_consumer_mismatch`` (409/consumer_id);
+        * a replay of the same *renewal_id* on the same lease is
+          resolved next and always answers 200 with its frozen first
+          response (the renewal's ``expires``), writing nothing — even
+          if the lease has since expired or been confirmed/released; the
+          id only has to be unique within one lease, so it may recur on
+          other leases;
+        * a first renewal then requires the lease to be not terminal,
+          its current effective deadline (the claim value initially,
+          the last renewal's afterwards) to be still in the future, and
+          the consumer's current checkpoint (0 when none is stored) to
+          equal the lease's starting ``expected`` while remaining below
+          ``next_after``; at most :data:`CLEANUP_LEASE_MAX_RENEWALS`
+          renewals may exist. Any of these raises
+          ``cleanup_lease_renew_conflict`` (409/lease_id).
+
+        On success (201) the effective deadline is extended by exactly
+        :data:`CLEANUP_LEASE_SECONDS` seconds and one renewal record
+        (``renewal_id``/new ``expires``) is appended to the lease; the
+        claim replay still answers with its original frozen ``expires``.
+        The renewal commits with one persistence notification
+        (commit_seq + 1) and a data-file failure rolls the renewal, the
+        generation and both files back; a replay neither writes nor
+        advances the generation. Returns ``(body, status_code)`` with
+        keys ``consumer_id``, ``lease_id``, ``renewal_id`` and
+        ``expires`` in that order.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+
+            lease = self._cleanup_leases.get(lease_id)
+            if lease is None:
+                raise RedeliveryJobError(CLEANUP_LEASE_NOT_FOUND)
+            if lease.consumer_id != consumer_id:
+                raise RedeliveryJobError(CLEANUP_LEASE_CONSUMER_MISMATCH)
+
+            # Same renewal_id on this lease is an exact replay: rebuild
+            # the first response (its frozen deadline) byte-identically,
+            # however stale the lease is. The id is scoped to the lease.
+            for renewal in lease.renewals:
+                if renewal.renewal_id == renewal_id:
+                    return self._cleanup_lease_renew_view(
+                        lease, renewal_id, renewal.expires), 200
+
+            record = self._cleanup_checkpoints.get(consumer_id)
+            current = record.after if record is not None else 0
+            # A first renewal is only legal on a lease that is neither
+            # terminal nor expired, is still unacknowledged with the
+            # checkpoint exactly at the claim start, and has room under
+            # the ten-renewal cap. Every condition reports 409/lease_id.
+            if lease.terminal is not None:
+                raise RedeliveryJobError(CLEANUP_LEASE_RENEW_CONFLICT)
+            try:
+                deadline = datetime.fromisoformat(
+                    self._cleanup_lease_effective_expires(lease))
+            except ValueError:  # pragma: no cover - canonical on restore
+                raise RedeliveryJobError(
+                    CLEANUP_LEASE_RENEW_CONFLICT) from None
+            if deadline <= now:
+                raise RedeliveryJobError(CLEANUP_LEASE_RENEW_CONFLICT)
+            if current != lease.expected or current >= lease.next_after:
+                raise RedeliveryJobError(CLEANUP_LEASE_RENEW_CONFLICT)
+            if len(lease.renewals) >= CLEANUP_LEASE_MAX_RENEWALS:
+                raise RedeliveryJobError(CLEANUP_LEASE_RENEW_CONFLICT)
+
+            expires = (deadline + timedelta(
+                seconds=CLEANUP_LEASE_SECONDS)) \
+                .isoformat(timespec="microseconds")
+            lease.renewals.append(CleanupLeaseRenewal(
+                renewal_id=renewal_id, expires=expires))
+            # One persistence notification for the renewal: it commits
+            # (or rolls back) together with the rest of the state.
+            self._notify_change()
+            return self._cleanup_lease_renew_view(
+                lease, renewal_id, expires), 201
 
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
@@ -6579,6 +6716,10 @@ class DeviceStore:
                 "limit": record.limit,
                 "expires": record.expires,
                 "terminal": record.terminal,
+                "renewals": [{
+                    "renewal_id": renewal.renewal_id,
+                    "expires": renewal.expires,
+                } for renewal in record.renewals],
             } for record in self._cleanup_leases.values()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
@@ -8558,10 +8699,19 @@ class DeviceStore:
         # next_after <= audit record count with the page span no larger
         # than limit, limit a non-boolean integer in 1..100 and expires a
         # UTC ISO-8601 timestamp (six microsecond digits, +00:00).
+        # Records may additionally carry terminal (null/"confirm"/
+        # "release") as the seventh key and renewals as the eighth; old
+        # six/seven-key records load with the missing later fields as
+        # null/[]. Each renewal carries exactly renewal_id/expires (a
+        # non-empty id and a canonical UTC timestamp), ids are unique
+        # within the lease, at most ten renewals may exist, and each
+        # deadline must extend the previous effective deadline (the
+        # claim value for the first item) by exactly 30 seconds.
         # Lease ids are globally unique and each consumer may have at
         # most one still-open lease — neither acknowledged (the stored
-        # checkpoint reached next_after) nor expired — otherwise startup
-        # refuses rather than silently dropping or clamping the record.
+        # checkpoint reached next_after) nor expired against the current
+        # effective deadline after renewals — otherwise startup refuses
+        # rather than silently dropping or clamping the record.
         cleanup_leases: Dict[str, CleanupLease] = {}
         restore_now = datetime.now(timezone.utc)
         open_lease_by_consumer: Dict[str, str] = {}
@@ -8573,23 +8723,40 @@ class DeviceStore:
             legacy_six = ["lease_id", "consumer_id", "expected",
                           "next_after", "limit", "expires"]
             seven = legacy_six + ["terminal"]
+            eight = seven + ["renewals"]
             if keys == legacy_six:
                 # Older version-1 files predate explicit lease
                 # resolution: the six-key record loads with terminal
-                # null exactly like a never-resolved lease.
+                # null and no renewals exactly like a fresh claim.
                 l_terminal = None
+                raw_renewals = []
             elif keys == seven:
+                # Seven-key records predate renewals: terminal loads as
+                # stored, the renewal list is empty.
                 l_terminal = raw["terminal"]
                 if l_terminal is not None and l_terminal not in \
                         ("confirm", "release"):
                     raise ValueError(
                         f"{where}.terminal must be null, 'confirm' or "
                         f"'release'")
+                raw_renewals = []
+            elif keys == eight:
+                l_terminal = raw["terminal"]
+                if l_terminal is not None and l_terminal not in \
+                        ("confirm", "release"):
+                    raise ValueError(
+                        f"{where}.terminal must be null, 'confirm' or "
+                        f"'release'")
+                raw_renewals = raw["renewals"]
+                if not isinstance(raw_renewals, list):
+                    raise ValueError(
+                        f"{where}.renewals must be a list")
             else:
                 raise ValueError(
                     f"{where} must have exactly the keys 'lease_id', "
                     f"'consumer_id', 'expected', 'next_after', 'limit', "
-                    f"'expires' and optionally 'terminal' in order")
+                    f"'expires' and optionally 'terminal' and "
+                    f"'renewals' in order")
             l_lease_id = raw["lease_id"]
             l_consumer_id = raw["consumer_id"]
             l_expected = raw["expected"]
@@ -8624,6 +8791,60 @@ class DeviceStore:
                 raise ValueError(
                     f"{where}.expires must be a UTC ISO-8601 timestamp "
                     f"with microseconds and a +00:00 offset")
+            # Lease renewals. Each item freezes the client-chosen
+            # renewal_id (unique within this lease) and the new effective
+            # deadline; the deadlines chain exactly +30s from the claim
+            # deadline, then item by item, and at most ten renewals may
+            # ever exist.
+            if len(raw_renewals) > CLEANUP_LEASE_MAX_RENEWALS:
+                raise ValueError(
+                    f"{where} carries more than "
+                    f"{CLEANUP_LEASE_MAX_RENEWALS} renewals")
+            l_renewals: List[CleanupLeaseRenewal] = []
+            seen_renewal_ids: Set[str] = set()
+            chain_from = l_expires
+            for r_index, raw_renewal in enumerate(raw_renewals):
+                r_where = f"{where}.renewals[{r_index}]"
+                if not isinstance(raw_renewal, dict):
+                    raise ValueError(f"{r_where} must be an object")
+                if list(raw_renewal) != ["renewal_id", "expires"]:
+                    raise ValueError(
+                        f"{r_where} must have exactly the keys "
+                        f"'renewal_id' and 'expires' in that order")
+                r_renewal_id = raw_renewal["renewal_id"]
+                r_expires = raw_renewal["expires"]
+                if not (isinstance(r_renewal_id, str) and r_renewal_id):
+                    raise ValueError(
+                        f"{r_where}.renewal_id must be a non-empty string")
+                if not _is_utc_microsecond_iso(r_expires):
+                    raise ValueError(
+                        f"{r_where}.expires must be a UTC ISO-8601 "
+                        f"timestamp with microseconds and a +00:00 offset")
+                if r_renewal_id in seen_renewal_ids:
+                    raise ValueError(
+                        f"{r_where} repeats renewal_id {r_renewal_id}")
+                seen_renewal_ids.add(r_renewal_id)
+                # Each renewal extends the previous effective deadline
+                # by exactly the lease lifetime.
+                try:
+                    previous = datetime.fromisoformat(chain_from)
+                except (TypeError, ValueError):  # pragma: no cover
+                    previous = None
+                if previous is None or previous.tzinfo is None:
+                    raise ValueError(
+                        f"{r_where} cannot chain onto an unparseable "
+                        f"deadline {chain_from!r}")
+                expected_until = (previous + timedelta(
+                    seconds=CLEANUP_LEASE_SECONDS)) \
+                    .isoformat(timespec="microseconds")
+                if r_expires != expected_until:
+                    raise ValueError(
+                        f"{r_where}.expires must extend the previous "
+                        f"effective deadline by exactly "
+                        f"{CLEANUP_LEASE_SECONDS} seconds")
+                chain_from = r_expires
+                l_renewals.append(CleanupLeaseRenewal(
+                    renewal_id=r_renewal_id, expires=r_expires))
             if l_lease_id in cleanup_leases:
                 raise ValueError(
                     f"duplicate cleanup lease in state: {l_lease_id}")
@@ -8636,8 +8857,13 @@ class DeviceStore:
                 raise ValueError(
                     f"{where} is marked confirmed but the consumer's "
                     f"checkpoint has not reached next_after")
+            # Liveness uses the current effective deadline: the claim
+            # value initially, the last renewal's afterwards.
+            effective_expires = l_renewals[-1].expires if l_renewals \
+                else l_expires
             unacknowledged = stored_after < l_next_after
-            unexpired = datetime.fromisoformat(l_expires) > restore_now
+            unexpired = datetime.fromisoformat(effective_expires) \
+                > restore_now
             if unacknowledged and unexpired and l_terminal != "release":
                 if l_consumer_id in open_lease_by_consumer:
                     raise ValueError(
@@ -8647,7 +8873,8 @@ class DeviceStore:
             cleanup_leases[l_lease_id] = CleanupLease(
                 lease_id=l_lease_id, consumer_id=l_consumer_id,
                 expected=l_expected, next_after=l_next_after,
-                limit=l_limit, expires=l_expires, terminal=l_terminal)
+                limit=l_limit, expires=l_expires, terminal=l_terminal,
+                renewals=l_renewals)
 
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
