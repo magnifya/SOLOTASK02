@@ -21,6 +21,7 @@ _EVENT_GC_PATH = "/v1/event-gc"
 _EVENT_GC_BATCH_CLEANUP_PATH = "/v1/event-gc-batch/cleanup-expired"
 _EVENT_GC_BATCH_CHECKPOINT_PATH = "/v1/event-gc-batch/checkpoint"
 _EVENT_GC_BATCH_CHECKPOINTS_PATH = "/v1/event-gc-batch/checkpoints"
+_EVENT_GC_BATCH_CONSUME_PATH = "/v1/event-gc-batch/consume"
 _EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH = \
     _EVENT_GC_BATCH_CLEANUP_PATH + "/requests"
 _GROUPS_PATH = "/v1/groups"
@@ -122,6 +123,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_event_gc_cleanup_expired_batch()
         elif path == _EVENT_GC_BATCH_CHECKPOINT_PATH:
             self._handle_event_gc_batch_checkpoint()
+        elif path == _EVENT_GC_BATCH_CONSUME_PATH:
+            self._handle_event_gc_batch_consume()
         elif path.startswith(_EVENT_GC_PATH + "/"):
             self._route_event_gc(path)
         elif path == _INBOX_JOBS_PATH + "/recover-batch":
@@ -1151,26 +1154,46 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         self._send_json(status_code, body)
 
-    def _handle_event_gc_batch_checkpoints(self) -> None:
-        # The batch-cleanup audit checkpoint page takes no request body:
-        # a non-empty one is 400/request_body. Only single-valued
-        # after/limit query parameters are accepted (defaults 0/100)
-        # under the same paging contract as the request audit list;
-        # anything else is 400/query. Validation order is fixed:
-        # non-empty body (request_body), any other parameter (query),
-        # then after, then limit. keep_blank_values so a bare ``?foo``
-        # flag is an actual (unknown) parameter rather than being
+    def _handle_event_gc_batch_consume(self) -> None:
+        # The batch-cleanup audit consume takes no query parameters:
+        # any one is a 400 (field query). keep_blank_values so a bare
+        # ``?foo`` flag is an actual (unknown) parameter rather than being
         # silently dropped, while a trailing ``?`` with no parameter at
         # all is accepted.
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._send_json(400, {"message": "invalid Content-Length header",
-                                  "field": "Content-Length"})
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
             return
-        if length > 0:
-            # Drain the body so the connection stays usable, then reject.
-            self.rfile.read(length)
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.event_gc_batch_consume(
+                payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_event_gc_batch_checkpoints(self) -> None:
+        # The batch-cleanup audit checkpoint page takes no request body:
+        # a non-empty one is 400/request_body, however it is legally
+        # framed (Content-Length or chunked transfer encoding). Only
+        # single-valued after/limit query parameters are accepted
+        # (defaults 0/100) under the same paging contract as the request
+        # audit list; anything else is 400/query. Validation order is
+        # fixed: non-empty body (request_body), any other parameter
+        # (query), then after, then limit. keep_blank_values so a bare
+        # ``?foo`` flag is an actual (unknown) parameter rather than
+        # being silently dropped, while a trailing ``?`` with no
+        # parameter at all is accepted.
+        body = self._read_framed_body()
+        if body is None:
+            return  # a 400 response was already sent
+        if body:
             self._send_json(400, {"message": "request body must be empty",
                                   "field": "request_body"})
             return
@@ -1920,6 +1943,61 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"message": "request body must be valid JSON",
                                   "field": "request_body"})
             return _BAD_REQUEST
+
+    def _read_framed_body(self) -> Optional[bytes]:
+        """Read the request body under either legal framing.
+
+        A ``Transfer-Encoding`` naming ``chunked`` takes precedence over
+        ``Content-Length`` (per RFC 9112 the length header is then
+        ignored); otherwise the Content-Length header frames the body.
+        Returns the raw body bytes (``b""`` when there is no body), or
+        ``None`` after sending the 400 response itself when the
+        Content-Length header is invalid.
+        """
+        transfer_encoding = self.headers.get("Transfer-Encoding")
+        if transfer_encoding is not None \
+                and "chunked" in transfer_encoding.lower():
+            return self._read_chunked_body()
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return None
+        if length <= 0:
+            return b""
+        # Drain the body so the connection stays usable.
+        return self.rfile.read(length)
+
+    def _read_chunked_body(self) -> bytes:
+        """Read a ``Transfer-Encoding: chunked`` request body.
+
+        Best-effort: returns the concatenated chunk data; a malformed
+        frame stops the read and yields what was decoded so far.
+        """
+        body = bytearray()
+        while True:
+            line = self.rfile.readline(65537)
+            if not line:
+                break
+            try:
+                # Chunk extensions (after a ``;``) carry no data.
+                size = int(line.split(b";", 1)[0].strip(), 16)
+            except ValueError:
+                break
+            if size == 0:
+                # Consume the trailer section up to the blank line.
+                while True:
+                    trailer = self.rfile.readline(65537)
+                    if not trailer or trailer in (b"\r\n", b"\n"):
+                        break
+                break
+            data = self.rfile.read(size)
+            body.extend(data)
+            if len(data) < size:
+                break
+            self.rfile.read(2)  # the CRLF terminating each chunk
+        return bytes(body)
 
     def _send_json(self, status_code: int, body: Any) -> None:
         data = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")

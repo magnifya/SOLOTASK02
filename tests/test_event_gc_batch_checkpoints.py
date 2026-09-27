@@ -266,6 +266,46 @@ class CheckpointsHTTPTest(CheckpointsMixin, unittest.TestCase):
         self.assertEqual(body["field"], "request_body")
         self.assertEqual(list(body), ["message", "field"])
 
+    def _raw_request(self, request: bytes):
+        import socket
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            sock.sendall(request)
+            chunks = []
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        finally:
+            sock.close()
+        head, _, raw = b"".join(chunks).partition(b"\r\n\r\n")
+        status = int(head.split(b" ", 2)[1])
+        return status, (json.loads(raw.decode("utf-8")) if raw else None)
+
+    def test_chunked_nonempty_body_rejected(self) -> None:
+        # A legally framed (chunked) non-empty body is 400/request_body
+        # just like a Content-Length framed one.
+        status, body = self._raw_request(
+            b"GET " + PATH.encode() + b" HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            b"2\r\n{}\r\n0\r\n\r\n")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["field"], "request_body")
+        self.assertEqual(list(body), ["message", "field"])
+
+    def test_chunked_empty_body_accepted(self) -> None:
+        status, body = self._raw_request(
+            b"GET " + PATH.encode() + b" HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            b"0\r\n\r\n")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["checkpoints"], [])
+
     def test_body_checked_before_query(self) -> None:
         status, body, _ = self._request(path=PATH + "?foo=1", raw="{}")
         self.assertEqual(status, 400)
