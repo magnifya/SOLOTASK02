@@ -2795,6 +2795,38 @@ class DeviceService:
                 "field must be an integer in 1..100: limit", "limit")
         return self.store.cleanup_leases_page(consumer_id, after, limit)
 
+    def event_gc_batch_lease_get(self, lease_id: str) -> Dict[str, Any]:
+        """Return one committed batch-cleanup audit claim lease.
+
+        ``GET /v1/event-gc-batch/leases/{lease_id}``. The GET takes no
+        request body (the HTTP layer rejects a non-empty one with
+        400/field ``request_body``) and no query parameters (any is
+        400/field ``query``); the path identifier is a single non-empty
+        segment strictly percent-decoded as UTF-8 by the HTTP layer (an
+        empty segment, a bad escape or invalid UTF-8 is 400/field
+        ``lease_id``, a deeper path is 404/field ``lease_id``). An
+        uncommitted *lease_id* is 404/field ``lease_id``. The lookup is
+        purely read-only (no write, no ``commit_seq`` change) and
+        shares the store lock with the claims, lease
+        confirmations/releases/renewals, checkpoint advances and batch
+        cleanup commits. On success the body keys are ``lease_id``,
+        ``consumer_id``, ``expected``, ``next_after``, ``limit``,
+        ``expires``, ``renewals``, ``terminal``, ``checkpoint``,
+        ``effective_expires`` and ``state`` in that order; ``renewals``
+        keeps the commit order with each item's keys ``renewal_id``
+        then ``expires``, ``terminal`` is ``None``, ``"confirm"`` or
+        ``"release"``, ``checkpoint`` is the consumer's current
+        checkpoint (0 when the consumer never advanced) and ``state``
+        is decided at one query instant in the order released,
+        confirmed (explicit or the checkpoint reached ``next_after``),
+        expired, active.
+        """
+        body = self.store.cleanup_lease_get(lease_id)
+        if body is None:
+            raise ServiceError(f"lease not found: {lease_id}",
+                               "lease_id", status_code=404)
+        return body
+
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:
         """Return one committed batch cleanup idempotency record.

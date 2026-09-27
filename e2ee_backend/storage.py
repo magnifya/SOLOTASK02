@@ -4885,6 +4885,54 @@ class DeviceStore:
                 "has_more": next_after < len(leases),
             }
 
+    def cleanup_lease_get(self, lease_id: str) -> Optional[Dict[str, Any]]:
+        """Read one batch-cleanup audit claim lease (read-only).
+
+        ``GET /v1/event-gc-batch/leases/{lease_id}``. Under the one
+        store lock shared with the claims, lease
+        confirmations/releases/renewals, checkpoint advances and batch
+        cleanup commits, the committed lease named *lease_id* is looked
+        up; an uncommitted id yields ``None`` (the service layer
+        answers 404/field ``lease_id``). The lease's state is decided
+        at one query instant by :meth:`_cleanup_lease_state_locked`.
+
+        On success the body keys are ``lease_id``, ``consumer_id``,
+        ``expected``, ``next_after``, ``limit``, ``expires`` (the
+        frozen claim deadline), ``renewals`` (the committed renewals in
+        commit order, each ``renewal_id`` then ``expires``),
+        ``terminal`` (``None``, ``"confirm"`` or ``"release"``),
+        ``checkpoint`` (the consumer's current checkpoint, 0 when the
+        consumer never advanced), ``effective_expires`` (the current
+        effective deadline — the last renewal's value, falling back to
+        the claim value) and ``state`` in that order. The lookup writes
+        nothing and advances no commit generation.
+        """
+        with self._lock:
+            lease = self._cleanup_leases.get(lease_id)
+            if lease is None:
+                return None
+            now = datetime.now(timezone.utc)
+            record = self._cleanup_checkpoints.get(lease.consumer_id)
+            checkpoint = record.after if record is not None else 0
+            return {
+                "lease_id": lease.lease_id,
+                "consumer_id": lease.consumer_id,
+                "expected": lease.expected,
+                "next_after": lease.next_after,
+                "limit": lease.limit,
+                "expires": lease.expires,
+                "renewals": [{
+                    "renewal_id": renewal.renewal_id,
+                    "expires": renewal.expires,
+                } for renewal in lease.renewals],
+                "terminal": lease.terminal,
+                "checkpoint": checkpoint,
+                "effective_expires":
+                    self._cleanup_lease_effective_expires(lease),
+                "state": self._cleanup_lease_state_locked(
+                    lease, checkpoint, now),
+            }
+
     @staticmethod
     def _cleanup_lease_view(
             lease: CleanupLease,

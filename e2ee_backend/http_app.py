@@ -427,6 +427,31 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_event_gc_batch_checkpoints()
         elif path == _EVENT_GC_BATCH_LEASES_PATH:
             self._handle_event_gc_batch_leases()
+        elif path.startswith(_EVENT_GC_BATCH_LEASES_PATH + "/"):
+            suffix = path[len(_EVENT_GC_BATCH_LEASES_PATH) + 1:]
+            # R/leases/{lease_id} — split on raw slashes only; a
+            # percent-encoded slash inside the id segment is part of
+            # it. The segment must be non-empty and strictly
+            # percent-decodable as UTF-8: an empty segment, a bad
+            # escape or an invalid encoding is 400/lease_id, a deeper
+            # path is 404/lease_id.
+            if "/" in suffix:
+                self._send_json(404, {"message": "lease not found",
+                                      "field": "lease_id"})
+                return
+            if not suffix:
+                self._send_json(400, {"message": "lease_id must be a "
+                                                 "non-empty path segment",
+                                      "field": "lease_id"})
+                return
+            lease_id = _strict_percent_decode(suffix)
+            if lease_id is None:
+                self._send_json(400, {
+                    "message": "lease_id has a malformed percent escape "
+                               "or is not valid UTF-8",
+                    "field": "lease_id"})
+                return
+            self._handle_event_gc_batch_lease_get(lease_id)
         elif path == _EVENT_GC_BATCH_CLEANUP_REQUESTS_PATH:
             self._handle_event_gc_batch_cleanup_request_list()
         elif path.startswith(
@@ -1354,6 +1379,35 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body = self.service.event_gc_batch_leases(
                 consumer_id, after, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_event_gc_batch_lease_get(self, lease_id: str) -> None:
+        # The lease detail takes no query parameters or request body:
+        # either one is a 400 (field query / request_body, checked in
+        # that order). The path identifier is already strictly
+        # percent-decoded as UTF-8 by the router. keep_blank_values so
+        # a bare ``?foo`` flag is an actual (unknown) parameter rather
+        # than being silently dropped, while a trailing ``?`` with no
+        # parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        body = self._read_framed_body()
+        if body is None:
+            return  # a 400 response was already sent
+        if body:
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        try:
+            body = self.service.event_gc_batch_lease_get(lease_id)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
