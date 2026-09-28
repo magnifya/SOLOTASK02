@@ -31,6 +31,7 @@ from .models import (
     GroupSessionRotation,
     GroupSyncCursor,
     KeyEvent,
+    LeaseEventCursor,
     Message,
     MessageDelivery,
     MessageLease,
@@ -334,6 +335,12 @@ CLEANUP_LEASE_STATE_CONFLICT = "cleanup_lease_state_conflict"
 #: offset, or ten renewals already exist (409/lease_id at the service
 #: layer).
 CLEANUP_LEASE_RENEW_CONFLICT = "cleanup_lease_renew_conflict"
+#: A lease-event stream subscribe/consume named an ``expected`` value
+#: that differs from the subscriber's currently stored cursor (a
+#: subscriber that has never advanced reads as 0): a brand-new
+#: subscriber must send 0, an existing one its last ``next_after`` —
+#: 409/expected at the service layer.
+LEASE_EVENT_CURSOR_EXPECTED_CONFLICT = "lease_event_cursor_expected_conflict"
 
 #: Lifetime of one batch-cleanup audit claim lease, in seconds. A
 #: non-empty claim reserves the page for 30 seconds: the lease is
@@ -801,6 +808,7 @@ INTEGRITY_SECTION_KEYS = (
     "cleanup_checkpoints",
     "cleanup_leases",
     "cleanup_lease_events",
+    "lease_event_cursors",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -813,7 +821,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 25 canonical
+    """Project a store snapshot/document payload onto the 26 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -952,6 +960,13 @@ class DeviceStore:
         # events are appended inside the same locked transaction as the
         # mutation they record and persist/roll back together with it.
         self._cleanup_lease_events: List[CleanupLeaseEvent] = []
+        # Per-subscriber read cursors on the global cleanup-lease event
+        # stream above, keyed by subscriber_id in creation order; created
+        # lazily on the first consume that delivers and advances past an
+        # event. Each committed cursor advance happens inside the same
+        # locked transaction as every other mutation, so the cursors are
+        # persisted and rolled back together with the rest of the state.
+        self._lease_event_cursors: Dict[str, LeaseEventCursor] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -5487,6 +5502,78 @@ class DeviceStore:
                                 for event in matched),
             }
 
+    def lease_event_cursor_consume(
+            self, subscriber_id: str, expected: int,
+            limit: int) -> Tuple[Dict[str, Any], bool]:
+        """Atomically subscribe one subscriber and pull a lease-event page.
+
+        ``POST /v1/event-gc-batch/lease-events/consume``. Under the one
+        store lock (shared with the claims, lease operations, checkpoint
+        advances and batch cleanup commits that append the lifecycle
+        events), an *expected* differing from the subscriber's current
+        cursor (0 when none is stored) raises
+        :class:`RedeliveryJobError`
+        ``lease_event_cursor_expected_conflict`` (409/expected at the
+        service layer). A brand-new subscriber therefore must send 0,
+        and an existing one its last ``next_after``; concurrent pulls
+        with the same ``expected`` linearize to at most one advance.
+
+        On a match the page is the global lifecycle events with
+        ``seq > cursor`` in seq order, at most *limit* of them, and the
+        cursor advances to the last returned event's seq (the record is
+        created on that first non-empty page). A non-empty page
+        persists through the change hook, so a data-file failure rolls
+        the cursor advance back; an empty page leaves the cursor
+        untouched and writes nothing (the record is never created just
+        for polling an empty stream). On success the body keys are
+        ``subscriber_id``, ``events``, ``next_after`` and ``has_more``
+        in that order; each event item is ``seq``, ``lease_id``,
+        ``consumer_id`` and ``type`` in that order. An empty page
+        echoes ``next_after=expected``; otherwise it is the last
+        returned event's seq, and ``has_more`` says whether a later
+        event follows the page. Returns ``(view, advanced)`` with
+        *advanced* true for a created or advanced subscription.
+        """
+        with self._lock:
+            record = self._lease_event_cursors.get(subscriber_id)
+            current = record.after if record is not None else 0
+            if expected != current:
+                raise RedeliveryJobError(
+                    LEASE_EVENT_CURSOR_EXPECTED_CONFLICT)
+            matched = [event for event in self._cleanup_lease_events
+                       if event.seq > current]
+            page = matched[:limit]
+            if not page:
+                # Empty page: the cursor stays untouched and nothing is
+                # written; a polling subscriber without a record keeps
+                # reading expected 0.
+                return ({
+                    "subscriber_id": subscriber_id,
+                    "events": [],
+                    "next_after": current,
+                    "has_more": False,
+                }, False)
+            next_after = page[-1].seq
+            if record is None:
+                record = LeaseEventCursor(
+                    subscriber_id=subscriber_id, after=next_after)
+                self._lease_event_cursors[subscriber_id] = record
+            else:
+                record.after = next_after
+            self._notify_change()
+            return ({
+                "subscriber_id": subscriber_id,
+                "events": [{
+                    "seq": event.seq,
+                    "lease_id": event.lease_id,
+                    "consumer_id": event.consumer_id,
+                    "type": event.type,
+                } for event in page],
+                "next_after": next_after,
+                "has_more": any(event.seq > next_after
+                                for event in matched),
+            }, True)
+
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
@@ -7018,6 +7105,10 @@ class DeviceStore:
                 "consumer_id": event.consumer_id,
                 "type": event.type,
             } for event in self._cleanup_lease_events]
+            lease_event_cursors = [{
+                "subscriber_id": record.subscriber_id,
+                "after": record.after,
+            } for record in self._lease_event_cursors.values()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -7041,7 +7132,8 @@ class DeviceStore:
                             event_gc_batch_cleanup_requests,
                         "cleanup_checkpoints": cleanup_checkpoints,
                         "cleanup_leases": cleanup_leases,
-                        "cleanup_lease_events": cleanup_lease_events}
+                        "cleanup_lease_events": cleanup_lease_events,
+                        "lease_event_cursors": lease_event_cursors}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -7228,6 +7320,7 @@ class DeviceStore:
         raw_cleanup_checkpoints = state.get("cleanup_checkpoints", [])
         raw_cleanup_leases = state.get("cleanup_leases", [])
         raw_cleanup_lease_events = state.get("cleanup_lease_events", [])
+        raw_lease_event_cursors = state.get("lease_event_cursors", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -7251,7 +7344,8 @@ class DeviceStore:
                     raw_event_gc_batch_cleanup_requests, list)
                 and isinstance(raw_cleanup_checkpoints, list)
                 and isinstance(raw_cleanup_leases, list)
-                and isinstance(raw_cleanup_lease_events, list)):
+                and isinstance(raw_cleanup_lease_events, list)
+                and isinstance(raw_lease_event_cursors, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -9325,6 +9419,50 @@ class DeviceStore:
                         f"{where} ends without the lease's "
                         f"implicit_confirm event")
 
+        # Per-subscriber read cursors on the lease-event stream above,
+        # serialized right after cleanup_lease_events. Older version-1
+        # files predate the section: it is absent and treated as empty.
+        # A present section holds one record per subscriber (unique,
+        # creation order); every record carries exactly
+        # subscriber_id/after in that order, with subscriber_id a
+        # non-empty string and after a non-boolean integer that is 0 or
+        # the seq of an event that exists in cleanup_lease_events (the
+        # live cursor only ever lands on the last event actually
+        # delivered, so a seq the stream has no event at is a
+        # contradiction). A duplicate subscriber, a key-order/type
+        # error or a cursor that names no such event refuses startup
+        # rather than silently dropping or clamping the record.
+        lease_event_cursors: Dict[str, LeaseEventCursor] = {}
+        event_seqs = {event.seq for event in cleanup_lease_events}
+        for index, raw in enumerate(raw_lease_event_cursors):
+            where = f"lease_event_cursors[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["subscriber_id", "after"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'subscriber_id' "
+                    f"and 'after' in order")
+            ec_subscriber_id = raw["subscriber_id"]
+            ec_after = raw["after"]
+            if not (isinstance(ec_subscriber_id, str)
+                    and ec_subscriber_id):
+                raise ValueError(
+                    f"{where}.subscriber_id must be a non-empty string")
+            if not isinstance(ec_after, int) or isinstance(ec_after, bool) \
+                    or not 0 <= ec_after <= 2**63 - 1:
+                raise ValueError(
+                    f"{where}.after must be an integer in 0..2^63-1")
+            if ec_after != 0 and ec_after not in event_seqs:
+                raise ValueError(
+                    f"{where}.after {ec_after} is not the seq of an "
+                    f"existing cleanup lease event")
+            if ec_subscriber_id in lease_event_cursors:
+                raise ValueError(
+                    f"duplicate lease event cursor in state: "
+                    f"{ec_subscriber_id}")
+            lease_event_cursors[ec_subscriber_id] = LeaseEventCursor(
+                subscriber_id=ec_subscriber_id, after=ec_after)
+
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
         # job without any event is simply older than the section and stays
@@ -9859,6 +9997,7 @@ class DeviceStore:
             self._cleanup_checkpoints = cleanup_checkpoints
             self._cleanup_leases = cleanup_leases
             self._cleanup_lease_events = cleanup_lease_events
+            self._lease_event_cursors = lease_event_cursors
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor

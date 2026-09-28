@@ -23,6 +23,8 @@ _EVENT_GC_BATCH_CHECKPOINT_PATH = "/v1/event-gc-batch/checkpoint"
 _EVENT_GC_BATCH_CHECKPOINTS_PATH = "/v1/event-gc-batch/checkpoints"
 _EVENT_GC_BATCH_LEASES_PATH = "/v1/event-gc-batch/leases"
 _EVENT_GC_BATCH_LEASE_EVENTS_PATH = "/v1/event-gc-batch/lease-events"
+_EVENT_GC_BATCH_LEASE_EVENTS_CONSUME_PATH = \
+    _EVENT_GC_BATCH_LEASE_EVENTS_PATH + "/consume"
 _EVENT_GC_BATCH_CONSUME_PATH = "/v1/event-gc-batch/consume"
 _EVENT_GC_BATCH_CLAIM_PATH = "/v1/event-gc-batch/claim"
 _EVENT_GC_BATCH_LEASE_PATH = "/v1/event-gc-batch/lease"
@@ -130,6 +132,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_event_gc_batch_checkpoint()
         elif path == _EVENT_GC_BATCH_CONSUME_PATH:
             self._handle_event_gc_batch_consume()
+        elif path == _EVENT_GC_BATCH_LEASE_EVENTS_CONSUME_PATH:
+            self._handle_event_gc_batch_lease_event_consume()
         elif path == _EVENT_GC_BATCH_CLAIM_PATH:
             self._handle_event_gc_batch_claim()
         elif path == _EVENT_GC_BATCH_LEASE_RENEW_PATH:
@@ -1433,6 +1437,31 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(200, body)
+
+    def _handle_event_gc_batch_lease_event_consume(self) -> None:
+        # The cleanup lease-event stream subscribe/consume takes no
+        # query parameters: any one is a 400 (field query), checked
+        # before the body just like the sibling audit consume route.
+        # keep_blank_values so a bare ``?foo`` flag is an actual
+        # (unknown) parameter rather than being silently dropped, while
+        # a trailing ``?`` with no parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = \
+                self.service.event_gc_batch_lease_event_consume(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
 
     def _handle_event_gc_batch_lease_get(self, lease_id: str) -> None:
         # The single cleanup audit lease query takes no request body and

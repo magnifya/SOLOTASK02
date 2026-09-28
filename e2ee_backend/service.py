@@ -61,6 +61,7 @@ from .storage import (
     GROUP_SESSION_INITIATOR_NOT_MEMBER,
     GROUP_SESSION_INITIATOR_UNKNOWN,
     GROUP_UNKNOWN,
+    LEASE_EVENT_CURSOR_EXPECTED_CONFLICT,
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
@@ -2883,6 +2884,83 @@ class DeviceService:
                 "field must be an integer in 1..100: limit", "limit")
         return self.store.cleanup_lease_events_page(
             consumer_id, lease_id, after, limit)
+
+    def event_gc_batch_lease_event_consume(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Subscribe to, and pull one page of, the cleanup lease events.
+
+        ``POST /v1/event-gc-batch/lease-events/consume``. The call
+        takes no query parameters (the HTTP layer rejects any with
+        400/field ``query``) and the body must be a JSON object
+        carrying exactly ``subscriber_id``, ``expected`` and
+        ``limit``; a bad/non-object body is 400/field ``request_body``,
+        a missing, wrongly typed or extra field is 400 with that field
+        (the first extra key, in payload order). ``subscriber_id``
+        must be a non-empty string, ``expected`` a non-boolean
+        integer in 0..2^63-1 and ``limit`` a non-boolean integer in
+        1..100.
+
+        A subscriber's cursor starts at 0 and is created lazily on the
+        first non-empty page: a brand-new subscriber naming a non-zero
+        ``expected`` and an existing subscriber naming an ``expected``
+        that differs from its stored cursor (the last ``next_after``)
+        are both 409/field ``expected``. On a match the store returns,
+        under the one store lock, the global lifecycle events right
+        after the cursor in seq order (at most ``limit`` of them) and
+        advances the cursor to the last event's seq. A non-empty page
+        — a newly created subscription or a forward advance — answers
+        201; an empty page answers 200, leaves the cursor untouched
+        and writes nothing. Concurrent pulls with the same
+        ``expected`` linearize to at most one 201, the rest 409; a
+        data-file failure on a non-empty page is 503/field
+        ``data_file`` with the cursor, both files and the commit
+        generation rolled back. On success the body keys are
+        ``subscriber_id``, ``events``, ``next_after`` and ``has_more``
+        in that order; each event keeps the existing four-key event
+        view (``seq``, ``lease_id``, ``consumer_id``, ``type``), an
+        empty page echoes ``next_after=expected`` and ``has_more``
+        says whether a later event follows.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly subscriber_id, expected and limit;
+        # any other key is 400 with that field (the first extra key, in
+        # payload order).
+        extras = [key for key in payload
+                  if key not in ("subscriber_id", "expected", "limit")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("subscriber_id", "expected", "limit"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["subscriber_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: subscriber_id",
+                "subscriber_id")
+        expected = payload["expected"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(expected, int) or isinstance(expected, bool) \
+                or not 0 <= expected <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: expected",
+                "expected")
+        limit = payload["limit"]
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            view, advanced = self.store.lease_event_cursor_consume(
+                payload["subscriber_id"], expected, limit)
+        except RedeliveryJobError as error:
+            if error.reason == LEASE_EVENT_CURSOR_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the subscriber's current "
+                    "cursor", "expected", status_code=409)
+            raise
+        return view, 201 if advanced else 200
 
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:

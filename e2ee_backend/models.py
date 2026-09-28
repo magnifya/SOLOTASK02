@@ -544,6 +544,28 @@ class CleanupLeaseEvent:
 
 
 @dataclass
+class LeaseEventCursor:
+    """One subscriber's read cursor on the cleanup-lease event stream.
+
+    Created lazily by ``POST
+    /v1/event-gc-batch/lease-events/consume`` the first time a named
+    subscriber actually receives (and advances past) an event; a
+    subscriber whose first calls only ever see an empty page has no
+    record and keeps sending ``expected`` 0. ``after`` is the global
+    ``seq`` of the last event delivered to that subscriber (0 for a
+    record that has never advanced) and only ever equals 0 or the seq
+    of an event that exists in :class:`CleanupLeaseEvent` stream — the
+    cursor advances strictly from one delivered event's seq to a later
+    one, never to a seq the stream has no event at. Cursors are
+    independent per ``subscriber_id`` and persist and roll back
+    together with every other section.
+    """
+
+    subscriber_id: str
+    after: int = 0
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 
