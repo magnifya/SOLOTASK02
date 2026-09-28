@@ -522,6 +522,36 @@ class CleanupLease:
 
 
 @dataclass
+class CleanupLeaseEvent:
+    """One entry in the cleanup-audit lease event stream.
+
+    Every real lifecycle transition of a
+    :class:`CleanupLease` appends exactly one event inside the same
+    locked transaction as the transition itself, so the stream commits
+    and rolls back together with the rest of the state and shares its
+    ``commit_seq``. ``seq`` runs consecutively from 1 across the whole
+    stream (not per lease or consumer); ``lease_id`` references the
+    lease the event belongs to and ``consumer_id`` is that lease's
+    owner, frozen even though the lease record itself keeps both.
+
+    ``type`` is one of ``claim`` (a non-empty claim committed the
+    lease), ``renew`` (a first, non-replayed renewal), ``confirm`` (a
+    first explicit confirmation), ``release`` (a first explicit
+    release) and ``implicit_confirm`` (a checkpoint/consume advance
+    crossed an unterminated lease's ``next_after``). Replays, failed
+    attempts, no-ops and expirations append nothing. A lease therefore
+    has exactly one ``claim`` event (its first), zero or more ``renew``
+    events, and at most one terminating event (``confirm``,
+    ``release`` or ``implicit_confirm``).
+    """
+
+    seq: int
+    lease_id: str
+    consumer_id: str
+    type: str
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

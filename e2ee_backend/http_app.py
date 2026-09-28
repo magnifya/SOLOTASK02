@@ -22,6 +22,8 @@ _EVENT_GC_BATCH_CLEANUP_PATH = "/v1/event-gc-batch/cleanup-expired"
 _EVENT_GC_BATCH_CHECKPOINT_PATH = "/v1/event-gc-batch/checkpoint"
 _EVENT_GC_BATCH_CHECKPOINTS_PATH = "/v1/event-gc-batch/checkpoints"
 _EVENT_GC_BATCH_LEASES_PATH = "/v1/event-gc-batch/leases"
+_EVENT_GC_BATCH_LEASE_EVENTS_PATH = \
+    "/v1/event-gc-batch/lease-events"
 _EVENT_GC_BATCH_CONSUME_PATH = "/v1/event-gc-batch/consume"
 _EVENT_GC_BATCH_CLAIM_PATH = "/v1/event-gc-batch/claim"
 _EVENT_GC_BATCH_LEASE_PATH = "/v1/event-gc-batch/lease"
@@ -427,6 +429,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_event_gc_batch_checkpoints()
         elif path == _EVENT_GC_BATCH_LEASES_PATH:
             self._handle_event_gc_batch_leases()
+        elif path == _EVENT_GC_BATCH_LEASE_EVENTS_PATH:
+            self._handle_event_gc_batch_lease_events()
         elif path.startswith(_EVENT_GC_BATCH_LEASES_PATH + "/"):
             suffix = path[len(_EVENT_GC_BATCH_LEASES_PATH) + 1:]
             # leases/{lease_id} — routing splits on raw slashes only; a
@@ -1407,6 +1411,74 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self.service.event_gc_batch_lease_get(lease_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_event_gc_batch_lease_events(self) -> None:
+        # The cleanup audit lease event stream takes no request body: a
+        # non-empty one is 400/request_body, however it is legally
+        # framed (Content-Length or chunked transfer encoding). Only
+        # single-valued consumer_id/lease_id/after/limit query
+        # parameters are accepted (defaults omitted/omitted/0/100);
+        # anything else is 400/query. Validation order is fixed:
+        # non-empty body (request_body), any other parameter (query),
+        # then consumer_id, lease_id, after, limit. keep_blank_values
+        # so a bare ``?foo`` flag is an actual (unknown) parameter and
+        # so an empty ``consumer_id=``/``lease_id=`` is seen, while a
+        # trailing ``?`` with no parameter at all is accepted.
+        body = self._read_framed_body()
+        if body is None:
+            return  # a 400 response was already sent
+        if body:
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name not in ("consumer_id", "lease_id", "after", "limit")
+               for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        consumer_values = query.get("consumer_id", [])
+        if len(consumer_values) > 1:
+            self._send_json(400, {"message": "consumer_id must appear at "
+                                             "most once",
+                                  "field": "consumer_id"})
+            return
+        consumer_id = consumer_values[0] if consumer_values else None
+        if consumer_id is not None and not consumer_id:
+            self._send_json(400, {"message": "consumer_id must be a "
+                                             "non-empty string",
+                                  "field": "consumer_id"})
+            return
+        lease_values = query.get("lease_id", [])
+        if len(lease_values) > 1:
+            self._send_json(400, {"message": "lease_id must appear at "
+                                             "most once",
+                                  "field": "lease_id"})
+            return
+        lease_id = lease_values[0] if lease_values else None
+        if lease_id is not None and not lease_id:
+            self._send_json(400, {"message": "lease_id must be a "
+                                             "non-empty string",
+                                  "field": "lease_id"})
+            return
+        after = self._decimal_nonneg_param(query, "after", default=0,
+                                           maximum=2**63 - 1, max_digits=19)
+        if after is None:
+            return  # a 400 response was already sent
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.event_gc_batch_lease_events(
+                consumer_id, lease_id, after, limit)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

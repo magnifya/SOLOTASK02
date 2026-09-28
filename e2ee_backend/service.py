@@ -2832,6 +2832,59 @@ class DeviceService:
                                "lease_id", status_code=404)
         return body
 
+    def event_gc_batch_lease_events(
+            self, consumer_id: Optional[str], lease_id: Optional[str],
+            after: int, limit: int) -> Dict[str, Any]:
+        """Page the batch-cleanup audit lease lifecycle event stream.
+
+        ``GET /v1/event-gc-batch/lease-events``. The GET takes no
+        request body (the HTTP layer rejects a non-empty one with
+        400/field ``request_body``) and only the single-valued query
+        parameters ``consumer_id``, ``lease_id``, ``after`` and
+        ``limit`` (any other parameter is 400/field ``query``). Both
+        ids are optional and, when given, must be non-empty strings (a
+        repeated or empty value is 400 with that parameter name);
+        ``after`` defaults to 0 and is an ASCII decimal integer in
+        0..2**63-1 and ``limit`` defaults to 100 and is in 1..100 (the
+        HTTP layer enforces the decimal shape and single occurrence).
+        Unlike the lease list, an unknown ``consumer_id``/``lease_id``
+        is not an error: it simply filters the stream down to an empty
+        page.
+
+        Under the store lock the committed events are taken in global
+        ``seq`` order, filtered by the optional ids, and the page is the
+        matches with ``seq > after``, at most *limit* of them — the
+        seq-based paging contract (an empty page echoes
+        ``next_after=after``, otherwise it is the last event's seq). On
+        success the body keys are ``events``, ``next_after`` and
+        ``has_more`` in that order; each item is ``seq``, ``lease_id``,
+        ``consumer_id`` and ``type`` in that order, with ``type`` one of
+        ``claim``/``renew``/``confirm``/``release``/
+        ``implicit_confirm``. The lookup is purely read-only (no write,
+        no ``commit_seq`` change) and shares the store lock with every
+        mutation that appends an event.
+        """
+        if consumer_id is not None and (
+                not isinstance(consumer_id, str) or not consumer_id):
+            raise ServiceError(
+                "field must be a non-empty string: consumer_id",
+                "consumer_id")
+        if lease_id is not None and (
+                not isinstance(lease_id, str) or not lease_id):
+            raise ServiceError(
+                "field must be a non-empty string: lease_id",
+                "lease_id")
+        if not isinstance(after, int) or isinstance(after, bool) \
+                or not 0 <= after <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: after", "after")
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        return self.store.cleanup_lease_events_page(
+            consumer_id, lease_id, after, limit)
+
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:
         """Return one committed batch cleanup idempotency record.

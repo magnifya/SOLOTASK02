@@ -22,6 +22,7 @@ from .models import (
     ClaimSessionBinding,
     CleanupCheckpoint,
     CleanupLease,
+    CleanupLeaseEvent,
     CleanupLeaseRenewal,
     Device,
     EventGcBatchCleanupRequest,
@@ -345,6 +346,26 @@ CLEANUP_LEASE_SECONDS = 30
 #: extend the effective deadline by :data:`CLEANUP_LEASE_SECONDS`
 #: seconds, the eleventh conflicts.
 CLEANUP_LEASE_MAX_RENEWALS = 10
+
+#: Event types in the batch-cleanup audit lease event stream. A
+#: non-empty claim appends ``claim``; a first renewal appends
+#: ``renew``; a first explicit confirmation/release appends
+#: ``confirm``/``release``; and a checkpoint/consume advance that
+#: crosses an unterminated lease appends ``implicit_confirm`` (in lease
+#: creation order). Replays, failed attempts, no-ops and expirations
+#: append nothing.
+CLEANUP_LEASE_EVENT_CLAIM = "claim"
+CLEANUP_LEASE_EVENT_RENEW = "renew"
+CLEANUP_LEASE_EVENT_CONFIRM = "confirm"
+CLEANUP_LEASE_EVENT_RELEASE = "release"
+CLEANUP_LEASE_EVENT_IMPLICIT_CONFIRM = "implicit_confirm"
+CLEANUP_LEASE_EVENT_TYPES = frozenset((
+    CLEANUP_LEASE_EVENT_CLAIM,
+    CLEANUP_LEASE_EVENT_RENEW,
+    CLEANUP_LEASE_EVENT_CONFIRM,
+    CLEANUP_LEASE_EVENT_RELEASE,
+    CLEANUP_LEASE_EVENT_IMPLICIT_CONFIRM,
+))
 
 #: Lifetime of one event-retention lease registered by an event-gc
 #: ``touch``, in seconds (30 days). While at least one valid lease
@@ -779,6 +800,7 @@ INTEGRITY_SECTION_KEYS = (
     "event_gc_batch_cleanup_requests",
     "cleanup_checkpoints",
     "cleanup_leases",
+    "cleanup_lease_events",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -791,7 +813,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 24 canonical
+    """Project a store snapshot/document payload onto the 25 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -924,6 +946,16 @@ class DeviceStore:
         # same consumer from another claim. Each lease commits and rolls
         # back together with the rest of the state.
         self._cleanup_leases: Dict[str, CleanupLease] = {}
+        # Append-only lifecycle event stream over the cleanup audit
+        # claim leases, in global commit order with ``seq`` running
+        # consecutively from 1. Every real lease transition appends
+        # exactly one event (claim/renew/confirm/release, plus
+        # implicit_confirm when a checkpoint/consume advance crosses an
+        # unterminated lease), inside the same locked transaction as the
+        # transition, so the stream is persisted and rolled back with the
+        # rest of the state and adds no commit generation of its own.
+        self._cleanup_lease_events: List[CleanupLeaseEvent] = []
+
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -4693,6 +4725,12 @@ class DeviceStore:
             else:
                 record.after = after
                 record.updated_at = utc_now_iso()
+            # The advance implicitly confirms every still-unterminated
+            # lease it crosses; each gets one event in lease creation
+            # order, committed with the checkpoint under the one
+            # notification below.
+            self._append_implicit_cleanup_confirmations_locked(
+                consumer_id, current, after)
             self._notify_change()
             return (self._cleanup_checkpoint_view(consumer_id, record),
                     True)
@@ -4750,6 +4788,12 @@ class DeviceStore:
             else:
                 record.after = next_after
                 record.updated_at = utc_now_iso()
+            # The pull advances the checkpoint, so every still-
+            # unterminated lease the advance crosses is implicitly
+            # confirmed; the events commit with the checkpoint under
+            # the one notification below.
+            self._append_implicit_cleanup_confirmations_locked(
+                consumer_id, current, next_after)
             self._notify_change()
             return ({
                 "consumer_id": consumer_id,
@@ -4968,6 +5012,102 @@ class DeviceStore:
             return lease.renewals[-1].expires
         return lease.expires
 
+    def _append_cleanup_lease_event_locked(
+            self, lease: CleanupLease, event_type: str) -> CleanupLeaseEvent:
+        """Append one entry to the cleanup lease lifecycle event stream.
+
+        Lock required. The event's ``seq`` continues the global stream
+        (starting at 1, across every lease and consumer); callers append
+        exactly one event per real transition — a non-empty claim, a
+        first renewal, a first explicit confirm/release, or an
+        ``implicit_confirm`` synthesized when a checkpoint/consume
+        advance crosses an unterminated lease. Replays, failed attempts,
+        no-ops and expirations append nothing. The append happens in the
+        same locked transaction as the transition (a single
+        :meth:`_notify_change` persists both), so it commits and rolls
+        back together with the rest of the state without consuming a
+        commit generation of its own.
+        """
+        event = CleanupLeaseEvent(
+            seq=len(self._cleanup_lease_events) + 1,
+            lease_id=lease.lease_id, consumer_id=lease.consumer_id,
+            type=event_type)
+        self._cleanup_lease_events.append(event)
+        return event
+
+    def _append_implicit_cleanup_confirmations_locked(
+            self, consumer_id: str, old_after: int,
+            new_after: int) -> None:
+        """Append ``implicit_confirm`` events a checkpoint advance crosses.
+
+        Lock required. When a consumer's checkpoint moves from
+        *old_after* to *new_after* (via the checkpoint or consume
+        endpoints), every still-unterminated lease (``terminal is
+        None``) owned by that consumer whose ``next_after`` lies in
+        ``(old_after, new_after]`` is acknowledged by the advance; one
+        ``implicit_confirm`` event is appended per such lease in lease
+        creation order (the insertion order of ``_cleanup_leases``).
+        Leases already explicitly resolved (a non-null terminal) or
+        already crossed before this advance get no event, and so do
+        leases the advance does not reach.
+        """
+        if new_after <= old_after:
+            return
+        for lease in self._cleanup_leases.values():
+            if lease.consumer_id != consumer_id:
+                continue
+            if lease.terminal is not None:
+                continue
+            if old_after < lease.next_after <= new_after:
+                self._append_cleanup_lease_event_locked(
+                    lease, CLEANUP_LEASE_EVENT_IMPLICIT_CONFIRM)
+
+    def cleanup_lease_events_page(
+            self, consumer_id: Optional[str], lease_id: Optional[str],
+            after: int, limit: int) -> Dict[str, Any]:
+        """Read one page of the cleanup audit lease event stream.
+
+        ``GET /v1/event-gc-batch/lease-events``. Under the one store
+        lock shared with claims, lease confirmations/releases/renewals,
+        checkpoint advances (which append the implicit confirmation
+        events) and batch cleanup commits, the committed events are
+        taken in global ``seq`` order and filtered to *consumer_id*
+        and/or *lease_id* when given (an omitted filter matches all;
+        an unknown value simply yields an empty page rather than a
+        404). The page is the matching events with ``seq > after``, at
+        most *limit* of them — the same seq-based paging contract as
+        the other event chains, not a zero-based offset.
+
+        On success the body keys are ``events``, ``next_after`` and
+        ``has_more`` in that order; each item carries ``seq``,
+        ``lease_id``, ``consumer_id`` and ``type`` in that order. An
+        empty page echoes ``next_after=after``; otherwise it is the
+        last returned event's ``seq``. ``has_more`` says whether a
+        further matching event follows the page. The lookup writes
+        nothing and advances no commit generation.
+        """
+        with self._lock:
+            matches = [
+                event for event in self._cleanup_lease_events
+                if event.seq > after
+                and (consumer_id is None
+                     or event.consumer_id == consumer_id)
+                and (lease_id is None
+                     or event.lease_id == lease_id)]
+            page = matches[:limit]
+            events_view = [{
+                "seq": event.seq,
+                "lease_id": event.lease_id,
+                "consumer_id": event.consumer_id,
+                "type": event.type,
+            } for event in page]
+            next_after = page[-1].seq if page else after
+            return {
+                "events": events_view,
+                "next_after": next_after,
+                "has_more": len(matches) > len(page),
+            }
+
     def _cleanup_lease_open_locked(
             self, consumer_id: str, checkpoint: int,
             now: datetime) -> Optional[CleanupLease]:
@@ -5082,6 +5222,12 @@ class DeviceStore:
                 expected=current, next_after=current + len(page),
                 limit=limit, expires=expires)
             self._cleanup_leases[lease_id] = lease
+            # The non-empty claim records exactly one lifecycle event;
+            # it commits with the lease under the one persistence
+            # notification below (a replay or an empty page records
+            # nothing).
+            self._append_cleanup_lease_event_locked(
+                lease, CLEANUP_LEASE_EVENT_CLAIM)
             # One persistence notification for the lease: it commits (or
             # rolls back) together with the rest of the state.
             self._notify_change()
@@ -5201,7 +5347,15 @@ class DeviceStore:
             if op == "confirm":
                 # The confirmation advances the consumer's checkpoint to
                 # next_after (the lease is acknowledged) and records the
-                # terminal resolution in the same transaction.
+                # terminal resolution in the same transaction. The
+                # advance can also cross other still-unterminated leases
+                # of the same consumer (an expired lease does not block
+                # a later claim): those are implicitly acknowledged by
+                # the same checkpoint move. Events are appended in lease
+                # creation order — the target lease records ``confirm``,
+                # every other crossed lease ``implicit_confirm`` — so a
+                # lease is acknowledged if and only if its terminating
+                # event is present.
                 if record is None:
                     record = CleanupCheckpoint(
                         consumer_id=consumer_id, after=lease.next_after)
@@ -5209,11 +5363,25 @@ class DeviceStore:
                 else:
                     record.after = lease.next_after
                     record.updated_at = utc_now_iso()
+                for other in self._cleanup_leases.values():
+                    if other.consumer_id != consumer_id \
+                            or other.terminal is not None:
+                        continue
+                    if current < other.next_after <= lease.next_after:
+                        if other.lease_id == lease_id:
+                            self._append_cleanup_lease_event_locked(
+                                other, CLEANUP_LEASE_EVENT_CONFIRM)
+                        else:
+                            self._append_cleanup_lease_event_locked(
+                                other,
+                                CLEANUP_LEASE_EVENT_IMPLICIT_CONFIRM)
                 lease.terminal = "confirm"
             else:
                 # A release moves no checkpoint; the marker alone unblocks
                 # a later claim by this consumer.
                 lease.terminal = "release"
+                self._append_cleanup_lease_event_locked(
+                    lease, CLEANUP_LEASE_EVENT_RELEASE)
             # One persistence notification for the resolution (and, for a
             # confirmation, the checkpoint advance): they commit or roll
             # back together with the rest of the state.
@@ -5322,6 +5490,11 @@ class DeviceStore:
                 .isoformat(timespec="microseconds")
             lease.renewals.append(CleanupLeaseRenewal(
                 renewal_id=renewal_id, expires=expires))
+            # A first renewal records exactly one lifecycle event; a
+            # replay (the loop above) or a rejected renewal records
+            # nothing.
+            self._append_cleanup_lease_event_locked(
+                lease, CLEANUP_LEASE_EVENT_RENEW)
             # One persistence notification for the renewal: it commits
             # (or rolls back) together with the rest of the state.
             self._notify_change()
@@ -6853,6 +7026,12 @@ class DeviceStore:
                     "expires": renewal.expires,
                 } for renewal in record.renewals],
             } for record in self._cleanup_leases.values()]
+            cleanup_lease_events = [{
+                "seq": event.seq,
+                "lease_id": event.lease_id,
+                "consumer_id": event.consumer_id,
+                "type": event.type,
+            } for event in self._cleanup_lease_events]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -6875,7 +7054,8 @@ class DeviceStore:
                         "event_gc_batch_cleanup_requests":
                             event_gc_batch_cleanup_requests,
                         "cleanup_checkpoints": cleanup_checkpoints,
-                        "cleanup_leases": cleanup_leases}
+                        "cleanup_leases": cleanup_leases,
+                        "cleanup_lease_events": cleanup_lease_events}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -7061,6 +7241,7 @@ class DeviceStore:
             "event_gc_batch_cleanup_requests", [])
         raw_cleanup_checkpoints = state.get("cleanup_checkpoints", [])
         raw_cleanup_leases = state.get("cleanup_leases", [])
+        raw_cleanup_lease_events = state.get("cleanup_lease_events", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -7083,7 +7264,8 @@ class DeviceStore:
                 and isinstance(
                     raw_event_gc_batch_cleanup_requests, list)
                 and isinstance(raw_cleanup_checkpoints, list)
-                and isinstance(raw_cleanup_leases, list)):
+                and isinstance(raw_cleanup_leases, list)
+                and isinstance(raw_cleanup_lease_events, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -9008,6 +9190,105 @@ class DeviceStore:
                 limit=l_limit, expires=l_expires, terminal=l_terminal,
                 renewals=l_renewals)
 
+        # Batch-cleanup audit lease lifecycle event stream, serialized
+        # right after cleanup_leases. Older version-1 files predate the
+        # section: it is absent and treated as empty (leases that
+        # predate the stream simply carry no events and stay
+        # compatible). A present section holds the append-only stream in
+        # global commit order; every item carries exactly seq/
+        # lease_id/consumer_id/type in that order, seq runs consecutively
+        # from 1 across the whole stream, both ids are non-empty strings,
+        # lease_id references a committed cleanup lease and consumer_id
+        # equals that lease's owner, and type is one of claim/renew/
+        # confirm/release/implicit_confirm. Per lease the present events
+        # keep the lifecycle shape: an optional leading claim (at most
+        # one), then renew events (no more than the stored renewals),
+        # then at most one terminal event, whose type agrees with the
+        # lease's terminal marker (confirm/release name a marked lease;
+        # implicit_confirm names an unmarked one). Any contradiction
+        # refuses startup rather than silently dropping the history.
+        cleanup_lease_events: List[CleanupLeaseEvent] = []
+        events_by_lease: Dict[str, List[CleanupLeaseEvent]] = {}
+        for index, raw in enumerate(raw_cleanup_lease_events):
+            where = f"cleanup_lease_events[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["seq", "lease_id", "consumer_id", "type"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'seq', "
+                    f"'lease_id', 'consumer_id', 'type' in order")
+            ev_seq = raw["seq"]
+            ev_lease_id = raw["lease_id"]
+            ev_consumer_id = raw["consumer_id"]
+            ev_type = raw["type"]
+            if not isinstance(ev_seq, int) or isinstance(ev_seq, bool) \
+                    or ev_seq < 1:
+                raise ValueError(
+                    f"{where}.seq must be a positive integer")
+            if ev_seq != index + 1:
+                raise ValueError(
+                    "cleanup_lease_events seq must run consecutively "
+                    "from 1")
+            if not (isinstance(ev_lease_id, str) and ev_lease_id):
+                raise ValueError(
+                    f"{where}.lease_id must be a non-empty string")
+            if not (isinstance(ev_consumer_id, str) and ev_consumer_id):
+                raise ValueError(
+                    f"{where}.consumer_id must be a non-empty string")
+            if ev_type not in CLEANUP_LEASE_EVENT_TYPES:
+                raise ValueError(
+                    f"{where}.type must be one of "
+                    f"{sorted(CLEANUP_LEASE_EVENT_TYPES)}")
+            ev_lease = cleanup_leases.get(ev_lease_id)
+            if ev_lease is None:
+                raise ValueError(
+                    f"{where} references an unknown cleanup lease: "
+                    f"{ev_lease_id}")
+            if ev_consumer_id != ev_lease.consumer_id:
+                raise ValueError(
+                    f"{where}.consumer_id does not match the lease's "
+                    f"owner: {ev_lease_id}")
+            event = CleanupLeaseEvent(
+                seq=ev_seq, lease_id=ev_lease_id,
+                consumer_id=ev_consumer_id, type=ev_type)
+            cleanup_lease_events.append(event)
+            events_by_lease.setdefault(ev_lease_id, []).append(event)
+        # The present stream only needs the spec-mandated consistency:
+        # legal types, real lease references whose owner matches, and a
+        # terminating event that agrees with the lease's terminal marker.
+        # Leases written before the section have no events and may still
+        # enter the stream later (e.g. a renewal after an upgrade), so a
+        # per-lease chain is not required to start with a claim or to
+        # recount renewals; only a genuine contradiction refuses startup.
+        terminal_types = (CLEANUP_LEASE_EVENT_CONFIRM,
+                          CLEANUP_LEASE_EVENT_RELEASE,
+                          CLEANUP_LEASE_EVENT_IMPLICIT_CONFIRM)
+        for ev_lease_id, chain in events_by_lease.items():
+            where_lease = f"cleanup lease {ev_lease_id}"
+            lease = cleanup_leases[ev_lease_id]
+            terminal_events = [event for event in chain
+                               if event.type in terminal_types]
+            if len(terminal_events) > 1:
+                raise ValueError(
+                    f"{where_lease} has more than one terminating event")
+            terminal_seen = terminal_events[0].type if terminal_events \
+                else None
+            if terminal_seen == CLEANUP_LEASE_EVENT_CONFIRM \
+                    and lease.terminal != "confirm":
+                raise ValueError(
+                    f"{where_lease} has a confirm event but the lease "
+                    f"is not marked confirm")
+            if terminal_seen == CLEANUP_LEASE_EVENT_RELEASE \
+                    and lease.terminal != "release":
+                raise ValueError(
+                    f"{where_lease} has a release event but the lease "
+                    f"is not marked release")
+            if terminal_seen == CLEANUP_LEASE_EVENT_IMPLICIT_CONFIRM \
+                    and lease.terminal is not None:
+                raise ValueError(
+                    f"{where_lease} has an implicit_confirm event but "
+                    f"the lease is already explicitly terminal")
+
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
         # job without any event is simply older than the section and stays
@@ -9541,6 +9822,7 @@ class DeviceStore:
                 event_gc_batch_cleanup_requests
             self._cleanup_checkpoints = cleanup_checkpoints
             self._cleanup_leases = cleanup_leases
+            self._cleanup_lease_events = cleanup_lease_events
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor

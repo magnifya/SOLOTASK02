@@ -638,7 +638,11 @@ class ClaimRestoreValidationTest(unittest.TestCase):
 
     def test_legacy_document_without_section_loads(self) -> None:
         def mutate(document):
+            # A file predating the cleanup lease feature carries
+            # neither the leases section nor the later lease-event
+            # stream; both missing sections load as empty.
             document.pop("cleanup_leases")
+            document.pop("cleanup_lease_events")
         path = self._document_with_lease(mutate)
         service = DeviceService()
         attach_persistence(service, path)  # must not raise
