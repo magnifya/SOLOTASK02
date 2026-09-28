@@ -23,6 +23,7 @@ from .models import (
     CleanupCheckpoint,
     CleanupLease,
     CleanupLeaseEvent,
+    CleanupLeaseEventCursor,
     CleanupLeaseRenewal,
     Device,
     EventGcBatchCleanupRequest,
@@ -334,6 +335,12 @@ CLEANUP_LEASE_STATE_CONFLICT = "cleanup_lease_state_conflict"
 #: offset, or ten renewals already exist (409/lease_id at the service
 #: layer).
 CLEANUP_LEASE_RENEW_CONFLICT = "cleanup_lease_renew_conflict"
+#: A cleanup-lease event-stream subscribe-and-pull named an ``expected``
+#: that conflicts with the subscriber's cursor: a new subscriber_id may
+#: only start at 0, an existing one must name its stored cursor exactly
+#: (409/expected at the service layer).
+CLEANUP_LEASE_EVENT_EXPECTED_CONFLICT = \
+    "cleanup_lease_event_expected_conflict"
 
 #: Lifetime of one batch-cleanup audit claim lease, in seconds. A
 #: non-empty claim reserves the page for 30 seconds: the lease is
@@ -801,6 +808,7 @@ INTEGRITY_SECTION_KEYS = (
     "cleanup_checkpoints",
     "cleanup_leases",
     "cleanup_lease_events",
+    "lease_event_cursors",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -813,7 +821,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 25 canonical
+    """Project a store snapshot/document payload onto the 26 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -952,6 +960,17 @@ class DeviceStore:
         # events are appended inside the same locked transaction as the
         # mutation they record and persist/roll back together with it.
         self._cleanup_lease_events: List[CleanupLeaseEvent] = []
+        # Per-subscriber read cursors on the global cleanup-lease
+        # lifecycle event stream above, keyed by the client-chosen
+        # subscriber_id (independent per subscriber, unlike the leases
+        # themselves) in creation order; created lazily on a new
+        # subscriber's first non-empty page (an empty page for a
+        # subscriber that never pulled creates nothing). Each committed
+        # create/advance happens inside the same locked transaction as
+        # every other mutation, so the cursors persist and roll back
+        # together with the rest of the state.
+        self._cleanup_lease_event_cursors: \
+            Dict[str, CleanupLeaseEventCursor] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -5487,6 +5506,81 @@ class DeviceStore:
                                 for event in matched),
             }
 
+    def cleanup_lease_events_consume(
+            self, subscriber_id: str, expected: int,
+            limit: int) -> Tuple[Dict[str, Any], bool]:
+        """Subscribe to, and atomically pull, the cleanup-lease event stream.
+
+        ``POST /v1/event-gc-batch/lease-events/consume``. Under the one
+        store lock (shared with the claims, lease
+        confirmations/releases/renewals, checkpoint advances and batch
+        cleanup commits that append the events), *expected* is compared
+        against the subscriber's stored cursor: a new *subscriber_id*
+        may only start at 0 — any other *expected* raises
+        :class:`RedeliveryJobError`
+        ``cleanup_lease_event_expected_conflict`` (409/expected at the
+        service layer) — and an existing subscriber must name its stored
+        cursor exactly, so concurrent pulls with the same *expected*
+        linearize to at most one advance.
+
+        On a match the page is the global stream's events with
+        ``seq`` past the cursor, in seq order, at most *limit* of them,
+        and the cursor advances to the page's last event ``seq``. A
+        non-empty page — the first one of a new subscriber included —
+        creates/advances the cursor and persists through the change
+        hook, so a data-file failure rolls the cursor back; an empty
+        page writes nothing: a new subscriber is not created and an
+        existing one keeps its cursor. On success the body keys are
+        ``subscriber_id``, ``events`` (each ``seq``, ``lease_id``,
+        ``consumer_id`` and ``type`` in that order), ``next_after`` and
+        ``has_more`` in that order; an empty page echoes
+        ``next_after=expected``, otherwise it is the last event's
+        ``seq``, and ``has_more`` says whether a later event follows.
+        Returns ``(view, advanced)`` with *advanced* true for a created
+        or advanced subscriber.
+        """
+        with self._lock:
+            record = self._cleanup_lease_event_cursors.get(subscriber_id)
+            current = record.after if record is not None else 0
+            # A brand new subscriber may only start at the head of the
+            # stream; an existing one must name its stored cursor.
+            if expected != current:
+                raise RedeliveryJobError(
+                    CLEANUP_LEASE_EVENT_EXPECTED_CONFLICT)
+            # The stream is global with seq consecutive from 1, so the
+            # cursor (a seq value) doubles as the list offset.
+            page = self._cleanup_lease_events[current:current + limit]
+            if not page:
+                # Empty page: no cursor is created for a new subscriber
+                # and an existing cursor stays untouched; nothing is
+                # written and no commit generation is consumed.
+                return ({
+                    "subscriber_id": subscriber_id,
+                    "events": [],
+                    "next_after": current,
+                    "has_more": current < len(self._cleanup_lease_events),
+                }, False)
+            next_after = page[-1].seq
+            if record is None:
+                record = CleanupLeaseEventCursor(
+                    subscriber_id=subscriber_id, after=next_after)
+                self._cleanup_lease_event_cursors[subscriber_id] = record
+            else:
+                record.after = next_after
+            self._notify_change()
+            return ({
+                "subscriber_id": subscriber_id,
+                "events": [{
+                    "seq": event.seq,
+                    "lease_id": event.lease_id,
+                    "consumer_id": event.consumer_id,
+                    "type": event.type,
+                } for event in page],
+                "next_after": next_after,
+                "has_more":
+                    next_after < len(self._cleanup_lease_events),
+            }, True)
+
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
         """The wire view of one redelivery-job detail, keys in response order.
@@ -7018,6 +7112,10 @@ class DeviceStore:
                 "consumer_id": event.consumer_id,
                 "type": event.type,
             } for event in self._cleanup_lease_events]
+            lease_event_cursors = [{
+                "subscriber_id": record.subscriber_id,
+                "after": record.after,
+            } for record in self._cleanup_lease_event_cursors.values()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -7041,7 +7139,8 @@ class DeviceStore:
                             event_gc_batch_cleanup_requests,
                         "cleanup_checkpoints": cleanup_checkpoints,
                         "cleanup_leases": cleanup_leases,
-                        "cleanup_lease_events": cleanup_lease_events}
+                        "cleanup_lease_events": cleanup_lease_events,
+                        "lease_event_cursors": lease_event_cursors}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -7228,6 +7327,7 @@ class DeviceStore:
         raw_cleanup_checkpoints = state.get("cleanup_checkpoints", [])
         raw_cleanup_leases = state.get("cleanup_leases", [])
         raw_cleanup_lease_events = state.get("cleanup_lease_events", [])
+        raw_lease_event_cursors = state.get("lease_event_cursors", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -7251,7 +7351,8 @@ class DeviceStore:
                     raw_event_gc_batch_cleanup_requests, list)
                 and isinstance(raw_cleanup_checkpoints, list)
                 and isinstance(raw_cleanup_leases, list)
-                and isinstance(raw_cleanup_lease_events, list)):
+                and isinstance(raw_cleanup_lease_events, list)
+                and isinstance(raw_lease_event_cursors, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -9325,6 +9426,45 @@ class DeviceStore:
                         f"{where} ends without the lease's "
                         f"implicit_confirm event")
 
+        # Per-subscriber read cursors on the global cleanup-lease event
+        # stream, serialized right after cleanup_lease_events. Older
+        # version-1 files predate the section: it is absent and treated
+        # as empty. A present section holds one item per subscriber in
+        # creation order, each with exactly subscriber_id/after in that
+        # order: subscriber_id is a non-empty string and after is 0 or
+        # the seq of an event that still exists (the stream is
+        # consecutive from 1, so after is in 0..len(events)). A
+        # duplicated subscriber, a field/type/key-order error or a
+        # cursor that points past the stream refuses startup rather
+        # than silently dropping or clamping the record.
+        lease_event_cursors: Dict[str, CleanupLeaseEventCursor] = {}
+        for index, raw in enumerate(raw_lease_event_cursors):
+            where = f"lease_event_cursors[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["subscriber_id", "after"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'subscriber_id' "
+                    f"and 'after' in that order")
+            lec_subscriber_id = raw["subscriber_id"]
+            lec_after = raw["after"]
+            if not (isinstance(lec_subscriber_id, str)
+                    and lec_subscriber_id):
+                raise ValueError(
+                    f"{where}.subscriber_id must be a non-empty string")
+            if not isinstance(lec_after, int) \
+                    or isinstance(lec_after, bool) \
+                    or not 0 <= lec_after <= len(cleanup_lease_events):
+                raise ValueError(
+                    f"{where}.after must be 0 or the seq of an existing "
+                    f"cleanup lease event")
+            if lec_subscriber_id in lease_event_cursors:
+                raise ValueError(
+                    f"duplicate lease event cursor subscriber in state: "
+                    f"{lec_subscriber_id}")
+            lease_event_cursors[lec_subscriber_id] = CleanupLeaseEventCursor(
+                subscriber_id=lec_subscriber_id, after=lec_after)
+
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
         # job without any event is simply older than the section and stays
@@ -9859,6 +9999,7 @@ class DeviceStore:
             self._cleanup_checkpoints = cleanup_checkpoints
             self._cleanup_leases = cleanup_leases
             self._cleanup_lease_events = cleanup_lease_events
+            self._cleanup_lease_event_cursors = lease_event_cursors
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor

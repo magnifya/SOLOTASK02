@@ -544,6 +544,27 @@ class CleanupLeaseEvent:
 
 
 @dataclass
+class CleanupLeaseEventCursor:
+    """One subscriber's read cursor on the global cleanup-lease event stream.
+
+    ``POST /v1/event-gc-batch/lease-events/consume`` lets a named
+    subscriber atomically pull one page of the global
+    ``cleanup_lease_events`` chain and advance a personal cursor: a new
+    ``subscriber_id`` is created only with ``expected == 0`` (a later
+    starting point is a conflict), an existing one must name its stored
+    cursor exactly. The cursor always points at the last returned
+    event's ``seq`` (0 for a subscriber that never pulled a non-empty
+    page), and unlike the audit consume endpoint an existing
+    subscriber's empty page creates nothing new and writes nothing — so
+    only the first non-empty page (or an advance for a subscriber that
+    exists) commits.
+    """
+
+    subscriber_id: str
+    after: int = 0
+
+
+@dataclass
 class MessageDelivery:
     """Reliable-delivery state for one stored message of a session.
 

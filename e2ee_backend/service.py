@@ -37,6 +37,7 @@ from .storage import (
     CLEANUP_CHECKPOINT_EXPECTED_CONFLICT,
     CLEANUP_LEASE_CONSUMER_BUSY,
     CLEANUP_LEASE_CONSUMER_MISMATCH,
+    CLEANUP_LEASE_EVENT_EXPECTED_CONFLICT,
     CLEANUP_LEASE_ID_CONFLICT,
     CLEANUP_LEASE_NOT_FOUND,
     CLEANUP_LEASE_RENEW_CONFLICT,
@@ -2883,6 +2884,84 @@ class DeviceService:
                 "field must be an integer in 1..100: limit", "limit")
         return self.store.cleanup_lease_events_page(
             consumer_id, lease_id, after, limit)
+
+    def event_gc_batch_lease_events_consume(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Atomically subscribe to and pull one page of the lease event stream.
+
+        ``POST /v1/event-gc-batch/lease-events/consume``. The call takes
+        no query parameters (the HTTP layer rejects any with
+        400/field ``query``) and the body must be a JSON object carrying
+        exactly ``subscriber_id``, ``expected`` and ``limit``; a
+        bad/non-object body is 400/field ``request_body``, a missing,
+        wrongly typed or extra field is 400 with that field (the first
+        extra key, in payload order). ``subscriber_id`` must be a
+        non-empty string, ``expected`` a non-boolean integer in
+        0..2^63-1 and ``limit`` a non-boolean integer in 1..100.
+
+        Under the one store lock the ``expected`` value is compared
+        against the subscriber's stored cursor: a brand new
+        ``subscriber_id`` must start at 0 (a non-zero ``expected`` is
+        409/field ``expected``) and an existing subscriber must name its
+        stored cursor exactly, so concurrent pulls with the same
+        ``expected`` linearize to at most one advance. On a match the
+        page is the global lease lifecycle event stream (one chain,
+        ``seq`` consecutive from 1) past the cursor in seq order, at
+        most ``limit`` events, and the cursor advances to the page's
+        last event seq. A non-empty page answers 201 whether the
+        subscriber was just created or advanced; an existing
+        subscriber's empty page answers 200 and writes nothing (a new
+        subscriber is never created on an empty page). On success the
+        body keys are ``subscriber_id``, ``events``, ``next_after`` and
+        ``has_more`` in that order; each event keeps the
+        ``seq``/``lease_id``/``consumer_id``/``type`` key order; an
+        empty page echoes ``next_after=expected``, otherwise it is the
+        last event's seq, and ``has_more`` says whether a later event
+        follows. A data-file failure on the create/advance is
+        503/field ``data_file`` with the in-memory state, both files and
+        the commit generation rolled back.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly subscriber_id, expected and limit;
+        # any other key is 400 with that field (the first extra key, in
+        # payload order).
+        extras = [key for key in payload
+                  if key not in ("subscriber_id", "expected", "limit")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("subscriber_id", "expected", "limit"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["subscriber_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: subscriber_id",
+                "subscriber_id")
+        expected = payload["expected"]
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(expected, int) or isinstance(expected, bool) \
+                or not 0 <= expected <= 2**63 - 1:
+            raise ServiceError(
+                "field must be an integer in 0..2^63-1: expected",
+                "expected")
+        limit = payload["limit"]
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            view, advanced = self.store.cleanup_lease_events_consume(
+                payload["subscriber_id"], expected, limit)
+        except RedeliveryJobError as error:
+            if error.reason == CLEANUP_LEASE_EVENT_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the subscriber's current "
+                    "cursor (a new subscriber must start at 0)",
+                    "expected", status_code=409)
+            raise
+        return view, 201 if advanced else 200
 
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:
