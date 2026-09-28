@@ -25,6 +25,7 @@ _EVENT_GC_BATCH_LEASES_PATH = "/v1/event-gc-batch/leases"
 _EVENT_GC_BATCH_LEASE_EVENTS_PATH = "/v1/event-gc-batch/lease-events"
 _EVENT_GC_BATCH_LEASE_EVENTS_CONSUME_PATH = \
     _EVENT_GC_BATCH_LEASE_EVENTS_PATH + "/consume"
+_LEASE_SUBS_PATH = "/v1/lease-subs"
 _EVENT_GC_BATCH_CONSUME_PATH = "/v1/event-gc-batch/consume"
 _EVENT_GC_BATCH_CLAIM_PATH = "/v1/event-gc-batch/claim"
 _EVENT_GC_BATCH_LEASE_PATH = "/v1/event-gc-batch/lease"
@@ -134,6 +135,11 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_event_gc_batch_consume()
         elif path == _EVENT_GC_BATCH_LEASE_EVENTS_CONSUME_PATH:
             self._handle_event_gc_batch_lease_event_consume()
+        elif path == _LEASE_SUBS_PATH:
+            self._handle_lease_subscribe()
+        elif path.startswith(_LEASE_SUBS_PATH + "/") \
+                and path.endswith("/ack"):
+            self._route_lease_subscription_ack(path)
         elif path == _EVENT_GC_BATCH_CLAIM_PATH:
             self._handle_event_gc_batch_claim()
         elif path == _EVENT_GC_BATCH_LEASE_RENEW_PATH:
@@ -434,6 +440,28 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_event_gc_batch_leases()
         elif path == _EVENT_GC_BATCH_LEASE_EVENTS_PATH:
             self._handle_event_gc_batch_lease_events()
+        elif path.startswith(_LEASE_SUBS_PATH + "/"):
+            suffix = path[len(_LEASE_SUBS_PATH) + 1:]
+            # lease-subs/{subscriber_id} — routing splits on raw slashes
+            # only; a percent-encoded slash inside the id segment is
+            # part of it and decodes to an ordinary '/'. A deeper path
+            # (more than one segment) is 404/subscriber_id; the single
+            # segment must be non-empty and strictly percent-decodable
+            # as UTF-8: an empty segment, bad escape or invalid UTF-8 is
+            # 400/subscriber_id.
+            if "/" in suffix:
+                self._send_json(404, {"message": "subscription not found",
+                                      "field": "subscriber_id"})
+                return
+            subscriber_id = _strict_percent_decode(suffix)
+            if not subscriber_id:
+                self._send_json(400, {
+                    "message": "subscriber_id must be a non-empty "
+                               "segment with a well-formed percent "
+                               "escape and valid UTF-8 encoding",
+                    "field": "subscriber_id"})
+                return
+            self._handle_lease_subscription_get(subscriber_id)
         elif path.startswith(_EVENT_GC_BATCH_LEASES_PATH + "/"):
             suffix = path[len(_EVENT_GC_BATCH_LEASES_PATH) + 1:]
             # leases/{lease_id} — routing splits on raw slashes only; a
@@ -1462,6 +1490,106 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(status_code, body)
+
+    def _handle_lease_subscribe(self) -> None:
+        # Creating a filter-bound lease-event subscription takes no
+        # query parameters: any one is a 400 (field query), checked
+        # before the body like the sibling consume routes.
+        # keep_blank_values so a bare ``?foo`` flag is an actual
+        # (unknown) parameter, while a trailing ``?`` is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.lease_subscribe(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _route_lease_subscription_ack(self, path: str) -> None:
+        suffix = path[len(_LEASE_SUBS_PATH) + 1:-len("/ack")]
+        # lease-subs/{subscriber_id}/ack — split on raw slashes only;
+        # a percent-encoded slash inside the id segment is part of it.
+        # A deeper path or empty id is 404/subscriber_id; a bad percent
+        # escape or invalid UTF-8 is 400/subscriber_id.
+        if not suffix or "/" in suffix:
+            self._send_json(404, {"message": "subscription not found",
+                                  "field": "subscriber_id"})
+            return
+        subscriber_id = _strict_percent_decode(suffix)
+        if subscriber_id is None:
+            self._send_json(400, {
+                "message": "subscriber_id has a malformed percent "
+                           "escape or is not valid UTF-8",
+                "field": "subscriber_id"})
+            return
+        self._handle_lease_subscription_ack(subscriber_id)
+
+    def _handle_lease_subscription_ack(self, subscriber_id: str) -> None:
+        # Advancing a filter-bound subscription takes no query
+        # parameters: any one is a 400 (field query), checked before
+        # the body like the sibling consume routes. A trailing ``?``
+        # with no parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.lease_subscription_ack(
+                subscriber_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_lease_subscription_get(self, subscriber_id: str) -> None:
+        # Reading a filter-bound subscription page takes a request body
+        # that must be empty (400/request_body when non-empty, however
+        # it is framed) and only the single-valued ``limit`` query
+        # parameter (default 100, 1..100); any other parameter is
+        # 400/query. Validation order matches the event-stream page:
+        # non-empty body, other parameters, then limit. A trailing
+        # ``?`` with no parameter at all is accepted.
+        body = self._read_framed_body()
+        if body is None:
+            return  # a 400 response was already sent
+        if body:
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if any(name != "limit" for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            view = self.service.lease_subscription_get(
+                subscriber_id, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, view)
 
     def _handle_event_gc_batch_lease_get(self, lease_id: str) -> None:
         # The single cleanup audit lease query takes no request body and

@@ -62,6 +62,10 @@ from .storage import (
     GROUP_SESSION_INITIATOR_UNKNOWN,
     GROUP_UNKNOWN,
     LEASE_EVENT_CURSOR_EXPECTED_CONFLICT,
+    LEASE_SUBSCRIPTION_AFTER_CONFLICT,
+    LEASE_SUBSCRIPTION_EXPECTED_CONFLICT,
+    LEASE_SUBSCRIPTION_FILTER_CONFLICT,
+    LEASE_SUBSCRIPTION_NOT_FOUND,
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
@@ -2900,19 +2904,22 @@ class DeviceService:
         integer in 0..2^63-1 and ``limit`` a non-boolean integer in
         1..100.
 
-        A subscriber's cursor starts at 0 and is created lazily on the
-        first non-empty page: a brand-new subscriber naming a non-zero
-        ``expected`` and an existing subscriber naming an ``expected``
-        that differs from its stored cursor (the last ``next_after``)
-        are both 409/field ``expected``. On a match the store returns,
-        under the one store lock, the global lifecycle events right
-        after the cursor in seq order (at most ``limit`` of them) and
-        advances the cursor to the last event's seq. A non-empty page
+        A subscriber's cursor starts at 0. A brand-new subscriber is
+        anchored lazily on its first call: even when the stream is still
+        empty the cursor record is created at 0 and the call answers 201,
+        so the plain cursor exists independently of the filter-bound
+        ``POST /v1/lease-subs`` subscriptions (the two never migrate).
+        Naming a non-zero ``expected`` while new, or an ``expected`` that
+        differs from an existing subscriber's stored cursor (the last
+        ``next_after``), is 409/field ``expected``. On a match the store
+        returns, under the one store lock, the global lifecycle events
+        right after the cursor in seq order (at most ``limit`` of them)
+        and advances the cursor to the last event's seq. A non-empty page
         — a newly created subscription or a forward advance — answers
-        201; an empty page answers 200, leaves the cursor untouched
+        201; a later empty page answers 200, leaves the cursor untouched
         and writes nothing. Concurrent pulls with the same
         ``expected`` linearize to at most one 201, the rest 409; a
-        data-file failure on a non-empty page is 503/field
+        data-file failure on a created/advanced record is 503/field
         ``data_file`` with the cursor, both files and the commit
         generation rolled back. On success the body keys are
         ``subscriber_id``, ``events``, ``next_after`` and ``has_more``
@@ -2959,6 +2966,165 @@ class DeviceService:
                 raise ServiceError(
                     "expected does not match the subscriber's current "
                     "cursor", "expected", status_code=409)
+            raise
+        return view, 201 if advanced else 200
+
+    def lease_subscribe(self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Create (or replay) a filter-bound lease-event subscription.
+
+        ``POST /v1/lease-subs``. No query parameters are accepted (the
+        HTTP layer rejects any with 400/field ``query``) and the body
+        must be a JSON object carrying exactly ``subscriber_id``,
+        ``consumer_id`` and ``lease_id``; a bad/non-object body is
+        400/field ``request_body``, a missing/extra field is 400 with
+        that field (the first extra key, in payload order).
+        ``subscriber_id`` must be a non-empty string and each of
+        ``consumer_id``/``lease_id`` either ``null`` or a non-empty
+        string (an empty string or another type is 400 with that
+        field). The first subscription for an id answers 201 with the
+        frozen filter and ``after`` 0; re-posting the same id with the
+        same filter is an idempotent 200 replay writing nothing, while
+        a different filter is 409/field ``subscriber_id``. Both answers
+        carry the frozen creation view with ``after`` 0 (a replay echoes
+        the first response even after an ack advanced the live cursor).
+        These subscriptions are independent of the plain
+        ``lease_event_cursors`` and never migrate either way. The
+        response keys are ``subscriber_id``, ``consumer_id``,
+        ``lease_id`` and ``after`` in that order.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        extras = [key for key in payload
+                  if key not in ("subscriber_id", "consumer_id",
+                                 "lease_id")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("subscriber_id", "consumer_id", "lease_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        subscriber_id = payload["subscriber_id"]
+        if not is_nonempty_string(subscriber_id):
+            raise ServiceError(
+                "field must be a non-empty string: subscriber_id",
+                "subscriber_id")
+
+        def nullable_string(name: str) -> Optional[str]:
+            value = payload[name]
+            if value is None:
+                return None
+            if not is_nonempty_string(value):
+                raise ServiceError(
+                    "field must be null or a non-empty string: " + name,
+                    name)
+            return value
+
+        consumer_id = nullable_string("consumer_id")
+        lease_id = nullable_string("lease_id")
+        try:
+            view, created = self.store.lease_subscription_create(
+                subscriber_id, consumer_id, lease_id)
+        except RedeliveryJobError as error:
+            if error.reason == LEASE_SUBSCRIPTION_FILTER_CONFLICT:
+                raise ServiceError(
+                    "subscriber_id already exists with a different "
+                    "filter", "subscriber_id", status_code=409)
+            raise
+        return view, 201 if created else 200
+
+    def lease_subscription_get(
+            self, subscriber_id: str, limit: int) -> Dict[str, Any]:
+        """Page one filter-bound subscription's events without advancing.
+
+        ``GET /v1/lease-subs/{subscriber_id}``. The HTTP layer accepts
+        only the single-valued query parameter ``limit`` (default 100,
+        1..100 strict decimal; any other parameter is 400/field
+        ``query``); the path id is already strictly percent-decoded as
+        UTF-8. An unknown subscriber answers 404/field
+        ``subscriber_id``. Under the one store lock the global lease
+        lifecycle events right after the subscription's frozen cursor
+        that match its ``consumer_id``/``lease_id`` filter are paged in
+        seq order, at most *limit*; the read is purely read-only and
+        never advances ``after``. The body keys are ``subscriber_id``,
+        ``events``, ``next_after`` and ``has_more``; an empty page
+        echoes ``next_after`` as the stored cursor and each event keeps
+        the four-key event view.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            return self.store.lease_subscription_page(
+                subscriber_id, limit)
+        except RedeliveryJobError as error:
+            if error.reason == LEASE_SUBSCRIPTION_NOT_FOUND:
+                raise ServiceError(
+                    f"subscription not found: {subscriber_id}",
+                    "subscriber_id", status_code=404)
+            raise
+
+    def lease_subscription_ack(
+            self, subscriber_id: str,
+            payload: object) -> Tuple[Dict[str, Any], int]:
+        """Advance one filter-bound lease-event subscription's cursor.
+
+        ``POST /v1/lease-subs/{subscriber_id}/ack``. No query parameters
+        are accepted (400/field ``query``) and the body must be a JSON
+        object carrying exactly the non-boolean non-negative integers
+        ``expected`` and ``after``; a bad/non-object body is
+        400/``request_body`` and a missing/extra/wrongly-typed field is
+        400 with that field. An unknown subscriber answers
+        404/field ``subscriber_id`` and is never created; an
+        ``expected`` differing from the stored cursor is 409/field
+        ``expected``; an ``after`` that moves backwards, names a seq
+        past the stream, or names an event that does not match the
+        subscription's frozen filter is 409/field ``after``. Equality
+        writes nothing (200); a strict forward advance to a matching
+        event's seq answers 201. The body keys are ``subscriber_id``
+        and ``after`` in that order.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        extras = [key for key in payload
+                  if key not in ("expected", "after")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("expected", "after"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+
+        def nonneg_int(name: str) -> int:
+            value = payload[name]
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or not 0 <= value <= 2**63 - 1:
+                raise ServiceError(
+                    "field must be an integer in 0..2^63-1: " + name,
+                    name)
+            return value
+
+        expected = nonneg_int("expected")
+        after = nonneg_int("after")
+        try:
+            view, advanced = self.store.lease_subscription_ack(
+                subscriber_id, expected, after)
+        except RedeliveryJobError as error:
+            if error.reason == LEASE_SUBSCRIPTION_NOT_FOUND:
+                raise ServiceError(
+                    f"subscription not found: {subscriber_id}",
+                    "subscriber_id", status_code=404)
+            if error.reason == LEASE_SUBSCRIPTION_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the subscription's current "
+                    "cursor", "expected", status_code=409)
+            if error.reason == LEASE_SUBSCRIPTION_AFTER_CONFLICT:
+                raise ServiceError(
+                    "after must move forward to the seq of an event "
+                    "matching the subscription's filter", "after",
+                    status_code=409)
             raise
         return view, 201 if advanced else 200
 

@@ -547,11 +547,13 @@ class CleanupLeaseEvent:
 class LeaseEventCursor:
     """One subscriber's read cursor on the cleanup-lease event stream.
 
-    Created lazily by ``POST
-    /v1/event-gc-batch/lease-events/consume`` the first time a named
-    subscriber actually receives (and advances past) an event; a
-    subscriber whose first calls only ever see an empty page has no
-    record and keeps sending ``expected`` 0. ``after`` is the global
+    Created by ``POST
+    /v1/event-gc-batch/lease-events/consume`` on the subscriber's first
+    call even when the stream is still empty: that empty first read
+    persists a record at ``after`` 0 and answers 201, so the subscriber
+    is anchored independently of the filtered :class:`LeaseSubscription`
+    cursors (the two sections never migrate into each other). Later
+    empty pages answer 200 without writing. ``after`` is the global
     ``seq`` of the last event delivered to that subscriber (0 for a
     record that has never advanced) and only ever equals 0 or the seq
     of an event that exists in :class:`CleanupLeaseEvent` stream — the
@@ -562,6 +564,30 @@ class LeaseEventCursor:
     """
 
     subscriber_id: str
+    after: int = 0
+
+
+@dataclass
+class LeaseSubscription:
+    """One subscriber's filter-bound cursor on the lease-event stream.
+
+    Created by ``POST /v1/lease-subs`` and read via ``GET
+    /v1/lease-subs/{subscriber_id}``; ``POST .../ack`` advances it. The
+    filter (``consumer_id``/``lease_id``, each either ``None`` or a
+    non-empty string) is frozen at creation: re-subscribing under the
+    same filter is an idempotent replay, a different filter on the same
+    ``subscriber_id`` conflicts. Reads page only the lifecycle events
+    matching that filter and never advance ``after``; an ack may only
+    move ``after`` forward to the seq of an event matching the frozen
+    filter (0 is the never-advanced anchor). These subscriptions are a
+    section independent of :class:`LeaseEventCursor`: neither is ever
+    migrated from or into the other, and a subscription's pages never
+    touch the plain consume cursor.
+    """
+
+    subscriber_id: str
+    consumer_id: Optional[str] = None
+    lease_id: Optional[str] = None
     after: int = 0
 
 
