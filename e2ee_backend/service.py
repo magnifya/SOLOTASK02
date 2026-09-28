@@ -62,6 +62,10 @@ from .storage import (
     GROUP_SESSION_INITIATOR_UNKNOWN,
     GROUP_UNKNOWN,
     LEASE_EVENT_CURSOR_EXPECTED_CONFLICT,
+    LEASE_SUBSCRIPTION_AFTER_CONFLICT,
+    LEASE_SUBSCRIPTION_EXPECTED_CONFLICT,
+    LEASE_SUBSCRIPTION_FILTER_CONFLICT,
+    LEASE_SUBSCRIPTION_NOT_FOUND,
     MESSAGE_BAD_SEQUENCE,
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
@@ -2900,26 +2904,28 @@ class DeviceService:
         integer in 0..2^63-1 and ``limit`` a non-boolean integer in
         1..100.
 
-        A subscriber's cursor starts at 0 and is created lazily on the
-        first non-empty page: a brand-new subscriber naming a non-zero
-        ``expected`` and an existing subscriber naming an ``expected``
-        that differs from its stored cursor (the last ``next_after``)
-        are both 409/field ``expected``. On a match the store returns,
-        under the one store lock, the global lifecycle events right
-        after the cursor in seq order (at most ``limit`` of them) and
-        advances the cursor to the last event's seq. A non-empty page
-        — a newly created subscription or a forward advance — answers
-        201; an empty page answers 200, leaves the cursor untouched
-        and writes nothing. Concurrent pulls with the same
-        ``expected`` linearize to at most one 201, the rest 409; a
-        data-file failure on a non-empty page is 503/field
-        ``data_file`` with the cursor, both files and the commit
-        generation rolled back. On success the body keys are
-        ``subscriber_id``, ``events``, ``next_after`` and ``has_more``
-        in that order; each event keeps the existing four-key event
-        view (``seq``, ``lease_id``, ``consumer_id``, ``type``), an
-        empty page echoes ``next_after=expected`` and ``has_more``
-        says whether a later event follows.
+        A subscriber's cursor starts at 0; a brand-new subscriber
+        naming a non-zero ``expected`` and an existing subscriber
+        naming an ``expected`` that differs from its stored cursor
+        (the last ``next_after``) are both 409/field ``expected``. On a
+        match the store returns, under the one store lock, the global
+        lifecycle events right after the cursor in seq order (at most
+        ``limit`` of them) and advances the cursor to the last event's
+        seq. A brand-new subscriber reading an empty stream (expected
+        0) still registers a cursor record at after 0 and answers
+        ``201``; any later empty page answers 200, leaves the cursor
+        untouched and writes nothing. A non-empty page — a newly
+        created subscription or a forward advance — also answers 201.
+        Concurrent pulls with the same ``expected`` linearize to at
+        most one 201, the rest 409; a data-file failure on a created
+        or advanced cursor is 503/field ``data_file`` with the cursor,
+        both files and the commit generation rolled back. On success
+        the body keys are ``subscriber_id``, ``events``,
+        ``next_after`` and ``has_more`` in that order; each event keeps
+        the existing four-key event view (``seq``, ``lease_id``,
+        ``consumer_id``, ``type``), an empty page echoes
+        ``next_after=expected`` and ``has_more`` says whether a later
+        event follows.
         """
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object",
@@ -2961,6 +2967,180 @@ class DeviceService:
                     "cursor", "expected", status_code=409)
             raise
         return view, 201 if advanced else 200
+
+    def lease_subscription_register(
+            self, payload: object) -> Tuple[Dict[str, Any], int]:
+        """Register one named binding on the cleanup-lease event stream.
+
+        ``POST /v1/lease-subs``. The call takes no query parameters
+        (the HTTP layer rejects any with 400/field ``query``) and the
+        body must be a JSON object carrying exactly
+        ``subscriber_id``, ``consumer_id`` and ``lease_id``; a
+        bad/non-object body is 400/field ``request_body``, a missing,
+        wrongly typed or extra field is 400 with that field (the first
+        extra key, in payload order). ``subscriber_id`` must be a
+        non-empty string; ``consumer_id`` and ``lease_id`` must each
+        be a non-empty string or ``null`` (a null filter matches
+        every value).
+
+        A first registration answers 201 with the binding at position
+        0. Re-registering the same id with the identical filters is
+        an idempotent replay (200, the frozen first-registration view
+        whose ``after`` stays 0 even if the binding later advanced via
+        an ack, nothing written); the same id with different filters
+        is 409/field ``subscriber_id``. The registration commits once
+        under the one store lock, so a data-file failure is
+        503/field ``data_file`` with the in-memory state, both files
+        and the commit generation rolled back. On success the body
+        keys are ``subscriber_id``, ``consumer_id``, ``lease_id`` and
+        ``after`` in that order; ``after`` is 0.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        extras = [key for key in payload
+                  if key not in ("subscriber_id", "consumer_id",
+                                 "lease_id")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("subscriber_id", "consumer_id", "lease_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["subscriber_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: subscriber_id",
+                "subscriber_id")
+
+        def _filter(name: str) -> Optional[str]:
+            value = payload[name]
+            if value is None:
+                return None
+            if not is_nonempty_string(value):
+                raise ServiceError(
+                    "field must be a non-empty string or null: " + name,
+                    name)
+            return value
+
+        consumer_id = _filter("consumer_id")
+        lease_id = _filter("lease_id")
+        try:
+            return self.store.lease_subscription_register(
+                payload["subscriber_id"], consumer_id, lease_id)
+        except RedeliveryJobError as error:
+            if error.reason == LEASE_SUBSCRIPTION_FILTER_CONFLICT:
+                raise ServiceError(
+                    "subscriber_id is already registered with different "
+                    "filters", "subscriber_id", status_code=409)
+            raise
+
+    def lease_subscription_page(
+            self, subscriber_id: str, limit: int) -> Dict[str, Any]:
+        """Page one named binding's filtered event stream without advancing.
+
+        ``GET /v1/lease-subs/{subscriber_id}``. The GET takes no
+        request body and only the single-valued query parameter
+        ``limit`` (the HTTP layer rejects a body with
+        400/field ``request_body`` and any other parameter with
+        400/field ``query``), defaulting to 100 and restricted to
+        1..100 (the strict decimal shape is enforced by the HTTP
+        layer). An unknown *subscriber_id* is 404/field
+        ``subscriber_id`` and the lookup never creates the binding.
+        Under the one store lock the global lifecycle event stream is
+        filtered by the binding's ``consumer_id``/``lease_id`` (a null
+        filter matches all), the page is the matching events with a
+        ``seq`` greater than the binding's stored position in seq
+        order (at most ``limit`` of them), and the stored position is
+        never advanced. On success the body keys are
+        ``subscriber_id``, ``events``, ``next_after`` and
+        ``has_more`` in that order; each event keeps the four-key
+        event view (``seq``, ``lease_id``, ``consumer_id``,
+        ``type``), an empty page echoes the stored position as
+        ``next_after`` and ``has_more`` says whether a matching event
+        follows.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            return self.store.lease_subscription_page(
+                subscriber_id, limit)
+        except RedeliveryJobError as error:
+            if error.reason == LEASE_SUBSCRIPTION_NOT_FOUND:
+                raise ServiceError(
+                    f"subscriber not found: {subscriber_id}",
+                    "subscriber_id", status_code=404)
+            raise
+
+    def lease_subscription_ack(
+            self, subscriber_id: str, payload: object) \
+            -> Tuple[Dict[str, Any], int]:
+        """Advance one named binding's position to a matching event seq.
+
+        ``POST /v1/lease-subs/{subscriber_id}/ack``. The call takes no
+        query parameters (the HTTP layer rejects any with
+        400/field ``query``) and the body must be a JSON object
+        carrying exactly ``expected`` and ``after``; a bad/non-object
+        body is 400/field ``request_body``, a missing, wrongly typed
+        or extra field is 400 with that field (the first extra key, in
+        payload order). Both values must be non-boolean non-negative
+        integers (no upper bound on the wire: a position above the
+        stream is a state conflict, not a 400).
+
+        An unknown *subscriber_id* is 404/field ``subscriber_id`` and
+        the call never creates the binding. Under the one store lock,
+        an ``expected`` differing from the binding's stored position
+        is 409/field ``expected``; an ``after`` below the stored
+        position, above the highest global event seq or at a seq
+        whose event does not match the binding's filters is
+        409/field ``after``; an equal value is an idempotent no-op
+        (200, nothing written); a strictly greater matching value
+        advances once and answers 201. The advance commits once, so a
+        data-file failure is 503/field ``data_file`` with the
+        position, both files and the commit generation rolled back.
+        On success the body keys are ``subscriber_id`` and ``after``
+        in that order.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        extras = [key for key in payload
+                  if key not in ("expected", "after")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        for name in ("expected", "after"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        expected = payload["expected"]
+        after = payload["after"]
+        # Any non-negative (non-boolean) integer is a well-formed
+        # value; an out-of-range position is a state conflict
+        # (409/expected or 409/after), not a field 400.
+        for name, value in (("expected", expected), ("after", after)):
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or value < 0:
+                raise ServiceError(
+                    "field must be a non-negative integer: " + name, name)
+        try:
+            return self.store.lease_subscription_ack(
+                subscriber_id, expected, after)
+        except RedeliveryJobError as error:
+            if error.reason == LEASE_SUBSCRIPTION_NOT_FOUND:
+                raise ServiceError(
+                    f"subscriber not found: {subscriber_id}",
+                    "subscriber_id", status_code=404)
+            if error.reason == LEASE_SUBSCRIPTION_EXPECTED_CONFLICT:
+                raise ServiceError(
+                    "expected does not match the subscriber's current "
+                    "position", "expected", status_code=409)
+            if error.reason == LEASE_SUBSCRIPTION_AFTER_CONFLICT:
+                raise ServiceError(
+                    "after moves backwards, is out of bounds or is not "
+                    "the seq of a matching event",
+                    "after", status_code=409)
+            raise
 
     def event_gc_batch_cleanup_request_get(
             self, request_id: str) -> Dict[str, Any]:

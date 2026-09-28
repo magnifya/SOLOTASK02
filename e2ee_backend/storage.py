@@ -32,6 +32,7 @@ from .models import (
     GroupSyncCursor,
     KeyEvent,
     LeaseEventCursor,
+    LeaseSubscription,
     Message,
     MessageDelivery,
     MessageLease,
@@ -341,6 +342,25 @@ CLEANUP_LEASE_RENEW_CONFLICT = "cleanup_lease_renew_conflict"
 #: subscriber must send 0, an existing one its last ``next_after`` —
 #: 409/expected at the service layer.
 LEASE_EVENT_CURSOR_EXPECTED_CONFLICT = "lease_event_cursor_expected_conflict"
+#: A lease-event subscription endpoint named an unknown
+#: ``subscriber_id`` (no binding was ever registered): 404/subscriber_id
+#: at the service layer. Looking one up or acking one never creates it.
+LEASE_SUBSCRIPTION_NOT_FOUND = "lease_subscription_not_found"
+#: Registering a ``subscriber_id`` carried different
+#: ``consumer_id``/``lease_id`` filters than the binding already stored
+#: for that id (an identical replay returns the first response):
+#: 409/subscriber_id at the service layer.
+LEASE_SUBSCRIPTION_FILTER_CONFLICT = "lease_subscription_filter_conflict"
+#: A lease-event subscription ack named an ``expected`` value that
+#: differs from the subscriber's stored position: 409/expected at the
+#: service layer.
+LEASE_SUBSCRIPTION_EXPECTED_CONFLICT = \
+    "lease_subscription_expected_conflict"
+#: A lease-event subscription ack named an ``after`` value below the
+#: stored position, above the highest global event seq, or at a seq
+#: whose event does not match the binding's filters: 409/after at the
+#: service layer.
+LEASE_SUBSCRIPTION_AFTER_CONFLICT = "lease_subscription_after_conflict"
 
 #: Lifetime of one batch-cleanup audit claim lease, in seconds. A
 #: non-empty claim reserves the page for 30 seconds: the lease is
@@ -809,6 +829,7 @@ INTEGRITY_SECTION_KEYS = (
     "cleanup_leases",
     "cleanup_lease_events",
     "lease_event_cursors",
+    "lease_subscriptions",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -821,7 +842,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 26 canonical
+    """Project a store snapshot/document payload onto the 27 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -961,12 +982,23 @@ class DeviceStore:
         # mutation they record and persist/roll back together with it.
         self._cleanup_lease_events: List[CleanupLeaseEvent] = []
         # Per-subscriber read cursors on the global cleanup-lease event
-        # stream above, keyed by subscriber_id in creation order; created
-        # lazily on the first consume that delivers and advances past an
-        # event. Each committed cursor advance happens inside the same
-        # locked transaction as every other mutation, so the cursors are
-        # persisted and rolled back together with the rest of the state.
+        # stream above, keyed by subscriber_id in creation order; a
+        # brand-new subscriber's first matching consume creates the
+        # record, even when the stream is empty (an after-0 record on
+        # an empty page), and later empty pages write nothing. Each
+        # committed cursor creation/advance happens inside the same
+        # locked transaction as every other mutation, so the cursors
+        # are persisted and rolled back together with the rest of the
+        # state.
         self._lease_event_cursors: Dict[str, LeaseEventCursor] = {}
+        # Named bindings on the global cleanup-lease event stream, keyed
+        # by subscriber_id in registration order. Each keeps the
+        # consumer_id/lease_id filters (null means "match all") and a
+        # read position advanced only by the matching ack endpoint. The
+        # two collections above and below are independent: the consume
+        # cursors are not migrated into subscriptions and a
+        # subscription ack never touches a consume cursor.
+        self._lease_subscriptions: Dict[str, LeaseSubscription] = {}
         # Per-device delivery state for group sessions, keyed by
         # (session_id, message_id, device_id): every frozen non-sender
         # member accumulates its own dedup/ack record.
@@ -5520,19 +5552,20 @@ class DeviceStore:
 
         On a match the page is the global lifecycle events with
         ``seq > cursor`` in seq order, at most *limit* of them, and the
-        cursor advances to the last returned event's seq (the record is
-        created on that first non-empty page). A non-empty page
-        persists through the change hook, so a data-file failure rolls
-        the cursor advance back; an empty page leaves the cursor
-        untouched and writes nothing (the record is never created just
-        for polling an empty stream). On success the body keys are
-        ``subscriber_id``, ``events``, ``next_after`` and ``has_more``
-        in that order; each event item is ``seq``, ``lease_id``,
-        ``consumer_id`` and ``type`` in that order. An empty page
-        echoes ``next_after=expected``; otherwise it is the last
-        returned event's seq, and ``has_more`` says whether a later
-        event follows the page. Returns ``(view, advanced)`` with
-        *advanced* true for a created or advanced subscription.
+        cursor advances to the last returned event's seq. A brand-new
+        subscriber reading an empty stream still creates its record at
+        after 0 and answers 201 (the record persists through the change
+        hook, so a data-file failure rolls that registration back); a
+        later empty page on an existing record leaves the cursor
+        untouched and writes nothing (200). On success the body keys
+        are ``subscriber_id``, ``events``, ``next_after`` and
+        ``has_more`` in that order; each event item is ``seq``,
+        ``lease_id``, ``consumer_id`` and ``type`` in that order. An
+        empty page echoes ``next_after=expected``; otherwise it is the
+        last returned event's seq, and ``has_more`` says whether a
+        later event follows the page. Returns ``(view, advanced)`` with
+        *advanced* true for a newly created subscription (including one
+        registered at 0 on an empty stream) or a forward advance.
         """
         with self._lock:
             record = self._lease_event_cursors.get(subscriber_id)
@@ -5543,16 +5576,32 @@ class DeviceStore:
             matched = [event for event in self._cleanup_lease_events
                        if event.seq > current]
             page = matched[:limit]
-            if not page:
-                # Empty page: the cursor stays untouched and nothing is
-                # written; a polling subscriber without a record keeps
-                # reading expected 0.
+            if not page and record is not None:
+                # A later empty page: the cursor stays untouched and
+                # nothing is written.
                 return ({
                     "subscriber_id": subscriber_id,
                     "events": [],
                     "next_after": current,
                     "has_more": False,
                 }, False)
+            if not page:
+                # A brand-new subscriber reading an empty stream still
+                # registers its cursor at after 0 and gets 201: the
+                # record is persisted once, so a later call with a
+                # non-zero expected conflicts exactly like any existing
+                # subscription. The two sections (cursors and
+                # lease_subscriptions) are independent, so nothing is
+                # migrated either way.
+                self._lease_event_cursors[subscriber_id] = LeaseEventCursor(
+                    subscriber_id=subscriber_id, after=0)
+                self._notify_change()
+                return ({
+                    "subscriber_id": subscriber_id,
+                    "events": [],
+                    "next_after": 0,
+                    "has_more": False,
+                }, True)
             next_after = page[-1].seq
             if record is None:
                 record = LeaseEventCursor(
@@ -5573,6 +5622,157 @@ class DeviceStore:
                 "has_more": any(event.seq > next_after
                                 for event in matched),
             }, True)
+
+    @staticmethod
+    def _lease_subscription_view(
+            subscription: LeaseSubscription) -> Dict[str, Any]:
+        """The four-key binding view, keys in response order (R)."""
+        return {
+            "subscriber_id": subscription.subscriber_id,
+            "consumer_id": subscription.consumer_id,
+            "lease_id": subscription.lease_id,
+            "after": subscription.after,
+        }
+
+    def lease_subscription_register(
+            self, subscriber_id: str, consumer_id: Optional[str],
+            lease_id: Optional[str]) -> Tuple[Dict[str, Any], int]:
+        """Register (or replay) one named lease-event stream binding.
+
+        ``POST /v1/lease-subs``. Under the one store lock shared with
+        the consume cursors and every lease-event append, a
+        not-yet-known *subscriber_id* is registered with the
+        *consumer_id*/*lease_id* filters (each a non-empty string or
+        ``None``, matching all) at position 0, persisted once through
+        the change hook and answered 201. Re-registering the same id
+        with the identical filters is an idempotent replay: 200 with
+        the frozen first-registration view (its ``after`` stays 0 even
+        if the binding later advanced through an ack), nothing
+        written; the same id with different filters raises
+        :class:`RedeliveryJobError`
+        ``lease_subscription_filter_conflict`` (409/subscriber_id at
+        the service layer). Subscriptions are independent of the
+        consume cursors in ``lease_event_cursors``: nothing is
+        migrated in either direction.
+        """
+        with self._lock:
+            existing = self._lease_subscriptions.get(subscriber_id)
+            if existing is not None:
+                if (existing.consumer_id, existing.lease_id) \
+                        != (consumer_id, lease_id):
+                    raise RedeliveryJobError(
+                        LEASE_SUBSCRIPTION_FILTER_CONFLICT)
+                # An idempotent replay returns the byte-stable first
+                # registration view: the binding's position may have
+                # advanced via ack in between, but the registration
+                # response always reports after 0.
+                return {
+                    "subscriber_id": existing.subscriber_id,
+                    "consumer_id": existing.consumer_id,
+                    "lease_id": existing.lease_id,
+                    "after": 0,
+                }, 200
+            subscription = LeaseSubscription(
+                subscriber_id=subscriber_id, consumer_id=consumer_id,
+                lease_id=lease_id, after=0)
+            self._lease_subscriptions[subscriber_id] = subscription
+            self._notify_change()
+            return self._lease_subscription_view(subscription), 201
+
+    def lease_subscription_page(
+            self, subscriber_id: str, limit: int) -> Dict[str, Any]:
+        """Read one named binding's filtered event page without advancing.
+
+        ``GET /v1/lease-subs/{subscriber_id}``. An unknown subscriber
+        raises :class:`RedeliveryJobError`
+        ``lease_subscription_not_found`` (404/subscriber_id at the
+        service layer) and is never created by the lookup. Under the
+        one store lock the global event stream is filtered by the
+        binding's ``consumer_id``/``lease_id`` (a null filter matches
+        all) and the page is the matching events with ``seq`` greater
+        than the binding's stored position, in seq order, at most
+        *limit* of them. The stored position is never advanced. On
+        success the body keys are ``subscriber_id``, ``events``,
+        ``next_after`` and ``has_more`` in that order; each event is
+        the four-key event view; an empty page echoes
+        ``next_after`` as the stored position, otherwise it is the
+        last returned event's seq.
+        """
+        with self._lock:
+            subscription = self._lease_subscriptions.get(subscriber_id)
+            if subscription is None:
+                raise RedeliveryJobError(LEASE_SUBSCRIPTION_NOT_FOUND)
+            matched = [
+                event for event in self._cleanup_lease_events
+                if event.seq > subscription.after
+                and (subscription.consumer_id is None
+                     or event.consumer_id == subscription.consumer_id)
+                and (subscription.lease_id is None
+                     or event.lease_id == subscription.lease_id)]
+            page = matched[:limit]
+            next_after = page[-1].seq if page else subscription.after
+            return {
+                "subscriber_id": subscriber_id,
+                "events": [{
+                    "seq": event.seq,
+                    "lease_id": event.lease_id,
+                    "consumer_id": event.consumer_id,
+                    "type": event.type,
+                } for event in page],
+                "next_after": next_after,
+                "has_more": any(event.seq > next_after
+                                for event in matched),
+            }
+
+    def lease_subscription_ack(
+            self, subscriber_id: str, expected: int,
+            after: int) -> Tuple[Dict[str, Any], int]:
+        """Move one named binding's position to a matching event seq.
+
+        ``POST /v1/lease-subs/{subscriber_id}/ack``. An unknown
+        subscriber raises :class:`RedeliveryJobError`
+        ``lease_subscription_not_found`` (404/subscriber_id) and is
+        never created. Under the one store lock, an *expected* that
+        differs from the binding's stored position raises
+        ``lease_subscription_expected_conflict`` (409/expected). An
+        *after* below the stored position, above the highest global
+        event seq, or whose event does not match the binding's
+        filters raises ``lease_subscription_after_conflict``
+        (409/after); an equal position is an idempotent no-op (200,
+        nothing written); a strictly greater matching position
+        advances once through the change hook (201). The success view
+        is ``subscriber_id`` and ``after`` in that order.
+        """
+        with self._lock:
+            subscription = self._lease_subscriptions.get(subscriber_id)
+            if subscription is None:
+                raise RedeliveryJobError(LEASE_SUBSCRIPTION_NOT_FOUND)
+            current = subscription.after
+            if expected != current:
+                raise RedeliveryJobError(
+                    LEASE_SUBSCRIPTION_EXPECTED_CONFLICT)
+            if after == current:
+                return {
+                    "subscriber_id": subscriber_id,
+                    "after": current,
+                }, 200
+            if after < current \
+                    or after > len(self._cleanup_lease_events):
+                raise RedeliveryJobError(
+                    LEASE_SUBSCRIPTION_AFTER_CONFLICT)
+            target = self._cleanup_lease_events[after - 1]
+            if (subscription.consumer_id is not None
+                    and target.consumer_id != subscription.consumer_id) \
+                    or (subscription.lease_id is not None
+                        and target.lease_id != subscription.lease_id):
+                raise RedeliveryJobError(
+                    LEASE_SUBSCRIPTION_AFTER_CONFLICT)
+            subscription.after = after
+            self._notify_change()
+            return {
+                "subscriber_id": subscriber_id,
+                "after": after,
+            }, 201
 
     @staticmethod
     def redelivery_job_detail_view(job: RedeliveryJob) -> Dict[str, Any]:
@@ -7109,6 +7309,12 @@ class DeviceStore:
                 "subscriber_id": record.subscriber_id,
                 "after": record.after,
             } for record in self._lease_event_cursors.values()]
+            lease_subscriptions = [{
+                "subscriber_id": record.subscriber_id,
+                "consumer_id": record.consumer_id,
+                "lease_id": record.lease_id,
+                "after": record.after,
+            } for record in self._lease_subscriptions.values()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -7133,7 +7339,8 @@ class DeviceStore:
                         "cleanup_checkpoints": cleanup_checkpoints,
                         "cleanup_leases": cleanup_leases,
                         "cleanup_lease_events": cleanup_lease_events,
-                        "lease_event_cursors": lease_event_cursors}
+                        "lease_event_cursors": lease_event_cursors,
+                        "lease_subscriptions": lease_subscriptions}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -7321,6 +7528,7 @@ class DeviceStore:
         raw_cleanup_leases = state.get("cleanup_leases", [])
         raw_cleanup_lease_events = state.get("cleanup_lease_events", [])
         raw_lease_event_cursors = state.get("lease_event_cursors", [])
+        raw_lease_subscriptions = state.get("lease_subscriptions", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -7345,7 +7553,8 @@ class DeviceStore:
                 and isinstance(raw_cleanup_checkpoints, list)
                 and isinstance(raw_cleanup_leases, list)
                 and isinstance(raw_cleanup_lease_events, list)
-                and isinstance(raw_lease_event_cursors, list)):
+                and isinstance(raw_lease_event_cursors, list)
+                and isinstance(raw_lease_subscriptions, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -9463,6 +9672,75 @@ class DeviceStore:
             lease_event_cursors[ec_subscriber_id] = LeaseEventCursor(
                 subscriber_id=ec_subscriber_id, after=ec_after)
 
+        # Named bindings on the lease-event stream above, serialized
+        # right after lease_event_cursors (the 27th canonical
+        # section). Older version-1 files predate the section: it is
+        # absent and treated as empty. A present section holds one
+        # record per subscriber (unique, registration order); every
+        # record carries exactly subscriber_id/consumer_id/lease_id/
+        # after in that order: subscriber_id is a non-empty string,
+        # consumer_id/lease_id are each either a non-empty string or
+        # null (a null filter matches all), and after is 0 or the seq
+        # of an event that both exists in cleanup_lease_events and
+        # matches the binding's filters (the live ack only ever lands
+        # on such an event). A duplicate subscriber, a key-order/type
+        # error or a cursor that names no matching event refuses
+        # startup rather than silently dropping or clamping the
+        # record. The two sections are independent: a subscription
+        # never references lease_event_cursors and vice versa.
+        lease_subscriptions: Dict[str, LeaseSubscription] = {}
+        for index, raw in enumerate(raw_lease_subscriptions):
+            where = f"lease_subscriptions[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["subscriber_id", "consumer_id", "lease_id",
+                             "after"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'subscriber_id', "
+                    f"'consumer_id', 'lease_id' and 'after' in order")
+            ls_subscriber_id = raw["subscriber_id"]
+            ls_consumer_id = raw["consumer_id"]
+            ls_lease_id = raw["lease_id"]
+            ls_after = raw["after"]
+            if not (isinstance(ls_subscriber_id, str)
+                    and ls_subscriber_id):
+                raise ValueError(
+                    f"{where}.subscriber_id must be a non-empty string")
+            if ls_consumer_id is not None and not (
+                    isinstance(ls_consumer_id, str) and ls_consumer_id):
+                raise ValueError(
+                    f"{where}.consumer_id must be a non-empty string or "
+                    f"null")
+            if ls_lease_id is not None and not (
+                    isinstance(ls_lease_id, str) and ls_lease_id):
+                raise ValueError(
+                    f"{where}.lease_id must be a non-empty string or null")
+            if not isinstance(ls_after, int) or isinstance(ls_after, bool) \
+                    or ls_after < 0:
+                raise ValueError(
+                    f"{where}.after must be a non-negative integer")
+            if ls_after != 0:
+                if ls_after > len(cleanup_lease_events):
+                    raise ValueError(
+                        f"{where}.after {ls_after} is not the seq of an "
+                        f"existing cleanup lease event")
+                target = cleanup_lease_events[ls_after - 1]
+                if (ls_consumer_id is not None
+                        and target.consumer_id != ls_consumer_id) \
+                        or (ls_lease_id is not None
+                            and target.lease_id != ls_lease_id):
+                    raise ValueError(
+                        f"{where}.after {ls_after} is not the seq of a "
+                        f"cleanup lease event matching the binding filters")
+            if ls_subscriber_id in lease_subscriptions:
+                raise ValueError(
+                    f"duplicate lease subscription in state: "
+                    f"{ls_subscriber_id}")
+            lease_subscriptions[ls_subscriber_id] = LeaseSubscription(
+                subscriber_id=ls_subscriber_id,
+                consumer_id=ls_consumer_id, lease_id=ls_lease_id,
+                after=ls_after)
+
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
         # job without any event is simply older than the section and stays
@@ -9998,6 +10276,7 @@ class DeviceStore:
             self._cleanup_leases = cleanup_leases
             self._cleanup_lease_events = cleanup_lease_events
             self._lease_event_cursors = lease_event_cursors
+            self._lease_subscriptions = lease_subscriptions
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor

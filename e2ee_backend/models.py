@@ -547,11 +547,11 @@ class CleanupLeaseEvent:
 class LeaseEventCursor:
     """One subscriber's read cursor on the cleanup-lease event stream.
 
-    Created lazily by ``POST
+    Created by ``POST
     /v1/event-gc-batch/lease-events/consume`` the first time a named
-    subscriber actually receives (and advances past) an event; a
-    subscriber whose first calls only ever see an empty page has no
-    record and keeps sending ``expected`` 0. ``after`` is the global
+    subscriber matches — including a brand-new subscriber reading an
+    empty stream with ``expected`` 0, who gets a record at after 0 and
+    a 201; a later empty page writes nothing. ``after`` is the global
     ``seq`` of the last event delivered to that subscriber (0 for a
     record that has never advanced) and only ever equals 0 or the seq
     of an event that exists in :class:`CleanupLeaseEvent` stream — the
@@ -562,6 +562,30 @@ class LeaseEventCursor:
     """
 
     subscriber_id: str
+    after: int = 0
+
+
+@dataclass
+class LeaseSubscription:
+    """A named binding on the cleanup-lease lifecycle event stream.
+
+    Created by ``POST /v1/lease-subs`` the first time a
+    ``subscriber_id`` is registered; the same id keeps exactly one
+    binding of ``consumer_id``/``lease_id`` filters (each either a
+    non-empty string or ``null``, a null filter matches every value).
+    Re-registering the same id with the identical filters is an
+    idempotent replay; a different binding is a 409 and changes
+    nothing. ``after`` is the subscriber's read position on the
+    filtered stream — 0 at registration, moved forward (never
+    backwards) by ``POST /v1/lease-subs/{subscriber_id}/ack`` to the
+    global ``seq`` of an event that matches the binding. The
+    subscription and its position persist and roll back together with
+    every other section.
+    """
+
+    subscriber_id: str
+    consumer_id: Optional[str] = None
+    lease_id: Optional[str] = None
     after: int = 0
 
 
