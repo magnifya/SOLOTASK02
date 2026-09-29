@@ -195,6 +195,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 and path.endswith("/inbox/retry-batch"):
             self._route_device_inbox_retry_batch(path)
         elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/group-inbox/retry-batch"):
+            self._route_device_group_inbox_retry_batch(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
                 and path.endswith("/inbox/claim"):
             self._route_device_inbox_claim(path)
         elif path.startswith(_DEVICES_PATH + "/") \
@@ -344,6 +347,22 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
+
+    def _route_device_group_inbox_retry_batch(self, path: str) -> None:
+        suffix = path[len(_DEVICES_PATH) + 1:
+                      -len("/group-inbox/retry-batch")]
+        if not suffix or "/" in suffix:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+            return
+        device_id = _strict_percent_decode(suffix)
+        if device_id is None:
+            self._send_json(400, {
+                "message": "device_id has a malformed percent escape "
+                           "or is not valid UTF-8",
+                "field": "device_id"})
+            return
+        self._handle_device_group_inbox_retry_batch(device_id)
 
     def _route_device_inbox_claim(self, path: str) -> None:
         suffix = path[len(_DEVICES_PATH) + 1:-len("/inbox/claim")]
@@ -1206,6 +1225,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.inbox_retry_batch(
+                device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_device_group_inbox_retry_batch(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.group_inbox_retry_batch(
                 device_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
