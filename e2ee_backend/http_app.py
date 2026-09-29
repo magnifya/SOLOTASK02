@@ -189,6 +189,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 and path.endswith("/group-sync/ack-batch"):
             self._route_device_group_sync_ack_batch(path)
         elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/group-sync/ack-messages"):
+            self._route_device_group_sync_ack_messages(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
                 and path.endswith("/inbox/retry-batch"):
             self._route_device_inbox_retry_batch(path)
         elif path.startswith(_DEVICES_PATH + "/") \
@@ -321,6 +324,15 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                       -len("/group-sync/ack-batch")]
         if suffix and "/" not in suffix:
             self._handle_device_group_sync_ack_batch(unquote(suffix))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_device_group_sync_ack_messages(self, path: str) -> None:
+        suffix = path[len(_DEVICES_PATH) + 1:
+                      -len("/group-sync/ack-messages")]
+        if suffix and "/" not in suffix:
+            self._handle_device_group_sync_ack_messages(unquote(suffix))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -1159,6 +1171,29 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.sync_group_ack_batch(
+                device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_device_group_sync_ack_messages(self, device_id: str) -> None:
+        # The selective per-message ack batch takes no query parameters:
+        # any parameter (including a bare ``?foo`` flag, via
+        # keep_blank_values) is 400/query; a trailing ``?`` with no
+        # parameter at all is accepted.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.sync_group_ack_messages(
                 device_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
