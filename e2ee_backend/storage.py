@@ -3032,6 +3032,114 @@ class DeviceStore:
                             "has_more": False}
                 self._condition.wait(remaining)
 
+    def _group_inbox_entries_locked(
+            self, device_id: str
+    ) -> List[Tuple[str, str, Message]]:
+        """Collect a device's unacked group-inbox messages in inbox order.
+
+        Mirrors :meth:`_inbox_entries_locked` for group sessions: every
+        not-yet-acked group message of every group session whose frozen
+        member snapshot includes *device_id*, excluding messages the device
+        itself sent. Membership is the frozen snapshot, so a member removed
+        after the session froze still sees its messages while a device added
+        to the group later never does. 1:1 sessions never contribute.
+        Entries sort by ``(session.created_at, session_id, sequence)``
+        (session_id by code points). The caller must hold the store lock.
+        """
+        entries: List[Tuple[str, str, Message]] = []
+        for session_id, session in self._group_sessions.items():
+            if device_id not in session.members:
+                continue
+            for message in self._messages.get(session_id, []):
+                if message.sender_device_id == device_id:
+                    continue
+                state = self._group_delivery.get(
+                    (session_id, message.message_id, device_id))
+                if state is not None and state.acked:
+                    continue
+                entries.append((session.created_at, session_id, message))
+        entries.sort(key=lambda entry: (entry[0], entry[1],
+                                        entry[2].sequence))
+        return entries
+
+    def group_inbox(self, device_id: str, limit: int) -> Dict[str, Any]:
+        """Atomically read one device's aggregated group offline inbox.
+
+        ``GET /v1/devices/{device_id}/group-inbox``. Purely read-only, in the
+        same sense as :meth:`device_inbox`: nothing is created, advanced or
+        persisted, so an unchanged state answers byte-identically and the
+        snapshot is linearized against message submission, group-sync ack and
+        revocation under the one store lock. The device must exist and not be
+        revoked (both mapped to 409/device_id by the service).
+
+        The inbox aggregates, across every group session whose frozen member
+        snapshot contains the device (1:1 sessions never contribute, a
+        later-added member sees nothing, a removed frozen member still sees
+        its frozen session), every message sent by another device whose
+        ``group_delivery`` record for this device is missing or not yet
+        acked. Entries are ordered by ``(session.created_at, session_id,
+        sequence)`` — session_id compared by code points — and the page
+        holds at most *limit* of them; ``has_more`` says whether the locked
+        snapshot still had further entries beyond the page.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            entries = self._group_inbox_entries_locked(device_id)
+            page = entries[:limit]
+            return {
+                "device_id": device_id,
+                "messages": [self.message_view(entry[2]) for entry in page],
+                "has_more": len(entries) > limit,
+            }
+
+    def group_inbox_wait(self, device_id: str, limit: int,
+                         timeout_ms: int) -> Dict[str, Any]:
+        """Long-polling variant of :meth:`group_inbox` (read-only).
+
+        ``GET /v1/devices/{device_id}/group-inbox/wait``. Under the store
+        lock, if the device already has at least one receivable group
+        message, the first *limit* entries return immediately, exactly as
+        :meth:`group_inbox` would. Otherwise the caller waits — **without**
+        holding the lock, so message submission, group-sync ack and
+        revocation stay unblocked — on the store condition until a committed
+        mutation makes a group message deliverable, the device is revoked,
+        or *timeout_ms* milliseconds (measured against a monotonic clock)
+        elapse. After every wakeup and once more at the deadline the state is
+        rechecked under the lock, revocation taking priority over message
+        delivery. Only a still-empty snapshot at the deadline answers ``200``
+        with ``messages`` empty and ``has_more`` false. Nothing is written by
+        the wait itself: no persistence notification, no ``commit_seq``
+        generation, and no cursor, delivery record or sidecar is touched.
+        The device must exist and not be revoked (both mapped to
+        409/device_id by the service).
+        """
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        with self._condition:
+            while True:
+                device = self._find_device(device_id)
+                if device is None:
+                    raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+                if device.revoked:
+                    raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+                entries = self._group_inbox_entries_locked(device_id)
+                if entries:
+                    page = entries[:limit]
+                    return {
+                        "device_id": device_id,
+                        "messages": [self.message_view(entry[2])
+                                     for entry in page],
+                        "has_more": len(entries) > limit,
+                    }
+                remaining = max(deadline - time.monotonic(), 0.0)
+                if remaining <= 0.0:
+                    return {"device_id": device_id, "messages": [],
+                            "has_more": False}
+                self._condition.wait(remaining)
+
     def inbox_claim(
             self, device_id: str, lease_id: str, limit: int
     ) -> Tuple[Dict[str, Any], int, bool]:

@@ -1508,6 +1508,68 @@ class DeviceService:
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
 
+    def group_inbox(self, device_id: str, limit: int) -> Dict[str, Any]:
+        """Return one device's aggregated group offline-inbox page (read-only).
+
+        ``GET /v1/devices/{device_id}/group-inbox``. Contract mirrors
+        :meth:`device_inbox` except the aggregation spans the group sessions
+        the device was frozen into: only messages sent by another device and
+        not yet acknowledged for this device contribute; 1:1 messages, the
+        device's own messages and messages of sessions the device joined only
+        after they froze never appear (a member removed after the freeze
+        still sees the frozen session). Ordering, paging, key order, the
+        unknown/revoked 409/field=device_id mapping and the read-only,
+        byte-identical-on-unchanged-state guarantees match
+        :meth:`device_inbox`; each envelope additionally carries its
+        ``session_id`` as usual.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        try:
+            return self.store.group_inbox(device_id, limit)
+        except MessageSyncError as error:
+            if error.reason == MESSAGE_SYNC_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
+    def group_inbox_wait(self, device_id: str, limit: int,
+                         timeout_ms: int) -> Dict[str, Any]:
+        """Long-poll one device's aggregated group offline inbox (read-only).
+
+        ``GET /v1/devices/{device_id}/group-inbox/wait``. Contract mirrors
+        :meth:`device_inbox_wait` over the group aggregation of
+        :meth:`group_inbox`: ``limit`` is a non-boolean integer in 1..100
+        (HTTP default 100) and ``timeout_ms`` a non-boolean integer in
+        0..30000 (HTTP default 30000); an unknown or revoked device is
+        409/field=device_id, checked again under the lock after every wakeup
+        with revocation taking priority over message delivery. A populated
+        inbox returns immediately; otherwise the wait (without holding the
+        store lock) ends when a receivable group message appears, the device
+        is revoked, or the monotonic deadline passes, the last case
+        answering ``messages=[]``/``has_more=false``. Nothing is written.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+        if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) \
+                or not 0 <= timeout_ms <= 30000:
+            raise ServiceError(
+                "field must be an integer in 0..30000: timeout_ms",
+                "timeout_ms")
+        try:
+            return self.store.group_inbox_wait(device_id, limit, timeout_ms)
+        except MessageSyncError as error:
+            if error.reason == MESSAGE_SYNC_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
     def inbox_retry_batch(self, device_id: str,
                           payload: object) -> Tuple[Dict[str, Any], int]:
         """Validate and apply one device's batch retry of 1:1 inbox messages.

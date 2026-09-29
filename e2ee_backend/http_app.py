@@ -573,6 +573,36 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_device_inbox_wait(unquote(device_id))
                 return
+            if suffix.endswith("/group-inbox/wait"):
+                device_segment = suffix[:-len("/group-inbox/wait")]
+                if not device_segment or "/" in device_segment:
+                    self._send_json(404, {"message": "device not found",
+                                          "field": "device_id"})
+                    return
+                device_id = _strict_percent_decode(device_segment)
+                if device_id is None:
+                    self._send_json(400, {
+                        "message": "device_id has a malformed percent escape "
+                                   "or is not valid UTF-8",
+                        "field": "device_id"})
+                    return
+                self._handle_device_group_inbox_wait(device_id)
+                return
+            if suffix.endswith("/group-inbox"):
+                device_segment = suffix[:-len("/group-inbox")]
+                if not device_segment or "/" in device_segment:
+                    self._send_json(404, {"message": "device not found",
+                                          "field": "device_id"})
+                    return
+                device_id = _strict_percent_decode(device_segment)
+                if device_id is None:
+                    self._send_json(400, {
+                        "message": "device_id has a malformed percent escape "
+                                   "or is not valid UTF-8",
+                        "field": "device_id"})
+                    return
+                self._handle_device_group_inbox(device_id)
+                return
             if "/inbox-jobs/" in suffix:
                 # {device_id}/inbox-jobs/{job_id} — split on raw slashes
                 # only; a percent-encoded slash inside an id segment is
@@ -790,6 +820,85 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return  # a 400 response was already sent
         try:
             body = self.service.device_inbox_wait(
+                device_id, limit, timeout_ms)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_device_group_inbox(self, device_id: str) -> None:
+        # The group inbox takes no request body and only a single-valued
+        # limit (default 100, range 1..100). Validation order is fixed:
+        # non-empty body (request_body), any other parameter (query), then
+        # limit. keep_blank_values so a bare ``?foo`` flag or an explicit
+        # ``limit=`` is an actual (malformed) parameter; a trailing ``?``
+        # with no parameter at all is accepted.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if any(name != "limit" for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.group_inbox(device_id, limit)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_device_group_inbox_wait(self, device_id: str) -> None:
+        # Same shape as the 1:1 long poll: no request body, only
+        # single-valued limit (default 100, 1..100) and timeout_ms (default
+        # 30000, 0..30000). Validation order is fixed: non-empty body
+        # (request_body), any other parameter (query), then limit, then
+        # timeout_ms.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if any(name not in ("limit", "timeout_ms") for name in query):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        limit = self._decimal_nonneg_param(query, "limit", default=100,
+                                           minimum=1, maximum=100,
+                                           max_digits=3)
+        if limit is None:
+            return  # a 400 response was already sent
+        timeout_ms = self._decimal_nonneg_param(query, "timeout_ms",
+                                                default=30000, minimum=0,
+                                                maximum=30000, max_digits=5)
+        if timeout_ms is None:
+            return  # a 400 response was already sent
+        try:
+            body = self.service.group_inbox_wait(
                 device_id, limit, timeout_ms)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
