@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 
 from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from typing import Optional
+from typing import Dict, Optional
 
 #: AES-GCM nonce size in bytes (96-bit nonces, as recommended for GCM).
 GCM_NONCE_BYTES = 12
@@ -25,6 +28,8 @@ GCM_NONCE_BYTES = 12
 GCM_TAG_BYTES = 16
 #: AES-256 key size in bytes.
 AES_KEY_BYTES = 32
+#: HKDF info label for locally derived session keys.
+SESSION_KEY_INFO = b"e2ee-session-key-v1"
 
 
 class CryptoError(Exception):
@@ -200,3 +205,258 @@ def load_public_key(value: str) -> Optional[object]:
         if der is not None:
             return der
     return None
+
+
+#: Snapshot fields that carry public X25519 material. ``initiator_identity_key``
+#: is an extra local-only field: the eight-field server snapshot never stores
+#: the initiator's identity public key, but the recipient needs it to compute
+#: the initiator-identity/pre-key agreement of the three shared secrets.
+_SESSION_PUBLIC_FIELDS = (
+    "ephemeral_key",
+    "identity_key",
+    "public_key",
+    "initiator_identity_key",
+)
+
+
+def load_session_snapshot(session_json: object) -> Dict[str, str]:
+    """Parse and validate the frozen session JSON used for local derivation.
+
+    Accepts either a JSON string (e.g. the output of ``show-session``) or an
+    already-parsed mapping. Every required field must be a non-empty string.
+    The three server-snapshot public keys and the local-only
+    ``initiator_identity_key`` must all parse as X25519 public keys. Any
+    failure raises :class:`CryptoError` with a precise ``field``:
+    ``session_json`` for parse/shape problems, ``session_id`` for the id, or
+    the offending key field for non-X25519 material.
+    """
+    if isinstance(session_json, (bytes, bytearray)):
+        try:
+            session_json = bytes(session_json).decode("utf-8")
+        except UnicodeDecodeError:
+            raise CryptoError("session_json must be valid UTF-8 JSON",
+                              "session_json") from None
+    if isinstance(session_json, str):
+        try:
+            snapshot = json.loads(session_json)
+        except (json.JSONDecodeError, ValueError):
+            raise CryptoError("session_json must be a JSON object",
+                              "session_json") from None
+    else:
+        snapshot = session_json
+    if not isinstance(snapshot, dict):
+        raise CryptoError("session_json must be a JSON object", "session_json")
+
+    for name in ("session_id", *_SESSION_PUBLIC_FIELDS):
+        if name not in snapshot:
+            raise CryptoError(f"missing required field: {name}",
+                              "session_id" if name == "session_id" else name)
+        if not is_nonempty_string(snapshot[name]):
+            raise CryptoError(
+                f"field must be a non-empty string: {name}",
+                "session_id" if name == "session_id" else name)
+
+    for name in _SESSION_PUBLIC_FIELDS:
+        if load_x25519_public_key(snapshot[name], name) is None:
+            raise CryptoError(f"field is not a valid X25519 public key: {name}",
+                              name)
+    return {name: snapshot[name]
+            for name in ("session_id", *_SESSION_PUBLIC_FIELDS)}
+
+
+def load_x25519_public_key(value: str, field: str) -> Optional[x25519.X25519PublicKey]:
+    """Parse *value* strictly as an X25519 public key; return ``None`` otherwise.
+
+    Accepts PEM SubjectPublicKeyInfo, base64/hex DER SubjectPublicKeyInfo, or a
+    base64/hex raw 32-byte point. Ed25519 and other curves are rejected.
+    """
+    if not is_nonempty_string(value):
+        return None
+
+    try:
+        key = serialization.load_pem_public_key(value.encode("ascii"))
+    except (ValueError, UnsupportedAlgorithm, TypeError):
+        key = None
+    if isinstance(key, x25519.X25519PublicKey):
+        return key
+
+    candidates: list[bytes] = []
+    blob = _decode_base64(value)
+    if blob is not None:
+        candidates.append(blob)
+    blob = _decode_hex(value)
+    if blob is not None and blob not in candidates:
+        candidates.append(blob)
+
+    for candidate in candidates:
+        if len(candidate) == 32:
+            try:
+                return x25519.X25519PublicKey.from_public_bytes(candidate)
+            except (ValueError, UnsupportedAlgorithm, TypeError):
+                pass
+        try:
+            der_key = serialization.load_der_public_key(candidate)
+        except (ValueError, UnsupportedAlgorithm, TypeError):
+            continue
+        if isinstance(der_key, x25519.X25519PublicKey):
+            return der_key
+    return None
+
+
+def load_x25519_private_key(value: object,
+                            field: str) -> x25519.X25519PrivateKey:
+    """Parse an X25519 private key in PEM PKCS#8, DER, or raw 32-byte form.
+
+    PEM text must be PKCS#8; other encodings accept base64/hex DER PKCS#8 or
+    base64/hex of the raw 32-byte scalar. Anything missing, malformed or not
+    X25519 raises :class:`CryptoError` naming *field*.
+    """
+    if not is_nonempty_string(value):
+        raise CryptoError(f"missing or invalid field: {field}", field)
+    assert isinstance(value, str)
+
+    try:
+        key = serialization.load_pem_private_key(
+            value.encode("ascii"), password=None)
+    except (ValueError, UnsupportedAlgorithm, TypeError):
+        key = None
+    if isinstance(key, x25519.X25519PrivateKey):
+        return key
+
+    candidates: list[bytes] = []
+    blob = _decode_base64(value)
+    if blob is not None:
+        candidates.append(blob)
+    blob = _decode_hex(value)
+    if blob is not None and blob not in candidates:
+        candidates.append(blob)
+
+    for candidate in candidates:
+        if len(candidate) == 32:
+            try:
+                return x25519.X25519PrivateKey.from_private_bytes(candidate)
+            except (ValueError, UnsupportedAlgorithm, TypeError):
+                pass
+        try:
+            der_key = serialization.load_der_private_key(
+                candidate, password=None)
+        except (ValueError, UnsupportedAlgorithm, TypeError):
+            continue
+        if isinstance(der_key, x25519.X25519PrivateKey):
+            return der_key
+    raise CryptoError(f"field is not a valid X25519 private key: {field}", field)
+
+
+def _require_matching_private_key(private_key: x25519.X25519PrivateKey,
+                                  public_value: str, field: str) -> None:
+    """Ensure *private_key* corresponds to the snapshot's *public_value*."""
+    public_key = load_x25519_public_key(public_value, field)
+    if public_key is None:
+        raise CryptoError(
+            f"field is not a valid X25519 public key: {field}", field)
+    derived = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    expected = public_key.public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    if derived != expected:
+        raise CryptoError(
+            f"private key does not match the snapshot public key: {field}",
+            field)
+
+
+def _x25519_exchange(private_key: x25519.X25519PrivateKey,
+                    public_value: str, field: str) -> bytes:
+    """Perform one X25519 ECDH against a snapshot public key."""
+    public_key = load_x25519_public_key(public_value, field)
+    if public_key is None:
+        raise CryptoError(
+            f"field is not a valid X25519 public key: {field}", field)
+    try:
+        return private_key.exchange(public_key)
+    except ValueError:
+        raise CryptoError(f"X25519 key agreement failed for field: {field}",
+                          field) from None
+
+
+def derive_session_key(session_json: object, role: object,
+                       identity_private: object,
+                       ephemeral_private: object = None,
+                       prekey_private: object = None) -> Dict[str, str]:
+    """Locally derive the shared AES-256 session key from one side's keys.
+
+    *role* is ``"initiator"`` (identity + ephemeral private keys) or
+    ``"recipient"`` (identity + pre-key private keys). Both sides compute the
+    same three X25519 shared secrets, in the same order::
+
+        DH(IK_initiator, SPK_recipient)
+        || DH(EK_initiator, IK_recipient)
+        || DH(EK_initiator, SPK_recipient)
+
+    HKDF-SHA256 with ``salt = UTF-8(session_id)`` and
+    ``info = b"e2ee-session-key-v1"`` then yields the 32-byte key. Every
+    validation failure raises :class:`CryptoError` with the precise field.
+    """
+    snapshot = load_session_snapshot(session_json)
+
+    if not is_nonempty_string(role) or role not in ("initiator", "recipient"):
+        raise CryptoError("role must be 'initiator' or 'recipient'", "role")
+
+    if not is_nonempty_string(identity_private):
+        raise CryptoError(
+            "missing or invalid field: identity_private_key",
+            "identity_private_key")
+    identity = load_x25519_private_key(
+        identity_private, "identity_private_key")
+
+    if role == "initiator":
+        if not is_nonempty_string(ephemeral_private):
+            raise CryptoError(
+                "missing or invalid field: ephemeral_private_key",
+                "ephemeral_private_key")
+        ephemeral = load_x25519_private_key(
+            ephemeral_private, "ephemeral_private_key")
+        _require_matching_private_key(
+            identity, snapshot["initiator_identity_key"],
+            "identity_private_key")
+        _require_matching_private_key(
+            ephemeral, snapshot["ephemeral_key"],
+            "ephemeral_private_key")
+        secrets = (
+            _x25519_exchange(identity, snapshot["public_key"],
+                             "identity_private_key"),
+            _x25519_exchange(ephemeral, snapshot["identity_key"],
+                             "ephemeral_private_key"),
+            _x25519_exchange(ephemeral, snapshot["public_key"],
+                             "ephemeral_private_key"),
+        )
+    else:
+        if not is_nonempty_string(prekey_private):
+            raise CryptoError(
+                "missing or invalid field: prekey_private_key",
+                "prekey_private_key")
+        prekey = load_x25519_private_key(
+            prekey_private, "prekey_private_key")
+        _require_matching_private_key(
+            identity, snapshot["identity_key"], "identity_private_key")
+        _require_matching_private_key(
+            prekey, snapshot["public_key"], "prekey_private_key")
+        secrets = (
+            _x25519_exchange(prekey, snapshot["initiator_identity_key"],
+                             "prekey_private_key"),
+            _x25519_exchange(identity, snapshot["ephemeral_key"],
+                             "identity_private_key"),
+            _x25519_exchange(prekey, snapshot["ephemeral_key"],
+                             "prekey_private_key"),
+        )
+
+    session_id = snapshot["session_id"]
+    key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=AES_KEY_BYTES,
+        salt=session_id.encode("utf-8"),
+        info=SESSION_KEY_INFO,
+    ).derive(b"".join(secrets))
+    return {
+        "session_id": session_id,
+        "key": base64.b64encode(key).decode("ascii"),
+    }

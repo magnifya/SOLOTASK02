@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from .crypto import CryptoError, decrypt_message, encrypt_message
+from .crypto import (CryptoError, decrypt_message, derive_session_key,
+                     encrypt_message)
 from .http_app import create_server
 from .locking import StateFileLocked, acquire_state_file_lock
 from .persistence import StateFileError, attach_persistence
@@ -33,6 +34,23 @@ def _read_key_argument(value: str) -> str:
         with open(value[1:], "r", encoding="utf-8") as handle:
             return handle.read().strip()
     return value
+
+
+def is_nonempty_cli_value(value: Optional[str]) -> bool:
+    """True for a supplied CLI string that is not empty or whitespace-only."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _read_optional_key_argument(value: Optional[str], field: str) -> Optional[str]:
+    """Read an optional ``@path`` key argument, tagging read errors with *field*."""
+    if value is None:
+        return None
+    if not is_nonempty_cli_value(value):
+        raise CryptoError(f"missing required field: {field}", field)
+    try:
+        return _read_key_argument(value)
+    except OSError as error:
+        raise CryptoError(str(error), field) from None
 
 
 def _parse_prekey(spec: str) -> Dict[str, str]:
@@ -373,6 +391,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_decrypt.add_argument("--ciphertext", required=True,
                            help="base64-encoded ciphertext with appended GCM tag")
     p_decrypt.set_defaults(handler=cmd_decrypt_message)
+
+    p_derive = sub.add_parser(
+        "derive-session-key",
+        help="locally derive the shared session key from one side's private keys")
+    p_derive.add_argument(
+        "--session-json",
+        help="show-session session JSON text, or @path to read it from a file")
+    p_derive.add_argument(
+        "--role",
+        help="which side's private keys are supplied")
+    p_derive.add_argument(
+        "--identity-private-key",
+        help="this side's identity private key (PEM/DER/raw), or @path")
+    p_derive.add_argument(
+        "--ephemeral-private-key",
+        help="initiator's ephemeral private key (PEM/DER/raw), or @path")
+    p_derive.add_argument(
+        "--prekey-private-key",
+        help="recipient's pre-key private key (PEM/DER/raw), or @path")
+    p_derive.set_defaults(handler=cmd_derive_session_key)
 
     p_integrity_history_page = sub.add_parser(
         "integrity-history-page",
@@ -1006,6 +1044,48 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
                                  args.nonce, args.ciphertext)
     except OSError as error:
         return _emit_crypto_error(CryptoError(str(error), "key"))
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+def cmd_derive_session_key(args: argparse.Namespace) -> int:
+    """Derive the shared session key locally; print ``session_id``/``key``.
+
+    Purely local: the session JSON comes from ``show-session`` (directly or
+    via ``@path``), and only the caller's own private keys are read. Nothing
+    is sent to the server and no private material is ever printed. Success
+    prints one compact JSON line on stdout; any failure prints one JSON line
+    ``{"message", "field"}`` on stderr and exits non-zero.
+    """
+    try:
+        if not is_nonempty_cli_value(args.session_json):
+            raise CryptoError("missing required field: session_json",
+                              "session_json")
+        if not is_nonempty_cli_value(args.identity_private_key):
+            raise CryptoError(
+                "missing required field: identity_private_key",
+                "identity_private_key")
+        try:
+            session_json = _read_key_argument(args.session_json)
+        except OSError as error:
+            raise CryptoError(str(error), "session_json") from None
+        try:
+            identity_private = _read_key_argument(args.identity_private_key)
+        except OSError as error:
+            raise CryptoError(str(error),
+                              "identity_private_key") from None
+        ephemeral_private = _read_optional_key_argument(
+            args.ephemeral_private_key, "ephemeral_private_key")
+        prekey_private = _read_optional_key_argument(
+            args.prekey_private_key, "prekey_private_key")
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+
+    try:
+        result = derive_session_key(
+            session_json, args.role, identity_private,
+            ephemeral_private, prekey_private)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
