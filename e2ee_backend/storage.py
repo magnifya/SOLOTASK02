@@ -140,6 +140,9 @@ SYNC_DEVICE_UNKNOWN = "device_unknown"
 SYNC_DEVICE_INACTIVE = "device_inactive"
 SYNC_DEVICE_NOT_MEMBER = "device_not_member"
 SYNC_CURSOR_CONFLICT = "cursor_conflict"
+SYNC_MESSAGE_UNKNOWN = "message_unknown"
+SYNC_BAD_SEQUENCE = "bad_sequence"
+SYNC_OWN_MESSAGE = "own_message"
 
 #: Outcome codes for unified 1:1/group-session message sync.
 MESSAGE_SYNC_SESSION_UNKNOWN = "session_unknown"
@@ -584,6 +587,20 @@ class MessageSyncAckBatchError(Exception):
 
 class GroupSyncAckBatchError(Exception):
     """A device-scoped group-session batch sync-ack failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item; validation runs in array order and the whole batch
+    writes nothing.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
+class GroupSyncAckMessagesError(Exception):
+    """A device-scoped selective group-message ack failed at one item.
 
     Carries the zero-based *index* of the first (and only reported)
     offending item; validation runs in array order and the whole batch
@@ -2458,6 +2475,108 @@ class DeviceStore:
                 "updated_at": record.updated_at,
             } for plan, record in zip(plans, records)]
             return results, any_advanced
+
+    def group_sync_ack_messages(
+            self, device_id: str,
+            items: List[Tuple[str, str, int]]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Selectively ack scattered messages across group sessions.
+
+        *items* are ``(session_id, message_id, sequence)`` triples already
+        validated for shape and unique ``(session_id, message_id)`` pairs by
+        the service. The device must exist and not be revoked (a
+        batch-level ``device_unknown``/``device_inactive``
+        :class:`GroupSyncError`). Items are then validated in array order;
+        the first failure raises
+        :class:`GroupSyncAckMessagesError` carrying that item's index and
+        the batch writes nothing:
+
+        * an unknown session (neither a group nor a 1:1 session) ->
+          ``session_unknown`` (404);
+        * a 1:1 session, or a group session the device was not frozen into
+          -> ``device_not_member`` (409);
+        * an unknown ``message_id`` inside the session ->
+          ``message_unknown`` (404);
+        * a ``sequence`` different from the message's stored sequence ->
+          ``bad_sequence`` (409);
+        * a message the device itself sent -> ``own_message`` (409).
+
+        Membership is the frozen snapshot, so a removed member still acks
+        and a later-added member cannot. On success each first-time ack
+        marks the per-device ``group_delivery`` record (created on demand)
+        ``acked`` with ``ack_sequence`` equal to the message sequence,
+        removing the message from this device's group inbox; already-acked
+        items write nothing. Sync cursors, paging, ``attempts`` and the
+        attempt-id dedup sets are never touched. All first-time acks share
+        the single persistence notification under the one store lock (so a
+        durable write failure rolls the whole batch back: delivery flags
+        and the generation). Returns ``(results, any_first_ack)`` with one
+        ``session_id``/``message_id``/``acked=true`` result per item, in
+        input order; replays return the same results.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise GroupSyncError(SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise GroupSyncError(SYNC_DEVICE_INACTIVE)
+            plans: List[Dict[str, Any]] = []
+            for index, (session_id, message_id, sequence) in enumerate(items):
+                session = self._group_sessions.get(session_id)
+                if session is None:
+                    reason = SYNC_DEVICE_NOT_MEMBER \
+                        if self._sessions.get(session_id) is not None \
+                        else SYNC_SESSION_UNKNOWN
+                    raise GroupSyncAckMessagesError(reason, index)
+                if device_id not in session.members:
+                    raise GroupSyncAckMessagesError(
+                        SYNC_DEVICE_NOT_MEMBER, index)
+                message = next(
+                    (m for m in self._messages.get(session_id, [])
+                     if m.message_id == message_id), None)
+                if message is None:
+                    raise GroupSyncAckMessagesError(
+                        SYNC_MESSAGE_UNKNOWN, index)
+                if sequence != message.sequence:
+                    raise GroupSyncAckMessagesError(
+                        SYNC_BAD_SEQUENCE, index)
+                if message.sender_device_id == device_id:
+                    raise GroupSyncAckMessagesError(
+                        SYNC_OWN_MESSAGE, index)
+                # Validate in array order; only after every item passes are
+                # any of them committed below.
+                plans.append({
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "message": message,
+                })
+            any_first_ack = False
+            for plan in plans:
+                key = (plan["session_id"], plan["message_id"], device_id)
+                state = self._group_delivery.get(key)
+                if state is not None and state.acked:
+                    continue
+                # The first ack (also creating the record when no retry
+                # ever happened) is the only transition: the acked flag and
+                # sequence commit atomically with every other first ack,
+                # leaving attempts/attempt ids untouched.
+                if state is None:
+                    state = MessageDelivery()
+                    self._group_delivery[key] = state
+                state.acked = True
+                state.ack_sequence = plan["message"].sequence
+                any_first_ack = True
+            if any_first_ack:
+                # One persistence notification for the whole batch: all the
+                # per-message acks commit (or roll back) together and the
+                # generation advances at most once.
+                self._notify_change()
+            results = [{
+                "session_id": plan["session_id"],
+                "message_id": plan["message_id"],
+                "acked": True,
+            } for plan in plans]
+            return results, any_first_ack
 
     # -- unified 1:1/group-session sync ------------------------------------
 

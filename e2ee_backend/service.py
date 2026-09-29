@@ -133,6 +133,9 @@ from .storage import (
     SYNC_DEVICE_INACTIVE,
     SYNC_DEVICE_NOT_MEMBER,
     SYNC_DEVICE_UNKNOWN,
+    SYNC_MESSAGE_UNKNOWN,
+    SYNC_BAD_SEQUENCE,
+    SYNC_OWN_MESSAGE,
     SYNC_SESSION_UNKNOWN,
     DeviceStore,
     DeviceUpdateError,
@@ -143,6 +146,7 @@ from .storage import (
     GroupSessionRotationError,
     GroupSyncError,
     GroupSyncAckBatchError,
+    GroupSyncAckMessagesError,
     MessageCreateError,
     MessageListError,
     InboxRetryBatchError,
@@ -1437,6 +1441,152 @@ class DeviceService:
             raise ServiceError(text, field, status_code=status_code)
         body = {"device_id": device_id, "results": results}
         return body, 201 if any_advanced else 200
+
+    def group_sync_ack_messages(self, device_id: str,
+                                payload: object
+                                ) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one device's selective multi-group-message ack.
+
+        ``POST /v1/devices/{device_id}/group-sync/ack-messages``. The body
+        must be an object carrying only a non-empty ``items`` array of
+        objects, each with exactly a non-empty string ``session_id``, a
+        non-empty string ``message_id`` and a non-negative non-bool
+        non-float integer ``sequence``, with no repeated
+        ``(session_id, message_id)`` pair. Shape errors are reported, in
+        order, as 400/field ``request_body`` (bad/non-object body), the
+        offending key name (a top-level key other than ``items``),
+        ``items`` (missing/not-a-non-empty-array), ``items[i]``
+        (non-object element, an unexpected element key or a repeated
+        session/message pair) or ``items[i].session_id`` /
+        ``items[i].message_id`` / ``items[i].sequence`` for the offending
+        field.
+
+        The device is then resolved (unknown/revoked -> 409/field
+        ``device_id``) and items are validated in array order, the first
+        error aborting the whole batch with nothing written: an unknown
+        session id is 404/``items[i].session_id``; a 1:1 session or a group
+        session the device was not frozen into is
+        409/``items[i].session_id`` (a removed member still acks; a
+        later-added member cannot); an unknown message is
+        404/``items[i].message_id``; a mismatched sequence is
+        409/``items[i].sequence``; a message the device itself sent is
+        409/``items[i].message_id``. On success the body is ``device_id``
+        then ``results``; results keep input order and each item is
+        ``session_id``/``message_id``/``acked=true``. Every first-time ack
+        removes the message from the device's group inbox; sync cursors,
+        paging, ``attempts`` and attempt-id sets never change. Status is
+        201 when at least one item is acked for the first time and 200
+        otherwise; replays return the same results.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        extras = [key for key in payload if key != "items"]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+
+        items: List[Tuple[str, str, int]] = []
+        seen_pairs: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            element_extras = [
+                key for key in element
+                if key not in ("session_id", "message_id", "sequence")]
+            if element_extras:
+                raise ServiceError(
+                    f"unexpected field: {item_field}.{element_extras[0]}",
+                    item_field)
+            session_field = f"{item_field}.session_id"
+            if "session_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {session_field}",
+                    session_field)
+            if not is_nonempty_string(element["session_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {session_field}",
+                    session_field)
+            message_field = f"{item_field}.message_id"
+            if "message_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {message_field}",
+                    message_field)
+            if not is_nonempty_string(element["message_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {message_field}",
+                    message_field)
+            sequence_field = f"{item_field}.sequence"
+            if "sequence" not in element:
+                raise ServiceError(
+                    f"missing required field: {sequence_field}",
+                    sequence_field)
+            sequence = element["sequence"]
+            # bool is a subclass of int; reject it and floats explicitly.
+            if not isinstance(sequence, int) or isinstance(sequence, bool):
+                raise ServiceError(
+                    f"field must be an integer: {sequence_field}",
+                    sequence_field)
+            if sequence < 0:
+                raise ServiceError(
+                    f"field must be a non-negative integer: "
+                    f"{sequence_field}",
+                    sequence_field)
+            pair = (element["session_id"], element["message_id"])
+            if pair in seen_pairs:
+                raise ServiceError(
+                    "duplicate session_id/message_id pair in items: "
+                    f"{pair[0]}/{pair[1]}", item_field)
+            seen_pairs.add(pair)
+            items.append((element["session_id"], element["message_id"],
+                          sequence))
+
+        try:
+            results, any_first_ack = self.store.group_sync_ack_messages(
+                device_id, items)
+        except GroupSyncError as error:
+            # Batch-level device failure (unknown/revoked): 409/device_id.
+            raise self._sync_error(error, device_id)
+        except GroupSyncAckMessagesError as error:
+            session_id = items[error.index][0]
+            message_id = items[error.index][1]
+            sequence = items[error.index][2]
+            if error.reason == SYNC_SESSION_UNKNOWN:
+                field = f"items[{error.index}].session_id"
+                text = f"session not found: {session_id}"
+                status_code = 404
+            elif error.reason == SYNC_MESSAGE_UNKNOWN:
+                field = f"items[{error.index}].message_id"
+                text = f"message not found: {message_id}"
+                status_code = 404
+            elif error.reason == SYNC_BAD_SEQUENCE:
+                field = f"items[{error.index}].sequence"
+                text = ("sequence does not match the message "
+                        f"(got {sequence})")
+                status_code = 409
+            elif error.reason == SYNC_OWN_MESSAGE:
+                field = f"items[{error.index}].message_id"
+                text = "a device cannot acknowledge its own message"
+                status_code = 409
+            else:
+                # A 1:1 session, or a group session the device was not
+                # frozen into, is not group-ack-able here.
+                field = f"items[{error.index}].session_id"
+                text = ("session is not a group session or device is not "
+                        "a frozen member")
+                status_code = 409
+            raise ServiceError(text, field, status_code=status_code)
+        body = {"device_id": device_id, "results": results}
+        return body, 201 if any_first_ack else 200
 
     def device_inbox(self, device_id: str, limit: int) -> Dict[str, Any]:
         """Return one device's aggregated 1:1 offline-inbox page (read-only).
