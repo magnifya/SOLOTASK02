@@ -133,6 +133,7 @@ from .storage import (
     SYNC_DEVICE_INACTIVE,
     SYNC_DEVICE_NOT_MEMBER,
     SYNC_DEVICE_UNKNOWN,
+    SYNC_SESSION_NOT_GROUP,
     SYNC_SESSION_UNKNOWN,
     DeviceStore,
     DeviceUpdateError,
@@ -140,6 +141,7 @@ from .storage import (
     ClaimSessionError,
     DeliveryError,
     GroupError,
+    GroupSyncAckBatchError,
     GroupSessionRotationError,
     GroupSyncError,
     MessageCreateError,
@@ -1323,6 +1325,121 @@ class DeviceService:
                 text = ("session is a group session or device is not its "
                         "recipient")
             raise ServiceError(text, field, status_code=status_code)
+        body = {"device_id": device_id, "results": results}
+        return body, 201 if any_advanced else 200
+
+    def sync_group_ack_batch(self, device_id: str,
+                             payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one device's multi-group-session batch sync-ack.
+
+        ``POST /v1/devices/{device_id}/group-sync/ack-batch``. The body must
+        be an object carrying exactly one key, a non-empty ``items`` array of
+        objects that each carry exactly a non-empty string ``session_id`` and
+        a non-negative non-bool integer ``cursor``, with no repeated session.
+        Shape errors are reported, in order, as 400/field ``request_body``
+        (bad/non-object body), the offending key (an extra top-level key),
+        ``items`` (missing or not a non-empty array), ``items[i]`` (a
+        non-object element, an extra item key or a repeated session),
+        ``items[i].session_id`` (missing, empty or non-string) or
+        ``items[i].cursor`` (missing, boolean, fractional or negative).
+
+        The path device is then resolved (unknown/revoked -> 409/field
+        ``device_id``) and items are validated in array order, the first
+        error aborting the whole batch with nothing written: an id that
+        names neither a group nor a 1:1 session is 404/
+        ``items[i].session_id``; a 1:1 session or a group session the device
+        was not frozen into is 409/``items[i].session_id``; a cursor below
+        the stored group cursor (0 initially) or above the session's max
+        sequence is 409/``items[i].cursor``. On success the body is
+        ``device_id`` then ``results``; results keep input order and each
+        item is ``session_id``/``cursor``/``updated_at``. Every advancing
+        item shares one UTC timestamp; equal items write nothing (a
+        never-advanced cursor reports the group session's ``created_at``).
+        Status is 201 when at least one cursor advanced and 200 otherwise.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # The body carries exactly items; any other key is 400 with that
+        # field (the first extra key, in payload order).
+        extras = [key for key in payload if key != "items"]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+
+        items: List[Tuple[str, int]] = []
+        seen_sessions: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            item_extras = [key for key in element
+                           if key not in ("session_id", "cursor")]
+            if item_extras:
+                raise ServiceError(
+                    f"unexpected field in {item_field}: {item_extras[0]}",
+                    item_field)
+            session_field = f"{item_field}.session_id"
+            if "session_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {session_field}", session_field)
+            if not is_nonempty_string(element["session_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {session_field}",
+                    session_field)
+            cursor_field = f"{item_field}.cursor"
+            if "cursor" not in element:
+                raise ServiceError(
+                    f"missing required field: {cursor_field}", cursor_field)
+            cursor = element["cursor"]
+            # bool is a subclass of int; reject it explicitly, alongside
+            # fractional JSON numbers and negatives.
+            if not isinstance(cursor, int) or isinstance(cursor, bool):
+                raise ServiceError(
+                    f"field must be an integer: {cursor_field}", cursor_field)
+            if cursor < 0:
+                raise ServiceError(
+                    f"field must be a non-negative integer: {cursor_field}",
+                    cursor_field)
+            if element["session_id"] in seen_sessions:
+                raise ServiceError(
+                    "duplicate session_id in items: "
+                    f"{element['session_id']}", item_field)
+            seen_sessions.add(element["session_id"])
+            items.append((element["session_id"], cursor))
+
+        try:
+            results, any_advanced = self.store.group_sync_ack_batch(
+                device_id, items)
+        except GroupSyncError as error:
+            # Batch-level device failure (unknown/revoked): 409/device_id.
+            raise self._sync_error(error, device_id)
+        except GroupSyncAckBatchError as error:
+            session_id = items[error.index][0]
+            field_index = f"items[{error.index}]"
+            if error.reason == SYNC_SESSION_UNKNOWN:
+                raise ServiceError(
+                    f"session not found: {session_id}",
+                    f"{field_index}.session_id", status_code=404)
+            if error.reason == SYNC_CURSOR_CONFLICT:
+                raise ServiceError(
+                    "cursor is out of range or moved backwards",
+                    f"{field_index}.cursor", status_code=409)
+            if error.reason == SYNC_SESSION_NOT_GROUP:
+                text = "session is not a group session"
+            else:
+                text = ("device_id is not a frozen member of this group "
+                        "session")
+            raise ServiceError(
+                text, f"{field_index}.session_id", status_code=409)
         body = {"device_id": device_id, "results": results}
         return body, 201 if any_advanced else 200
 
