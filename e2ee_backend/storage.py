@@ -158,6 +158,14 @@ INBOX_RETRY_NOT_RECIPIENT = "session_not_recipient"
 INBOX_RETRY_MESSAGE_UNKNOWN = "message_unknown"
 INBOX_RETRY_MESSAGE_ACKED = "message_acked"
 
+#: Outcome codes for a device group-inbox retry batch.
+GROUP_INBOX_RETRY_SESSION_UNKNOWN = "group_session_unknown"
+GROUP_INBOX_RETRY_NOT_GROUP = "session_not_group"
+GROUP_INBOX_RETRY_NOT_MEMBER = "group_session_not_member"
+GROUP_INBOX_RETRY_IS_SENDER = "group_session_is_sender"
+GROUP_INBOX_RETRY_MESSAGE_UNKNOWN = "group_message_unknown"
+GROUP_INBOX_RETRY_MESSAGE_ACKED = "group_message_acked"
+
 #: Outcome codes for a 1:1-inbox redelivery lease claim.
 INBOX_LEASE_DEVICE_UNKNOWN = "device_unknown"
 INBOX_LEASE_DEVICE_INACTIVE = "device_inactive"
@@ -602,6 +610,20 @@ class GroupSyncAckBatchError(Exception):
 
 class InboxRetryBatchError(Exception):
     """A device 1:1-inbox retry batch failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported) offending
+    item; items are prechecked in array order and the whole batch writes
+    nothing.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
+class GroupInboxRetryBatchError(Exception):
+    """A device group-inbox retry batch failed at one array item.
 
     Carries the zero-based *index* of the first (and only reported) offending
     item; items are prechecked in array order and the whole batch writes
@@ -7079,6 +7101,102 @@ class DeviceStore:
                 "message_id": message.message_id,
                 "attempts": self._delivery[
                     (session_id, message.message_id)].attempts,
+            } for session_id, message in targets]
+            return results, any_new
+
+    def group_inbox_retry_batch(
+            self, device_id: str, attempt_id: str,
+            items: List[Tuple[str, str]]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Record one ``attempt_id`` against many unacked group messages.
+
+        Group counterpart of :meth:`inbox_retry_batch`. *items* are
+        ``(session_id, message_id)`` pairs already validated for shape and
+        pair uniqueness by the service. The path device must exist and not be
+        revoked (a batch-level :class:`MessageSyncError`), checked ahead of
+        every item. Items are then prechecked in array order and the first
+        failure raises :class:`GroupInboxRetryBatchError` carrying that item's
+        index; the batch writes nothing:
+
+        * a session that is neither a 1:1 nor a group session ->
+          ``group_session_unknown`` (404);
+        * a 1:1 session -> ``session_not_group`` (409);
+        * a group session whose frozen member snapshot does not contain the
+          device (a device removed after the freeze stays authorized; a device
+          added later never is) -> ``group_session_not_member`` (409);
+        * a message the session does not hold -> ``group_message_unknown``
+          (404);
+        * a message the device itself sent -> ``group_session_is_sender``
+          (409);
+        * a message already acked by the device -> ``group_message_acked``
+          (409).
+
+        Only after every item passes does the commit run, under the one store
+        lock: the single *attempt_id* is added to each target's per-device
+        ``group_delivery`` dedup set. A record whose set already held the id
+        is a replay (its ``attempts`` is not counted); otherwise the record
+        is created as needed and ``attempts`` advances by one. All targets
+        share one persistence notification, so the batch commits as one
+        generation and a durable write failure rolls every record back.
+        Returns ``(results, any_new)`` with one three-field
+        (``session_id``/``message_id``/``attempts``) result per item, in
+        input order; when no item added the id nothing is persisted.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
+            targets: List[Tuple[str, Message]] = []
+            for index, (session_id, message_id) in enumerate(items):
+                group_session = self._group_sessions.get(session_id)
+                if group_session is None:
+                    reason = GROUP_INBOX_RETRY_NOT_GROUP \
+                        if self._sessions.get(session_id) is not None \
+                        else GROUP_INBOX_RETRY_SESSION_UNKNOWN
+                    raise GroupInboxRetryBatchError(reason, index)
+                if device_id not in group_session.members:
+                    raise GroupInboxRetryBatchError(
+                        GROUP_INBOX_RETRY_NOT_MEMBER, index)
+                message = next((m for m in self._messages.get(session_id, [])
+                                if m.message_id == message_id), None)
+                if message is None:
+                    raise GroupInboxRetryBatchError(
+                        GROUP_INBOX_RETRY_MESSAGE_UNKNOWN, index)
+                if message.sender_device_id == device_id:
+                    raise GroupInboxRetryBatchError(
+                        GROUP_INBOX_RETRY_IS_SENDER, index)
+                state = self._group_delivery.get(
+                    (session_id, message_id, device_id))
+                if state is not None and state.acked:
+                    raise GroupInboxRetryBatchError(
+                        GROUP_INBOX_RETRY_MESSAGE_ACKED, index)
+                # Precheck in array order; only after every item passes are
+                # any dedup sets touched below.
+                targets.append((session_id, message))
+            any_new = False
+            for session_id, message in targets:
+                key = (session_id, message.message_id, device_id)
+                state = self._group_delivery.get(key)
+                if state is not None and attempt_id in state.attempt_ids:
+                    continue
+                if state is None:
+                    state = MessageDelivery()
+                    self._group_delivery[key] = state
+                state.attempt_ids.add(attempt_id)
+                state.attempts += 1
+                any_new = True
+            if any_new:
+                # One persistence notification for the whole batch: all the
+                # per-device dedup sets and counters commit (or roll back)
+                # together and the generation advances at most once.
+                self._notify_change()
+            results = [{
+                "session_id": session_id,
+                "message_id": message.message_id,
+                "attempts": self._group_delivery[
+                    (session_id, message.message_id, device_id)].attempts,
             } for session_id, message in targets]
             return results, any_new
 
