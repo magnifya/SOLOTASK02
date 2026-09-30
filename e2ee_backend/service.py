@@ -7,7 +7,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from .crypto import is_nonempty_string, load_public_key
+from .crypto import (
+    decode_ed25519_signature,
+    is_nonempty_string,
+    load_ed25519_public_key,
+    load_public_key,
+    verify_signed_prekey,
+)
 from .models import Device, SignedPreKey
 from .persistence import IntegrityCheckError
 from .storage import (
@@ -299,6 +305,97 @@ class DeviceService:
             identity_key=payload["identity_key"],
             prekeys=prekeys,
         )
+        return self._publish_device(device)
+
+    def register_verified(self, payload: object) -> Dict[str, Any]:
+        """Validate a verified registration with signed pre-key proofs.
+
+        Same shape as :meth:`register` plus a non-empty ``signature`` per
+        signed pre-key. The ``identity_key`` must be an Ed25519 public key
+        and every signature must be a standard-base64 64-byte Ed25519
+        signature over the domain-separated canonical proof of that entry's
+        ``device_id``/``key_id``/``public_key``/``user_id``. Every check
+        passes before any state is written: a malformed field, a
+        non-Ed25519/illegal identity key, an illegal public key, a duplicate
+        ``key_id``, bad base64 or signature length, or a proof that does not
+        verify is a 400 naming the exact field path; nothing is registered
+        and no pre-key is consumed. A duplicate ``(user_id, device_id)`` is
+        the same 409/field=device_id as ordinary registration.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object", "request_body")
+
+        for name in _REQUIRED_SCALAR_FIELDS:
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(f"field must be a non-empty string: {name}", name)
+
+        identity = load_ed25519_public_key(payload["identity_key"])
+        if identity is None:
+            raise ServiceError(
+                "field is not a valid Ed25519 public key: identity_key",
+                "identity_key")
+
+        if "signed_prekeys" not in payload:
+            raise ServiceError("missing required field: signed_prekeys",
+                               "signed_prekeys")
+        raw_prekeys = payload["signed_prekeys"]
+        if not isinstance(raw_prekeys, list):
+            raise ServiceError("field must be an array: signed_prekeys",
+                               "signed_prekeys")
+
+        prekeys: List[SignedPreKey] = []
+        seen_key_ids: set = set()
+        for index, element in enumerate(raw_prekeys):
+            prefix = f"signed_prekeys[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(f"array element must be an object: {prefix}", prefix)
+            for subfield in ("key_id", "public_key", "signature"):
+                path = f"{prefix}.{subfield}"
+                if subfield not in element:
+                    raise ServiceError(f"missing required field: {path}", path)
+                if not is_nonempty_string(element[subfield]):
+                    raise ServiceError(
+                        f"field must be a non-empty string: {path}", path)
+            if element["key_id"] in seen_key_ids:
+                raise ServiceError(
+                    f"duplicate key_id in signed_prekeys: {element['key_id']}",
+                    f"{prefix}.key_id")
+            if load_public_key(element["public_key"]) is None:
+                raise ServiceError(
+                    f"field is not a valid public key: {prefix}.public_key",
+                    f"{prefix}.public_key")
+            signature = decode_ed25519_signature(element["signature"])
+            if signature is None:
+                raise ServiceError(
+                    f"field must be a standard base64 64-byte Ed25519 "
+                    f"signature: {prefix}.signature",
+                    f"{prefix}.signature")
+            if not verify_signed_prekey(
+                    identity, signature,
+                    payload["user_id"], payload["device_id"],
+                    element["key_id"], element["public_key"]):
+                raise ServiceError(
+                    f"signed pre-key proof failed verification: {prefix}.signature",
+                    f"{prefix}.signature")
+            seen_key_ids.add(element["key_id"])
+            prekeys.append(SignedPreKey(element["key_id"], element["public_key"]))
+
+        device = Device(
+            user_id=payload["user_id"],
+            device_id=payload["device_id"],
+            identity_key=payload["identity_key"],
+            prekeys=prekeys,
+        )
+        return self._publish_device(device)
+
+    def _publish_device(self, device: Device) -> Dict[str, Any]:
+        """Insert a fully validated device and return the 201 body.
+
+        Shared by ordinary and verified registration; a duplicate device id
+        is a 409/field=device_id.
+        """
         if not self.store.add_device(device):
             raise ServiceError(
                 f"device_id already registered: {device.device_id}",

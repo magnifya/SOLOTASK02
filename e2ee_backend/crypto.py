@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 
-from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
+from cryptography.exceptions import (
+    InvalidSignature,
+    InvalidTag,
+    UnsupportedAlgorithm,
+)
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -25,6 +30,11 @@ GCM_NONCE_BYTES = 12
 GCM_TAG_BYTES = 16
 #: AES-256 key size in bytes.
 AES_KEY_BYTES = 32
+
+#: Domain-separation prefix for the signed pre-key proof message.
+SIGNED_PREKEY_PROOF_PREFIX = "E2EE-SIGNED-PREKEY-V1"
+#: Length of an Ed25519 signature in bytes.
+ED25519_SIGNATURE_BYTES = 64
 
 
 class CryptoError(Exception):
@@ -200,3 +210,118 @@ def load_public_key(value: str) -> Optional[object]:
         if der is not None:
             return der
     return None
+
+
+def _load_ed25519_raw(data: bytes) -> Optional[ed25519.Ed25519PublicKey]:
+    """Parse a raw 32-byte Ed25519 public point; return ``None`` on failure."""
+    if len(data) != 32:
+        return None
+    try:
+        return ed25519.Ed25519PublicKey.from_public_bytes(data)
+    except (ValueError, UnsupportedAlgorithm):
+        return None
+
+
+def _load_ed25519_der(data: bytes) -> Optional[ed25519.Ed25519PublicKey]:
+    """Parse a DER SubjectPublicKeyInfo key; keep it only when it is Ed25519."""
+    try:
+        key = serialization.load_der_public_key(data)
+    except (ValueError, UnsupportedAlgorithm, TypeError):
+        return None
+    return key if isinstance(key, ed25519.Ed25519PublicKey) else None
+
+
+def load_ed25519_public_key(value: str) -> Optional[ed25519.Ed25519PublicKey]:
+    """Parse *value* strictly as an Ed25519 public key.
+
+    Accepts the same encodings as :func:`load_public_key` — PEM text,
+    standard base64 (padding optional) or hex DER SubjectPublicKeyInfo, and
+    standard base64 or hex of a raw 32-byte point — but only an Ed25519 key
+    is accepted: an X25519 key or any other algorithm yields ``None``.
+    """
+    if not is_nonempty_string(value):
+        return None
+
+    # 1) PEM text.
+    try:
+        key = serialization.load_pem_public_key(value.encode("ascii"))
+    except (ValueError, UnsupportedAlgorithm, TypeError):
+        pass
+    else:
+        return key if isinstance(key, ed25519.Ed25519PublicKey) else None
+
+    # 2) Encoded bytes: a hex string can also be valid base64, so both
+    #    decodings are candidates; the first one that parses as Ed25519 wins.
+    candidates: list[bytes] = []
+    blob = _decode_base64(value)
+    if blob is not None:
+        candidates.append(blob)
+    blob = _decode_hex(value)
+    if blob is not None and blob not in candidates:
+        candidates.append(blob)
+
+    # 3) Raw 32-byte Ed25519 point first, otherwise DER SubjectPublicKeyInfo.
+    for candidate in candidates:
+        raw = _load_ed25519_raw(candidate)
+        if raw is not None:
+            return raw
+        der = _load_ed25519_der(candidate)
+        if der is not None:
+            return der
+    return None
+
+
+def decode_ed25519_signature(value: object) -> Optional[bytes]:
+    """Decode a standard-base64 Ed25519 signature that must be 64 bytes.
+
+    Returns the raw 64-byte signature, or ``None`` when *value* is not a
+    string, is not canonical standard base64 (correct padding and alphabet
+    only — no whitespace or URL-safe alphabet), or does not decode to
+    exactly 64 bytes. Re-encoding the decoded bytes must reproduce the
+    input, so non-canonical padding/spellings are refused too.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(raw) != ED25519_SIGNATURE_BYTES:
+        return None
+    if base64.b64encode(raw).decode("ascii") != value:
+        return None
+    return raw
+
+
+def signed_prekey_proof_message(user_id: str, device_id: str, key_id: str,
+                                public_key: str) -> bytes:
+    """Build the exact bytes an identity key signs for one signed pre-key.
+
+    The message is the domain prefix ``E2EE-SIGNED-PREKEY-V1``, one newline,
+    then compact JSON of the four fields with keys sorted
+    (``device_id``, ``key_id``, ``public_key``, ``user_id``) and Unicode
+    written as-is. The string values are the request's original strings, so
+    the caller passes them through unmodified.
+    """
+    document = json.dumps(
+        {"device_id": device_id, "key_id": key_id,
+         "public_key": public_key, "user_id": user_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (SIGNED_PREKEY_PROOF_PREFIX + "\n" + document).encode("utf-8")
+
+
+def verify_signed_prekey(identity_key: ed25519.Ed25519PublicKey,
+                         signature: bytes, user_id: str, device_id: str,
+                         key_id: str, public_key: str) -> bool:
+    """Verify one signed pre-key proof against the Ed25519 identity key.
+
+    Returns ``True`` iff *signature* is valid over
+    :func:`signed_prekey_proof_message` for the four field values.
+    """
+    message = signed_prekey_proof_message(
+        user_id, device_id, key_id, public_key)
+    try:
+        identity_key.verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True

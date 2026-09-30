@@ -55,6 +55,38 @@ def _parse_prekey(spec: str) -> Dict[str, str]:
     return {"key_id": key_id, "public_key": public_key.strip()}
 
 
+def _parse_verified_prekey(spec: str) -> Dict[str, str]:
+    """Parse ``key_id:public_key:signature``; ``@path`` loads a JSON mapping.
+
+    The signature is the standard-base64 64-byte Ed25519 signature over the
+    pre-key proof. Neither base64 nor PEM text contains a colon, so the
+    first two colons delimit the three fields (a split with at most two
+    separators, so trailing padding ``=`` survives).
+    """
+    if spec.startswith("@"):
+        with open(spec[1:], "r", encoding="utf-8") as handle:
+            element = json.load(handle)
+        if (not isinstance(element, dict)
+                or not isinstance(element.get("key_id"), str)
+                or not isinstance(element.get("public_key"), str)
+                or not isinstance(element.get("signature"), str)):
+            raise ValueError(
+                "verified prekey file must contain key_id, public_key and "
+                f"signature: {spec}")
+        return {"key_id": element["key_id"],
+                "public_key": element["public_key"],
+                "signature": element["signature"]}
+
+    parts = spec.split(":", 2)
+    if len(parts) != 3 or not parts[0] \
+            or not parts[1].strip() or not parts[2].strip():
+        raise ValueError(
+            "verified prekey must have the form "
+            f"KEY_ID:PUBLIC_KEY:SIGNATURE (got: {spec!r})")
+    return {"key_id": parts[0], "public_key": parts[1].strip(),
+            "signature": parts[2].strip()}
+
+
 def _request_json(method: str, url: str, body: Any = None) -> Tuple[int, Any]:
     data = None
     headers = {"Accept": "application/json"}
@@ -105,6 +137,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--prekey", action="append", default=[], metavar="KEY_ID:PUBLIC_KEY",
         help="signed pre-key; repeatable. Use @path for a JSON object file.")
     p_register.set_defaults(handler=cmd_register)
+
+    p_register_verified = sub.add_parser(
+        "register-verified",
+        help="register a device and publish pre-keys with Ed25519 proofs")
+    p_register_verified.add_argument("--user-id", required=True)
+    p_register_verified.add_argument("--device-id", required=True)
+    p_register_verified.add_argument(
+        "--identity-key", required=True,
+        help="Ed25519 identity public key (string), or @path for a file")
+    p_register_verified.add_argument(
+        "--prekey", action="append", default=[],
+        metavar="KEY_ID:PUBLIC_KEY:SIGNATURE",
+        help="signed pre-key with its Ed25519 proof; repeatable. Use @path "
+             "for a JSON object file with key_id/public_key/signature.")
+    p_register_verified.set_defaults(handler=cmd_register_verified)
 
     p_show = sub.add_parser("show", help="show a device's public record")
     p_show.add_argument("device_id")
@@ -446,6 +493,32 @@ def cmd_register(args: argparse.Namespace) -> int:
     try:
         status, response = _request_json("POST", f"{args.base_url}/v1/devices",
                                          body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 201 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status == 201 else 1
+
+
+def cmd_register_verified(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/verified and print the single-line JSON."""
+    try:
+        prekeys: List[Dict[str, str]] = [
+            _parse_verified_prekey(spec) for spec in args.prekey]
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(json.dumps({"message": str(error), "field": "signed_prekeys"}),
+              file=sys.stderr)
+        return 2
+
+    payload = {
+        "user_id": args.user_id,
+        "device_id": args.device_id,
+        "identity_key": _read_key_argument(args.identity_key),
+        "signed_prekeys": prekeys,
+    }
+    try:
+        status, response = _request_json(
+            "POST", f"{args.base_url}/v1/devices/verified", body=payload)
     except ServerUnavailable:
         return _emit_server_error()
     stream = sys.stdout if status == 201 else sys.stderr
