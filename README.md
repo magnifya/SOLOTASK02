@@ -37,6 +37,7 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 接口已实现（纯标准库 HTTP 服务 + `cryptography` 校验公钥），并带有单元/集成测试。
 
 - `POST /v1/devices`：注册设备并发布签名预密钥；成功 `201`，冲突 `409`，校验失败 `400`（错误体带 `field` 指明字段，数组元素使用 `signed_prekeys[i].key_id` 这样的路径）。
+- `POST /v1/devices/verified`（别名 `POST /v1/register-verified`）：带证明的可验证注册。请求体同为含 `user_id`/`device_id`/`identity_key`/`signed_prekeys` 的 JSON；`identity_key` 必须是 Ed25519 公钥（PEM、base64/hex 编码的 DER SPKI，或 32 字节原始点；带算法标记的 X25519 等非 Ed25519 公钥返回 `400/field=identity_key`），每个 `signed_prekeys[i]` 除 `key_id`/`public_key` 外还必须含非空 `signature`：标准 base64 编码的恰好 64 字节 Ed25519 签名，非法 base64 或长度不符返回 `400/field=signed_prekeys[i].signature`。签名消息为 `E2EE-SIGNED-PREKEY-V1` 加一个换行，后接紧凑 JSON（字段按 `device_id`、`key_id`、`public_key`、`user_id` 排序、`ensure_ascii=False`，UTF-8 编码），字符串取请求原值；任一签名验证失败返回 `400/field=signed_prekeys[i].signature`。缺字段、类型错误、`public_key` 非法、`key_id` 重复分别用对应字段路径（`signed_prekeys[i].key_id` 等）返回 `400`，请求体非法沿用 `400/field=request_body`。全部检查通过才写状态：失败不注册设备、不消耗预密钥；成功 `201`，响应仅 `device_id`/`registered_at`，同一 `user_id`+`device_id` 已存在仍为 `409/field=device_id`。已验证预密钥沿用既有顺序、撤销、一次性领取、键审计事件与 version=1 持久化/重启语义；旧的无签名 `POST /v1/devices` 行为不变，但 verified 路由不接受无签名或错误证明的条目。
 - `GET /v1/devices/{device_id}`：返回 `identity_key`、`prekey_ids`（仅未撤销，顺序与注册时一致且重复请求完全相同）、`registered_at`；不存在返回 `404`。
 - `POST /v1/devices/{device_id}/revoke`：撤销设备及其全部预密钥。已存在设备返回 `200`，响应体 `{"device_id":...,"revoked":true}`；重复调用幂等；未知设备返回 `404`（`field=device_id`）。撤销后 `GET` 的 `prekey_ids` 为空，`identity_key` 与 `registered_at` 不变。
 - `POST /v1/devices/{device_id}/prekeys/{key_id}/revoke`：撤销单个预密钥。成功 `200`，响应体 `{"device_id":...,"key_id":...,"revoked":true}`；重复调用幂等；未知设备 `404/field=device_id`，设备存在但 `key_id` 未知 `404/field=key_id`。仅排除目标 key，其他 key 与同用户的其他设备不受影响。
@@ -169,6 +170,15 @@ python3 -m e2ee_backend register \
   --prekey 1:BASE64_OR_PEM_PUBLIC_KEY \
   --prekey 2:BASE64_OR_PEM_PUBLIC_KEY
 # => {"device_id":"laptop","registered_at":"2026-09-19T10:10:50.232732+00:00"}
+
+# 带签名证明的注册（--prekey 可重复，格式 KEY_ID:PUBLIC_KEY:SIGNATURE，
+# 或 @文件 读取含 key_id/public_key/signature 的 JSON 对象；
+# identity_key 须为 Ed25519 公钥，签名消息为 E2EE-SIGNED-PREKEY-V1\n+紧凑 JSON）
+python3 -m e2ee_backend register-verified \
+  --user-id alice --device-id laptop \
+  --identity-key  ED25519_BASE64_OR_PEM_PUBLIC_KEY \
+  --prekey 1:BASE64_OR_PEM_PUBLIC_KEY:STANDARD_BASE64_ED25519_SIGNATURE
+# => {"device_id":"laptop","registered_at":"…"}
 
 # 查询
 python3 -m e2ee_backend show laptop
@@ -345,7 +355,7 @@ e2ee_backend/
   persistence.py  # version=1 JSON 状态文件：缺失创建、损坏/版本不符拒启、临时文件+fsync+硬链接备份+os.replace+父目录 fsync（平台不支持时安全跳过）原子替换，不可判定失败后在存储锁内同进程自愈（校验并硬链接提升唯一 .bak、清理遗留、再提交当前请求；两个及以上可验证候选拒绝提升、绝不按名或 mtime 选；连正式路径都无法腾空时落 .state-*.block 标记进入阻断态、一切写 503 且不把残留正式文件当权威，路径腾出且唯一可验证备份时才硬链接提升解阻），启动清理/恢复崩溃遗留快照（同代多候选同样拒绝）
   locking.py      # --data-file 状态文件的进程级非阻塞独占锁：POSIX flock、Windows msvcrt.locking 字节区间锁，锁文件只创建不截断、不参与崩溃遗留扫描
   service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/群组/群会话/群会话轮换/消息/投递/群同步）
-  http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、群组创建/查询/成员增删、群组会话协商/查询/轮换、消息投递/幂等提交与拉取、重试/确认/状态、群会话同步与检查点、会话同步批量确认 sync/ack、补投事件保留 event-gc、只读持久化完整性探针 /v1/persistence/integrity）
-  cli.py          # register/show/key-events/revoke-*/rotate-identity-key/add-prekey/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
+  http_app.py     # POST/GET 路由与 JSON 响应（注册、签名证明注册 /v1/devices/verified 与 /v1/register-verified、查询、两类撤销、会话协商与查询、群组创建/查询/成员增删、群组会话协商/查询/轮换、消息投递/幂等提交与拉取、重试/确认/状态、群会话同步与检查点、会话同步批量确认 sync/ack、补投事件保留 event-gc、只读持久化完整性探针 /v1/persistence/integrity）
+  cli.py          # register/register-verified/show/key-events/revoke-*/rotate-identity-key/add-prekey/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
 tests/            # unittest 测试
 ```

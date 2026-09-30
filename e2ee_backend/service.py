@@ -5,9 +5,17 @@ stores identifiers and public-key material only.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
-from .crypto import is_nonempty_string, load_public_key
+from cryptography.exceptions import InvalidSignature
+
+from .crypto import (
+    decode_ed25519_signature,
+    is_nonempty_string,
+    load_ed25519_public_key,
+    load_public_key,
+)
 from .models import Device, SignedPreKey
 from .persistence import IntegrityCheckError
 from .storage import (
@@ -306,6 +314,130 @@ class DeviceService:
 
         return {"device_id": device.device_id,
                 "registered_at": device.registered_at}
+
+    # -- verified registration --------------------------------------------
+
+    def register_verified(self, payload: object) -> Dict[str, Any]:
+        """Validate and persist a proof-bearing registration; return the body.
+
+        Unlike :meth:`register`, the ``identity_key`` must be an Ed25519
+        public key and every entry of ``signed_prekeys`` must carry a
+        non-empty ``signature``: a standard-base64, 64-byte Ed25519 signature
+        by that identity key over the pre-key proof.
+
+        The signed message is ``E2EE-SIGNED-PREKEY-V1`` followed by one LF
+        and the compact JSON object of the entry with its four fields sorted
+        (``device_id``, ``key_id``, ``public_key``, ``user_id``); Unicode is
+        written as-is and the strings are the request's original values.
+        Every structural check and every signature is verified before any
+        state is written, so a rejected request neither registers the device
+        nor consumes a pre-key. On success the registration is published
+        exactly like :meth:`register`; an existing ``(user_id, device_id)``
+        (or a globally reused device id) is 409/field=device_id.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+
+        for name in _REQUIRED_SCALAR_FIELDS:
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+
+        if "signed_prekeys" not in payload:
+            raise ServiceError("missing required field: signed_prekeys",
+                               "signed_prekeys")
+        raw_prekeys = payload["signed_prekeys"]
+        if not isinstance(raw_prekeys, list):
+            raise ServiceError("field must be an array: signed_prekeys",
+                               "signed_prekeys")
+
+        parsed: List[Tuple[SignedPreKey, bytes]] = []
+        seen_key_ids: set = set()
+        for index, element in enumerate(raw_prekeys):
+            prefix = f"signed_prekeys[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {prefix}", prefix)
+            for subfield in ("key_id", "public_key", "signature"):
+                path = f"{prefix}.{subfield}"
+                if subfield not in element:
+                    raise ServiceError(f"missing required field: {path}", path)
+                if not is_nonempty_string(element[subfield]):
+                    raise ServiceError(
+                        f"field must be a non-empty string: {path}", path)
+            if load_public_key(element["public_key"]) is None:
+                raise ServiceError(
+                    f"field is not a valid public key: {prefix}.public_key",
+                    f"{prefix}.public_key")
+            raw_signature = decode_ed25519_signature(element["signature"])
+            if raw_signature is None:
+                raise ServiceError(
+                    f"field must be standard base64 encoding exactly 64 "
+                    f"bytes: {prefix}.signature",
+                    f"{prefix}.signature")
+            if element["key_id"] in seen_key_ids:
+                raise ServiceError(
+                    f"duplicate key_id in signed_prekeys: {element['key_id']}",
+                    f"{prefix}.key_id")
+            seen_key_ids.add(element["key_id"])
+            parsed.append((SignedPreKey(element["key_id"],
+                                        element["public_key"]),
+                           raw_signature))
+
+        # Same checkpoint as legacy registration (structure fully validated,
+        # identity key checked last), but the identity must be Ed25519.
+        identity = load_ed25519_public_key(payload["identity_key"])
+        if identity is None:
+            raise ServiceError(
+                "field is not a valid Ed25519 public key: identity_key",
+                "identity_key")
+
+        # All structure is valid; only now do the cryptographic checks, and
+        # only after the last signature verifies is any state written.
+        for index, (prekey, raw_signature) in enumerate(parsed):
+            message = self._signed_prekey_proof(
+                payload["user_id"], payload["device_id"],
+                prekey.key_id, prekey.public_key)
+            try:
+                identity.verify(raw_signature, message)
+            except InvalidSignature:
+                raise ServiceError(
+                    f"signed pre-key proof failed verification: "
+                    f"signed_prekeys[{index}].signature",
+                    f"signed_prekeys[{index}].signature") from None
+
+        device = Device(
+            user_id=payload["user_id"],
+            device_id=payload["device_id"],
+            identity_key=payload["identity_key"],
+            prekeys=[prekey for prekey, _ in parsed],
+        )
+        if not self.store.add_device(device):
+            raise ServiceError(
+                f"device_id already registered: {device.device_id}",
+                "device_id", status_code=409)
+
+        return {"device_id": device.device_id,
+                "registered_at": device.registered_at}
+
+    @staticmethod
+    def _signed_prekey_proof(user_id: str, device_id: str, key_id: str,
+                             public_key: str) -> bytes:
+        """Build the exact bytes an identity key signs for one pre-key.
+
+        ``E2EE-SIGNED-PREKEY-V1``, one LF, then the compact JSON object with
+        fields sorted (``device_id``, ``key_id``, ``public_key``, ``user_id``),
+        Unicode written as-is (``ensure_ascii=False``), UTF-8 encoded. The
+        four string values are the request's original strings.
+        """
+        canonical = json.dumps(
+            {"device_id": device_id, "key_id": key_id,
+             "public_key": public_key, "user_id": user_id},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return b"E2EE-SIGNED-PREKEY-V1\n" + canonical.encode("utf-8")
 
     # -- lookup ------------------------------------------------------------
 

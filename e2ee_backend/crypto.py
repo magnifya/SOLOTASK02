@@ -13,7 +13,7 @@ import base64
 import binascii
 import os
 
-from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
+from cryptography.exceptions import InvalidSignature, InvalidTag, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -25,6 +25,8 @@ GCM_NONCE_BYTES = 12
 GCM_TAG_BYTES = 16
 #: AES-256 key size in bytes.
 AES_KEY_BYTES = 32
+#: Ed25519 signature size in bytes.
+ED25519_SIGNATURE_BYTES = 64
 
 
 class CryptoError(Exception):
@@ -200,3 +202,87 @@ def load_public_key(value: str) -> Optional[object]:
         if der is not None:
             return der
     return None
+
+
+def load_ed25519_public_key(value: str) -> Optional[ed25519.Ed25519PublicKey]:
+    """Parse *value* strictly as an Ed25519 public key.
+
+    Accepts the same wire encodings as :func:`load_public_key` — PEM
+    SubjectPublicKeyInfo, base64- or hex-encoded DER SubjectPublicKeyInfo, and
+    the raw 32-byte point — but only an Ed25519 key qualifies. A key of any
+    other algorithm (e.g. an X25519 SPKI blob) or any unparseable value
+    returns ``None``; a raw 32-byte point is interpreted as Ed25519, matching
+    this endpoint's identity-key contract.
+    """
+    if not is_nonempty_string(value):
+        return None
+
+    # 1) PEM text: the algorithm OID pins the key type.
+    try:
+        pem_key = serialization.load_pem_public_key(value.encode("ascii"))
+    except (ValueError, UnsupportedAlgorithm, TypeError):
+        pass
+    else:
+        return pem_key if isinstance(pem_key, ed25519.Ed25519PublicKey) else None
+
+    # 2) Encoded bytes: same candidate set as load_public_key (a hex string can
+    #    also be valid base64), raw 32-byte Ed25519 point first, DER otherwise.
+    candidates: list[bytes] = []
+    blob = _decode_base64(value)
+    if blob is not None:
+        candidates.append(blob)
+    blob = _decode_hex(value)
+    if blob is not None and blob not in candidates:
+        candidates.append(blob)
+
+    for candidate in candidates:
+        if len(candidate) == 32:
+            try:
+                return ed25519.Ed25519PublicKey.from_public_bytes(candidate)
+            except (ValueError, UnsupportedAlgorithm):
+                pass
+        der_key = _load_der(candidate)
+        if isinstance(der_key, ed25519.Ed25519PublicKey):
+            return der_key
+    return None
+
+
+def decode_ed25519_signature(value: object) -> Optional[bytes]:
+    """Decode a standard-base64 Ed25519 signature.
+
+    Returns the raw signature only when *value* is a string whose strict
+    standard-base64 decoding yields exactly :data:`ED25519_SIGNATURE_BYTES`
+    (64) bytes. Non-strings, url-safe/whitespace/non-alphabet characters, bad
+    padding and any other length return ``None``.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(raw) != ED25519_SIGNATURE_BYTES:
+        return None
+    return raw
+
+
+def verify_ed25519(identity_key_b64: str, message: bytes,
+                   signature_b64: object) -> bool:
+    """Return True iff *signature_b64* is a valid Ed25519 signature of
+    *message* under the Ed25519 identity key *identity_key_b64*.
+
+    Every malformed input — a non-Ed25519 identity key, a non-standard-base64
+    signature or one that is not exactly 64 bytes, and a signature that fails
+    verification — reports ``False`` rather than raising.
+    """
+    identity = load_ed25519_public_key(identity_key_b64)
+    if identity is None:
+        return False
+    raw_signature = decode_ed25519_signature(signature_b64)
+    if raw_signature is None:
+        return False
+    try:
+        identity.verify(raw_signature, message)
+    except InvalidSignature:
+        return False
+    return True
