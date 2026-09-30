@@ -364,10 +364,11 @@ class GroupLeasePersistenceTest(GroupLeaseMixin, unittest.TestCase):
             self.assertEqual(len(record["leases"]), 1)
             self.assertEqual(list(record["leases"][0]),
                              ["lease_id", "limit", "leased_until",
-                              "released_at"])
+                              "released_at", "renewals"])
             self.assertEqual(record["leases"][0]["lease_id"], "L1")
             self.assertEqual(record["leases"][0]["limit"], 2)
             self.assertIsNone(record["leases"][0]["released_at"])
+            self.assertEqual(record["leases"][0]["renewals"], [])
 
     def test_empty_claim_and_replay_consume_no_generation(self) -> None:
         self.service.group_inbox_claim(
@@ -448,8 +449,21 @@ class GroupLeasePersistenceTest(GroupLeaseMixin, unittest.TestCase):
             document["group_delivery"][0]["leases"][0]["limit"] = 0
         self._assert_refuses_startup(self._malformed_group_document(mutate))
 
+        # ``renewals`` is now a recognised key: an empty list is the same
+        # as an absent field, while a non-list value or a malformed item
+        # still makes the document malformed.
         def mutate(document):
-            document["group_delivery"][0]["leases"][0]["renewals"] = []
+            document["group_delivery"][0]["leases"][0]["renewals"] = {}
+        self._assert_refuses_startup(self._malformed_group_document(mutate))
+
+        def mutate(document):
+            document["group_delivery"][0]["leases"][0]["renewals"] = [
+                {"renewal_id": "R1", "leased_until": "not-a-timestamp"}]
+        self._assert_refuses_startup(self._malformed_group_document(mutate))
+
+        def mutate(document):
+            document["group_delivery"][0]["leases"][0]["renewals"] = [
+                {"renewal_id": "R1", "bogus": 1}]
         self._assert_refuses_startup(self._malformed_group_document(mutate))
 
     def test_restore_rejects_inconsistent_binding(self) -> None:

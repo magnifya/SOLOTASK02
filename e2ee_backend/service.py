@@ -2046,6 +2046,69 @@ class DeviceService:
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
 
+    def group_inbox_lease_renew(
+            self, device_id: str, lease_id: str,
+            payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one group-inbox lease renewal.
+
+        ``POST /v1/devices/{device_id}/group-inbox/leases/{lease_id}
+        /renew``. The body must be a JSON object carrying only a non-empty
+        string ``renewal_id`` (any other top-level key is 400 with that
+        key's name). A bad/non-object body is 400/field ``request_body``;
+        a missing, empty or wrongly typed field is 400/field
+        ``renewal_id``.
+
+        The lease is resolved in the store under the lock, ahead of the
+        path device's state: a never-committed ``lease_id`` is
+        404/field ``lease_id`` and one owned by another device — or
+        committed in the 1:1 namespace, since the id is global — is
+        409/field ``lease_id``. Replaying the same ``renewal_id`` on the
+        same lease returns the frozen first response with 200 (ids may
+        recur on other leases), however stale the request. Only a first
+        renewal checks the device (unknown or revoked -> 409/field
+        ``device_id``) and the lease state (already released or expired ->
+        409/field ``lease_id``). A first renewal returns 201 with
+        ``device_id``, ``lease_id``, ``renewal_id`` and the new
+        ``leased_until`` (the previous effective deadline plus exactly 30
+        seconds, UTC ISO-8601 with six microsecond digits and ``+00:00``),
+        and persists one generation.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        extras = [key for key in payload if key != "renewal_id"]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        if "renewal_id" not in payload:
+            raise ServiceError("missing required field: renewal_id",
+                               "renewal_id")
+        if not is_nonempty_string(payload["renewal_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: renewal_id",
+                "renewal_id")
+
+        try:
+            return self.store.group_inbox_lease_renew(
+                device_id, lease_id, payload["renewal_id"])
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_UNAVAILABLE:
+                raise ServiceError(
+                    "lease is released or expired and cannot be renewed",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
     def inbox_claim(self, device_id: str,
                     payload: object) -> Tuple[Dict[str, Any], int]:
         """Validate and apply one 1:1-inbox redelivery lease claim.

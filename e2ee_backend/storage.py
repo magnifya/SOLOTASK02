@@ -3659,6 +3659,102 @@ class DeviceStore:
                      "released_at": released_at,
                      "released_count": len(keys)}, 201)
 
+    def group_inbox_lease_renew(
+            self, device_id: str, lease_id: str, renewal_id: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Renew one occupied group-inbox lease for another 30 seconds.
+
+        ``POST /v1/devices/{device_id}/group-inbox/leases/{lease_id}
+        /renew``. Group counterpart of :meth:`inbox_lease_renew` (group
+        leases have no completions). Under the one store lock (shared with
+        claims, releases, group acks, group retries and revocation), the
+        lease is resolved first: a never-committed *lease_id* raises
+        ``lease_not_found`` (404/lease_id) — and one committed in the 1:1
+        namespace raises ``lease_id_conflict`` — and one owned by another
+        device raises ``lease_id_conflict`` (409/lease_id), regardless of
+        the path device's state. A replay of the same *renewal_id* on the
+        same lease is decided next and returns its frozen first response
+        with status 200, writing nothing — even if the lease has since
+        expired, been released or the device revoked; the same
+        *renewal_id* on a different lease is allowed (ids only have to be
+        unique within one lease).
+
+        Only a first renewal resolves the device (unknown ->
+        ``device_unknown``, revoked -> ``device_inactive``, both
+        409/device_id) and the lease state: an already-released or
+        expired lease raises ``lease_unavailable`` (409/lease_id). On
+        success (201) the effective deadline — the claim ``leased_until``
+        initially, the last renewal's afterwards — is extended by exactly
+        :data:`INBOX_LEASE_SECONDS` seconds, and the same renewal record
+        (``renewal_id``/new ``leased_until``) is appended to the lease on
+        every group delivery record it lives on. The renewal set commits
+        as one persistence notification (commit_seq + 1); a durable write
+        failure rolls every record back. Returns ``(body, status_code)``
+        with keys ``device_id``, ``lease_id``, ``renewal_id``,
+        ``leased_until`` in that order.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            # Gather every (group delivery key, lease object) carrying the
+            # id; restore validation guarantees the copies stay identical,
+            # so any of them is authoritative for the replay lookup.
+            hits: List[Tuple[Tuple[str, str, str], MessageLease]] = []
+            for key, state in self._group_delivery.items():
+                for lease in state.leases:
+                    if lease.lease_id == lease_id:
+                        hits.append((key, lease))
+            if not hits:
+                # lease_id is global: one held by a 1:1 lease lives in
+                # another namespace, so it is a conflict (owned elsewhere),
+                # never a not-found.
+                if self._find_inbox_lease_locked(lease_id) is not None:
+                    raise InboxLeaseError(INBOX_LEASE_CONFLICT)
+                raise InboxLeaseError(INBOX_LEASE_NOT_FOUND)
+            owner = hits[0][0][2]
+            # A cross-device renewal is a conflict regardless of the path
+            # device's current state, mirroring claim/release replay rules.
+            if owner != device_id:
+                raise InboxLeaseError(INBOX_LEASE_CONFLICT)
+            # Same renewal_id on this lease is an exact replay: rebuild the
+            # first response (its frozen deadline) byte-identically. The id
+            # is scoped to the lease, so it may recur on other leases.
+            for renewal in hits[0][1].renewals:
+                if renewal.renewal_id == renewal_id:
+                    return ({"device_id": device_id,
+                             "lease_id": lease_id,
+                             "renewal_id": renewal_id,
+                             "leased_until": renewal.leased_until}, 200)
+            device = self._find_device(device_id)
+            if device is None:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_UNKNOWN)
+            if device.revoked:
+                raise InboxLeaseError(INBOX_LEASE_DEVICE_INACTIVE)
+            # Every copy of the lease shares one lifecycle; once released
+            # or past its current effective deadline it cannot be renewed.
+            if any(not self._lease_is_active_locked(lease, now)
+                   for _key, lease in hits):
+                raise InboxLeaseError(INBOX_LEASE_UNAVAILABLE)
+            current = self._lease_effective_deadline_locked(hits[0][1])
+            # Active above guarantees a parseable aware deadline on every
+            # copy; the copies are identical, so they all extend the same
+            # value by exactly 30 seconds.
+            if current is None:  # pragma: no cover - ruled out above
+                raise InboxLeaseError(INBOX_LEASE_UNAVAILABLE)
+            leased_until = (current + timedelta(
+                seconds=INBOX_LEASE_SECONDS)) \
+                .isoformat(timespec="microseconds")
+            for _key, lease in hits:
+                lease.renewals.append(MessageLeaseRenewal(
+                    renewal_id=renewal_id, leased_until=leased_until))
+            # One persistence notification for the whole lease set: every
+            # per-message renewal commits (or rolls back) together and the
+            # generation advances at most once.
+            self._notify_change()
+            return ({"device_id": device_id,
+                     "lease_id": lease_id,
+                     "renewal_id": renewal_id,
+                     "leased_until": leased_until}, 201)
+
     def inbox_lease_release_batch(
             self, device_id: str,
             items: List[str]
@@ -7879,6 +7975,10 @@ class DeviceStore:
                     "limit": lease.limit,
                     "leased_until": lease.leased_until,
                     "released_at": lease.released_at,
+                    "renewals": [{
+                        "renewal_id": renewal.renewal_id,
+                        "leased_until": renewal.leased_until,
+                    } for renewal in lease.renewals],
                 } for lease in state.leases],
             } for (sid, mid, did), state in self._group_delivery.items()]
             used_nonces = {
@@ -10620,7 +10720,8 @@ class DeviceStore:
         # cross-checks one id across every group_delivery record and, at
         # each insert, against the 1:1 delivery ``lease_index`` (the two
         # namespaces never share an id).
-        group_lease_index: Dict[str, Tuple[str, int, str, Optional[str]]] = {}
+        group_lease_index: Dict[
+            str, Tuple[str, int, str, Optional[str], Tuple]] = {}
         for index, raw in enumerate(raw_group_delivery):
             where = f"group_delivery[{index}]"
             if not isinstance(raw, dict):
@@ -10705,10 +10806,11 @@ class DeviceStore:
             # Group-inbox redelivery leases. Older files predate the field:
             # it is absent and treated as empty. A present field must be a
             # list of objects carrying exactly lease_id/limit/leased_until
-            # plus an optional released_at (group leases have no renewals,
-            # completion or ack id); one lease_id must not repeat within a
-            # record, and each id binds one device/limit/deadline/release
-            # timestamp globally, never also in the 1:1 delivery namespace.
+            # plus an optional released_at and renewals (group leases have
+            # no completion or ack id); one lease_id must not repeat within
+            # a record, and each id binds one device/limit/deadline/release
+            # timestamp/renewal chain globally, never also in the 1:1
+            # delivery namespace.
             group_leases: List[MessageLease] = []
             if "leases" in raw:
                 raw_leases = raw["leases"]
@@ -10720,7 +10822,7 @@ class DeviceStore:
                     if not isinstance(raw_lease, dict):
                         raise ValueError(f"{l_where} must be an object")
                     allowed_keys = {"lease_id", "limit", "leased_until",
-                                    "released_at"}
+                                    "released_at", "renewals"}
                     extra_lease_keys = [key for key in raw_lease
                                         if key not in allowed_keys]
                     if extra_lease_keys:
@@ -10754,6 +10856,68 @@ class DeviceStore:
                             f"{l_where}.released_at must be null or a UTC "
                             f"ISO-8601 timestamp with six microsecond "
                             f"digits and a +00:00 offset")
+                    # Lease renewals. Older files predate the key: absent
+                    # means empty. Each item freezes the client-chosen
+                    # renewal_id (unique within this lease) and the new
+                    # effective deadline; deadlines must chain exactly
+                    # +30s from the claim deadline, then item by item, and
+                    # every copy of one lease_id must carry the identical
+                    # chain (checked through group_lease_index below).
+                    raw_renewals = raw_lease.get("renewals", [])
+                    if not isinstance(raw_renewals, list):
+                        raise ValueError(
+                            f"{l_where}.renewals must be a list")
+                    group_renewals: List[MessageLeaseRenewal] = []
+                    seen_group_renewal_ids: Set[str] = set()
+                    group_chain_from = leased_until
+                    for r_index, raw_renewal in enumerate(raw_renewals):
+                        r_where = f"{l_where}.renewals[{r_index}]"
+                        if not isinstance(raw_renewal, dict):
+                            raise ValueError(f"{r_where} must be an object")
+                        try:
+                            renewal_id = raw_renewal["renewal_id"]
+                            renewal_until = raw_renewal["leased_until"]
+                        except KeyError as error:
+                            raise ValueError(
+                                f"{r_where} missing field: "
+                                f"{error.args[0]}") from None
+                        if not (isinstance(renewal_id, str) and renewal_id):
+                            raise ValueError(
+                                f"{r_where}.renewal_id must be a non-empty "
+                                f"string")
+                        if not _is_utc_microsecond_iso(renewal_until):
+                            raise ValueError(
+                                f"{r_where}.leased_until must be a UTC "
+                                f"ISO-8601 timestamp with six microsecond "
+                                f"digits and a +00:00 offset")
+                        if renewal_id in seen_group_renewal_ids:
+                            raise ValueError(
+                                f"{r_where} repeats renewal_id "
+                                f"{renewal_id}")
+                        seen_group_renewal_ids.add(renewal_id)
+                        # Each renewal extends the previous effective
+                        # deadline by exactly the lease lifetime.
+                        try:
+                            previous = datetime.fromisoformat(
+                                group_chain_from)
+                        except (TypeError, ValueError):
+                            previous = None
+                        if previous is None or previous.tzinfo is None:
+                            raise ValueError(
+                                f"{r_where} cannot chain onto an "
+                                f"unparseable deadline {group_chain_from!r}")
+                        expected = (previous + timedelta(
+                            seconds=INBOX_LEASE_SECONDS)) \
+                            .isoformat(timespec="microseconds")
+                        if renewal_until != expected:
+                            raise ValueError(
+                                f"{r_where}.leased_until must extend the "
+                                f"previous deadline by exactly "
+                                f"{INBOX_LEASE_SECONDS} seconds")
+                        group_chain_from = renewal_until
+                        group_renewals.append(MessageLeaseRenewal(
+                            renewal_id=renewal_id,
+                            leased_until=renewal_until))
                     if lease_id in seen_group_lease_ids:
                         raise ValueError(
                             f"{l_where} repeats lease_id {lease_id}")
@@ -10763,18 +10927,21 @@ class DeviceStore:
                             f"group inbox lease {lease_id} is already bound "
                             f"in the 1:1 delivery namespace")
                     binding = (g_device, lease_limit, leased_until,
-                               released_at)
+                               released_at,
+                               tuple((r.renewal_id, r.leased_until)
+                                     for r in group_renewals))
                     prior = group_lease_index.get(lease_id)
                     if prior is not None and prior != binding:
                         raise ValueError(
                             f"group inbox lease {lease_id} is bound "
                             f"inconsistently across records (device/limit/"
-                            f"leased_until/released_at)")
+                            f"leased_until/released_at/renewals)")
                     group_lease_index[lease_id] = binding
                     group_leases.append(MessageLease(
                         lease_id=lease_id, limit=lease_limit,
                         leased_until=leased_until,
-                        released_at=released_at))
+                        released_at=released_at,
+                        renewals=group_renewals))
             group_delivery[gkey] = MessageDelivery(
                 attempts=attempts, attempt_ids=set(attempt_ids), acked=acked,
                 ack_sequence=ack_sequence, leases=group_leases)
