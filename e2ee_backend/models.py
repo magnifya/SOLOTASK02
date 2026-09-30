@@ -718,3 +718,34 @@ class Session:
     identity_key: str
     public_key: str
     created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class SessionRotation:
+    """The durable record of one 1:1 session rotation.
+
+    Rotating a predecessor session creates a fresh ordinary session
+    (successor) between the same two endpoints, keyed with a new initiator
+    ephemeral public key, the recipient's current identity public key and the
+    public key of a fresh recipient pre-key; the successor's message stream
+    starts at sequence 1 and the predecessor snapshot (with its full message
+    history) is never altered. The record freezes the successor's eight
+    session fields together with the client-chosen ``rotation_id`` and the
+    predecessor's last message sequence at commit time (0 when it had no
+    messages). The record is idempotent on ``rotation_id`` for the same
+    predecessor: replaying it returns the original successor. A given
+    predecessor may be rotated at most once (no forks), and a given
+    ``rotation_id`` may succeed for at most one predecessor.
+    """
+
+    rotation_id: str
+    predecessor_session_id: str
+    successor_session_id: str
+    initiator_device_id: str
+    recipient_device_id: str
+    prekey_id: str
+    ephemeral_key: str
+    identity_key: str
+    public_key: str
+    predecessor_last_sequence: int
+    created_at: str = field(default_factory=utc_now_iso)

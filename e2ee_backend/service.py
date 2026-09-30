@@ -72,6 +72,7 @@ from .storage import (
     MESSAGE_DUPLICATE_NONCE,
     MESSAGE_REQUEST_ID_CONFLICT,
     MESSAGE_SENDER_INACTIVE,
+    MESSAGE_SESSION_ROTATED,
     MESSAGE_SESSION_UNKNOWN,
     MESSAGE_SYNC_CURSOR_CONFLICT,
     MESSAGE_SYNC_DEVICE_INACTIVE,
@@ -129,6 +130,15 @@ from .storage import (
     SESSION_PREKEY_UNKNOWN,
     SESSION_RECIPIENT_REVOKED,
     SESSION_RECIPIENT_UNKNOWN,
+    SESSION_ROTATION_ACTOR_NOT_INITIATOR,
+    SESSION_ROTATION_ACTOR_REVOKED,
+    SESSION_ROTATION_ACTOR_UNKNOWN,
+    SESSION_ROTATION_ID_CONFLICT,
+    SESSION_ROTATION_PREDECESSOR_ROTATED,
+    SESSION_ROTATION_PREKEY_REVOKED,
+    SESSION_ROTATION_PREKEY_UNKNOWN,
+    SESSION_ROTATION_RECIPIENT_REVOKED,
+    SESSION_ROTATION_SESSION_UNKNOWN,
     SYNC_BAD_SEQUENCE,
     SYNC_CURSOR_CONFLICT,
     SYNC_DEVICE_INACTIVE,
@@ -165,6 +175,7 @@ from .storage import (
     RedeliveryJobRecoverBatchError,
     RedeliveryJobStatusBatchError,
     SessionCreateError,
+    SessionRotationError,
 )
 
 _REQUIRED_SCALAR_FIELDS = ("user_id", "device_id", "identity_key")
@@ -176,6 +187,7 @@ _MESSAGE_STRING_FIELDS = (
 #: Maps a storage-level message-append failure reason to (HTTP status, field).
 _MESSAGE_CREATE_ERROR_MAP = {
     MESSAGE_SESSION_UNKNOWN: (404, "session_id"),
+    MESSAGE_SESSION_ROTATED: (409, "session_id"),
     MESSAGE_SENDER_INACTIVE: (409, "sender_device_id"),
     MESSAGE_DUPLICATE_ID: (409, "message_id"),
     MESSAGE_BAD_SEQUENCE: (409, "sequence"),
@@ -592,6 +604,100 @@ class DeviceService:
             raise ServiceError(f"session not found: {session_id}",
                                "session_id", status_code=404)
         return view
+
+    #: Maps a 1:1 session rotation failure to (HTTP status, field name).
+    _SESSION_ROTATION_ERROR_MAP = {
+        SESSION_ROTATION_SESSION_UNKNOWN: (404, "session_id"),
+        SESSION_ROTATION_ACTOR_UNKNOWN: (404, "actor_device_id"),
+        SESSION_ROTATION_ACTOR_REVOKED: (409, "actor_device_id"),
+        SESSION_ROTATION_ACTOR_NOT_INITIATOR: (409, "actor_device_id"),
+        SESSION_ROTATION_RECIPIENT_REVOKED: (409, "recipient_device_id"),
+        SESSION_ROTATION_PREKEY_UNKNOWN: (404, "prekey_id"),
+        SESSION_ROTATION_PREKEY_REVOKED: (409, "prekey_id"),
+        SESSION_ROTATION_ID_CONFLICT: (409, "rotation_id"),
+        SESSION_ROTATION_PREDECESSOR_ROTATED: (409, "session_id"),
+    }
+
+    def rotate_session(self, predecessor_session_id: str,
+                       payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate a 1:1 session rotation and commit it atomically.
+
+        ``rotation_id``, ``actor_device_id`` and ``prekey_id`` must be
+        non-empty strings and ``ephemeral_key`` a non-empty valid public key.
+        The actor must be the predecessor's un-revoked initiator, the
+        recipient must not be revoked, and the pre-key must be a valid
+        (un-revoked) pre-key of the recipient. The first rotation returns
+        201; an idempotent replay (same id on the same predecessor) returns
+        200 with the original response.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("rotation_id", "actor_device_id", "prekey_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if "ephemeral_key" not in payload:
+            raise ServiceError(
+                "missing required field: ephemeral_key", "ephemeral_key")
+        if not is_nonempty_string(payload["ephemeral_key"]):
+            raise ServiceError(
+                "field must be a non-empty string: ephemeral_key",
+                "ephemeral_key")
+        if load_public_key(payload["ephemeral_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: ephemeral_key",
+                "ephemeral_key")
+
+        try:
+            successor, rotation, created = self.store.rotate_session(
+                predecessor_session_id, payload["rotation_id"],
+                payload["actor_device_id"], payload["prekey_id"],
+                payload["ephemeral_key"])
+        except SessionRotationError as error:
+            status_code, field = \
+                self._SESSION_ROTATION_ERROR_MAP[error.reason]
+            if error.reason == SESSION_ROTATION_SESSION_UNKNOWN:
+                message = f"session not found: {predecessor_session_id}"
+            elif error.reason == SESSION_ROTATION_ACTOR_UNKNOWN:
+                message = ("actor_device_id is not a registered device: "
+                           f"{payload['actor_device_id']}")
+            elif error.reason == SESSION_ROTATION_ACTOR_NOT_INITIATOR:
+                message = (
+                    "actor_device_id is not the session initiator")
+            elif error.reason == SESSION_ROTATION_RECIPIENT_REVOKED:
+                message = "recipient_device_id is revoked"
+            elif error.reason == SESSION_ROTATION_PREKEY_UNKNOWN:
+                message = (
+                    "prekey_id not found or does not belong to the "
+                    f"recipient: {payload['prekey_id']}")
+            elif error.reason == SESSION_ROTATION_ID_CONFLICT:
+                message = (
+                    "rotation_id has already rotated another session: "
+                    f"{payload['rotation_id']}")
+            elif error.reason == SESSION_ROTATION_PREDECESSOR_ROTATED:
+                message = "session has already been rotated"
+            else:
+                message = f"{field} is revoked"
+            raise ServiceError(message, field, status_code=status_code)
+        return self.store.session_rotation_view(successor, rotation), \
+            201 if created else 200
+
+    def get_session_rotation(self, session_id: str) -> Dict[str, Any]:
+        """Return a session rotation addressed by its predecessor or successor.
+
+        404/field=session_id when the id is unknown or belongs to no
+        rotation.
+        """
+        resolved = self.store.get_session_rotation(session_id)
+        if resolved is None:
+            raise ServiceError(
+                f"session rotation not found: {session_id}",
+                "session_id", status_code=404)
+        successor, rotation = resolved
+        return self.store.session_rotation_view(successor, rotation)
 
     def create_session_from_claim(self, payload: object) -> Dict[str, Any]:
         """Validate a from-claim session payload and atomically create it.
@@ -5247,6 +5353,10 @@ class DeviceService:
         status_code, field = _MESSAGE_CREATE_ERROR_MAP[error.reason]
         if error.reason == MESSAGE_SESSION_UNKNOWN:
             message_text = f"session not found: {payload['session_id']}"
+        elif error.reason == MESSAGE_SESSION_ROTATED:
+            message_text = (
+                "session has been rotated; send new messages to its "
+                "successor session")
         elif error.reason == MESSAGE_SENDER_INACTIVE:
             message_text = "sender_device_id is not an active device"
         elif error.reason == MESSAGE_DUPLICATE_ID:

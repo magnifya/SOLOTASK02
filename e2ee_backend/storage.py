@@ -47,6 +47,7 @@ from .models import (
     RedeliveryJobEventCheckpoint,
     RedeliveryJobRecovery,
     Session,
+    SessionRotation,
     SignedPreKey,
     utc_now_iso,
 )
@@ -98,6 +99,8 @@ MESSAGE_SENDER_INACTIVE = "sender_inactive"
 MESSAGE_DUPLICATE_ID = "duplicate_message_id"
 MESSAGE_BAD_SEQUENCE = "bad_sequence"
 MESSAGE_DUPLICATE_NONCE = "duplicate_nonce"
+#: A new write targeted a 1:1 session that has been rotated into a successor.
+MESSAGE_SESSION_ROTATED = "session_rotated"
 #: A request_id already committed with different envelope fields.
 MESSAGE_REQUEST_ID_CONFLICT = "request_id_conflict"
 
@@ -431,6 +434,17 @@ ROTATION_ACTOR_NOT_CREATOR = "actor_not_creator"
 ROTATION_REVISION_MISMATCH = "revision_mismatch"
 ROTATION_ID_CONFLICT = "rotation_id_conflict"
 ROTATION_PREDECESSOR_ROTATED = "predecessor_rotated"
+
+#: Outcome codes for 1:1 session rotation.
+SESSION_ROTATION_SESSION_UNKNOWN = "session_unknown"
+SESSION_ROTATION_ACTOR_UNKNOWN = "actor_unknown"
+SESSION_ROTATION_ACTOR_REVOKED = "actor_revoked"
+SESSION_ROTATION_ACTOR_NOT_INITIATOR = "actor_not_initiator"
+SESSION_ROTATION_RECIPIENT_REVOKED = "recipient_revoked"
+SESSION_ROTATION_PREKEY_UNKNOWN = "prekey_unknown"
+SESSION_ROTATION_PREKEY_REVOKED = "prekey_revoked"
+SESSION_ROTATION_ID_CONFLICT = "rotation_id_conflict"
+SESSION_ROTATION_PREDECESSOR_ROTATED = "predecessor_rotated"
 
 #: Key-audit event types (the ``type`` field of a :class:`KeyEvent`).
 KEY_EVENT_REGISTERED = "registered"
@@ -815,6 +829,14 @@ class GroupSessionRotationError(Exception):
         self.reason = reason
 
 
+class SessionRotationError(Exception):
+    """An atomic 1:1 session rotation failed; nothing was written."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 #: Business-state sections covered by a persistence-integrity snapshot, in
 #: the fixed key order used both for the state hash and when comparing the
 #: on-disk document against the in-memory snapshot. Sections a legacy
@@ -832,6 +854,7 @@ INTEGRITY_SECTION_KEYS = (
     "claim_session_bindings",
     "batch_claim_session_bindings",
     "group_session_rotations",
+    "session_rotations",
     "group_delivery",
     "used_nonces",
     "group_sync_cursors",
@@ -860,7 +883,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 27 canonical
+    """Project a store snapshot/document payload onto the canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -929,6 +952,13 @@ class DeviceStore:
         self._group_session_rotations: Dict[str, GroupSessionRotation] = {}
         self._rotation_by_predecessor: Dict[str, GroupSessionRotation] = {}
         self._rotation_by_successor: Dict[str, GroupSessionRotation] = {}
+        # Committed 1:1 session rotations, keyed by the client-chosen
+        # rotation_id (globally unique; a separate namespace from group
+        # rotation ids is not required — ids only collide within this map).
+        # Two derived indexes make replay and the no-fork rule O(1).
+        self._session_rotations: Dict[str, SessionRotation] = {}
+        self._session_rotation_by_predecessor: Dict[str, SessionRotation] = {}
+        self._session_rotation_by_successor: Dict[str, SessionRotation] = {}
         # Per-device group-session read cursors, keyed by
         # (session_id, device_id); created lazily on the first advance.
         self._group_sync_cursors: Dict[Tuple[str, str], GroupSyncCursor] = {}
@@ -2219,6 +2249,171 @@ class DeviceStore:
             self._group_session_rotations[rotation_id] = rotation
             self._rotation_by_predecessor[predecessor_session_id] = rotation
             self._rotation_by_successor[new_id] = rotation
+            self._notify_change()
+            return successor, rotation, True
+
+    # -- 1:1 session rotation ---------------------------------------------
+
+    @staticmethod
+    def session_rotation_view(session: Session,
+                              rotation: SessionRotation) -> Dict[str, Any]:
+        """Public view of a 1:1 rotation successor: the successor's eight
+        session fields plus ``rotation_id``, ``predecessor_session_id``,
+        ``successor_session_id`` and ``predecessor_last_sequence``."""
+        return {
+            "session_id": session.session_id,
+            "initiator_device_id": session.initiator_device_id,
+            "recipient_device_id": session.recipient_device_id,
+            "prekey_id": session.prekey_id,
+            "ephemeral_key": session.ephemeral_key,
+            "identity_key": session.identity_key,
+            "public_key": session.public_key,
+            "created_at": session.created_at,
+            "rotation_id": rotation.rotation_id,
+            "predecessor_session_id": rotation.predecessor_session_id,
+            "successor_session_id": rotation.successor_session_id,
+            "predecessor_last_sequence": rotation.predecessor_last_sequence,
+        }
+
+    def get_session_rotation(self, session_id: str
+                             ) -> Optional[Tuple[Session, SessionRotation]]:
+        """Resolve a rotation by its predecessor or successor session id.
+
+        Returns ``(successor, rotation)`` when *session_id* is either side of
+        a committed 1:1 rotation, or ``None`` when it participates in none.
+        """
+        with self._lock:
+            rotation = self._session_rotation_by_predecessor.get(session_id)
+            if rotation is None:
+                rotation = self._session_rotation_by_successor.get(session_id)
+            if rotation is None:
+                return None
+            successor = self._sessions.get(rotation.successor_session_id)
+            if successor is None:  # pragma: no cover - restore enforces it
+                return None
+            return successor, rotation
+
+    def rotate_session(self, predecessor_session_id: str, rotation_id: str,
+                       actor_device_id: str, prekey_id: str,
+                       ephemeral_key: str
+                       ) -> Tuple[Session, SessionRotation, bool]:
+        """Atomically rotate one 1:1 session into a fresh successor session.
+
+        Returns ``(successor, rotation, created)`` with ``created`` False for a
+        replay of the same ``rotation_id`` on the same predecessor (200). The
+        predecessor snapshot (and its message history) is never altered; the
+        successor is an ordinary session between the same two endpoints,
+        keyed with the request's new ephemeral public key, the recipient's
+        current identity public key and the public key of the requested
+        recipient pre-key, and its message stream starts at sequence 1. The
+        record also freezes the predecessor's last message sequence (0 when
+        the predecessor had no messages).
+
+        Failure reasons (nothing written):
+
+        * ``session_unknown`` — the predecessor is not a known 1:1 session
+          (404/field=session_id);
+        * ``actor_unknown`` — the actor is not a registered device
+          (404/field=actor_device_id);
+        * ``actor_revoked`` / ``actor_not_initiator`` — the actor is revoked
+          or is not the predecessor's initiator (409/field=actor_device_id);
+        * ``recipient_revoked`` — the recipient device is revoked
+          (409/field=recipient_device_id);
+        * ``prekey_unknown`` — the pre-key is unknown or does not belong to
+          the recipient (404/field=prekey_id);
+        * ``prekey_revoked`` — the pre-key is revoked (409/field=prekey_id);
+        * ``rotation_id_conflict`` — the id already rotated another
+          predecessor (409/field=rotation_id);
+        * ``predecessor_rotated`` — the predecessor already has a successor
+          under a different id, so granting this would fork it
+          (409/field=session_id).
+        """
+        with self._lock:
+            predecessor = self._sessions.get(predecessor_session_id)
+            if predecessor is None:
+                raise SessionRotationError(SESSION_ROTATION_SESSION_UNKNOWN)
+
+            existing = self._session_rotations.get(rotation_id)
+            if existing is not None:
+                if existing.predecessor_session_id == predecessor_session_id:
+                    # Idempotent replay of the same id on the same
+                    # predecessor: return the original successor even if the
+                    # actor was since revoked or the recipient/pre-key state
+                    # changed.
+                    successor = self._sessions[
+                        existing.successor_session_id]
+                    return successor, existing, False
+                # The id is already committed for another predecessor.
+                raise SessionRotationError(SESSION_ROTATION_ID_CONFLICT)
+
+            actor = self._find_device(actor_device_id)
+            if actor is None:
+                raise SessionRotationError(SESSION_ROTATION_ACTOR_UNKNOWN)
+            if actor.revoked:
+                raise SessionRotationError(SESSION_ROTATION_ACTOR_REVOKED)
+            if actor_device_id != predecessor.initiator_device_id:
+                raise SessionRotationError(
+                    SESSION_ROTATION_ACTOR_NOT_INITIATOR)
+
+            recipient = self._find_device(predecessor.recipient_device_id)
+            # Restore_state guarantees both endpoints still exist; a missing
+            # recipient can therefore only be a defensive edge, which is the
+            # same class of failure as a revoked recipient.
+            if recipient is None or recipient.revoked:
+                raise SessionRotationError(
+                    SESSION_ROTATION_RECIPIENT_REVOKED)
+
+            used_prekey = next((pk for pk in recipient.prekeys
+                                if pk.key_id == prekey_id), None)
+            if used_prekey is None:
+                raise SessionRotationError(SESSION_ROTATION_PREKEY_UNKNOWN)
+            if used_prekey.revoked:
+                raise SessionRotationError(SESSION_ROTATION_PREKEY_REVOKED)
+
+            if predecessor_session_id in self._session_rotation_by_predecessor:
+                # Another rotation id already succeeded for this predecessor:
+                # never fork.
+                raise SessionRotationError(
+                    SESSION_ROTATION_PREDECESSOR_ROTATED)
+
+            # Fresh unique session id (shared keyspace with group sessions
+            # and other 1:1 sessions).
+            new_id = uuid.uuid4().hex
+            while (new_id in self._sessions
+                   or new_id in self._group_sessions):
+                new_id = uuid.uuid4().hex
+
+            predecessor_stream = self._messages.get(predecessor_session_id, [])
+            predecessor_last_sequence = (
+                predecessor_stream[-1].sequence if predecessor_stream else 0)
+
+            successor = Session(
+                session_id=new_id,
+                initiator_device_id=predecessor.initiator_device_id,
+                recipient_device_id=predecessor.recipient_device_id,
+                prekey_id=prekey_id,
+                ephemeral_key=ephemeral_key,
+                identity_key=recipient.identity_key,
+                public_key=used_prekey.public_key,
+            )
+            rotation = SessionRotation(
+                rotation_id=rotation_id,
+                predecessor_session_id=predecessor_session_id,
+                successor_session_id=new_id,
+                initiator_device_id=successor.initiator_device_id,
+                recipient_device_id=successor.recipient_device_id,
+                prekey_id=prekey_id,
+                ephemeral_key=ephemeral_key,
+                identity_key=successor.identity_key,
+                public_key=successor.public_key,
+                predecessor_last_sequence=predecessor_last_sequence,
+                created_at=successor.created_at,
+            )
+            self._sessions[new_id] = successor
+            self._session_rotations[rotation_id] = rotation
+            self._session_rotation_by_predecessor[
+                predecessor_session_id] = rotation
+            self._session_rotation_by_successor[new_id] = rotation
             self._notify_change()
             return successor, rotation, True
 
@@ -7651,6 +7846,12 @@ class DeviceStore:
         group_session = self._group_sessions.get(session_id)
         if session_id not in self._sessions and group_session is None:
             raise MessageCreateError(MESSAGE_SESSION_UNKNOWN)
+        # A 1:1 predecessor that has been rotated accepts no further writes;
+        # new traffic must target its successor. Reads and idempotent
+        # submission replays (handled before this method) are unaffected.
+        if (group_session is None
+                and session_id in self._session_rotation_by_predecessor):
+            raise MessageCreateError(MESSAGE_SESSION_ROTATED)
 
         sender_key = self._device_index.get(sender_device_id)
         sender = (self._devices.get(sender_key)
@@ -8019,6 +8220,19 @@ class DeviceStore:
                 "members": list(r.members),
                 "created_at": r.created_at,
             } for r in self._group_session_rotations.values()]
+            session_rotations = [{
+                "rotation_id": r.rotation_id,
+                "predecessor_session_id": r.predecessor_session_id,
+                "successor_session_id": r.successor_session_id,
+                "initiator_device_id": r.initiator_device_id,
+                "recipient_device_id": r.recipient_device_id,
+                "prekey_id": r.prekey_id,
+                "ephemeral_key": r.ephemeral_key,
+                "identity_key": r.identity_key,
+                "public_key": r.public_key,
+                "predecessor_last_sequence": r.predecessor_last_sequence,
+                "created_at": r.created_at,
+            } for r in self._session_rotations.values()]
             messages = {
                 sid: [{
                     "session_id": m.session_id,
@@ -8201,6 +8415,7 @@ class DeviceStore:
                             batch_claim_session_bindings,
                         "groups": groups, "group_sessions": group_sessions,
                         "group_session_rotations": group_session_rotations,
+                        "session_rotations": session_rotations,
                         "messages": messages, "delivery": delivery,
                         "group_delivery": group_delivery,
                         "used_nonces": used_nonces,
@@ -8388,6 +8603,7 @@ class DeviceStore:
         raw_group_sessions = state.get("group_sessions", [])
         raw_group_session_rotations = state.get(
             "group_session_rotations", [])
+        raw_session_rotations = state.get("session_rotations", [])
         raw_messages = state.get("messages", {})
         raw_delivery = state.get("delivery", [])
         raw_group_delivery = state.get("group_delivery", [])
@@ -8416,6 +8632,7 @@ class DeviceStore:
                 and isinstance(raw_groups, list)
                 and isinstance(raw_group_sessions, list)
                 and isinstance(raw_group_session_rotations, list)
+                and isinstance(raw_session_rotations, list)
                 and isinstance(raw_messages, dict)
                 and isinstance(raw_delivery, list)
                 and isinstance(raw_group_delivery, list)
@@ -9173,6 +9390,126 @@ class DeviceStore:
                 revision=revision, members=list(members),
                 created_at=created_at)
 
+        # 1:1 session rotation records. Older version-1 files predate the
+        # section: it is absent and treated as empty. A present section is
+        # fully validated — every record references a stored 1:1 predecessor
+        # and successor session (never a group session), the endpoints are
+        # preserved (the successor's initiator/recipient equal the
+        # predecessor's and the frozen record's), the requested pre-key is
+        # one of the recipient's own pre-keys (it may since have been
+        # revoked; the snapshot is frozen), the successor's frozen public
+        # material/created_at agree exactly with its session snapshot, the
+        # rotation_id/successor/predecessor are each unique (no id reuse, no
+        # forking a predecessor, and no two records pointing at one
+        # successor), and predecessor_last_sequence matches the actual last
+        # stored message sequence of the predecessor. A contradiction
+        # refuses startup rather than silently dropping the record.
+        session_rotations: Dict[str, SessionRotation] = {}
+        session_rotation_predecessors: Set[str] = set()
+        session_rotation_successors: Set[str] = set()
+        for index, raw in enumerate(raw_session_rotations):
+            where = f"session_rotations[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            rotation_id = raw.get("rotation_id")
+            predecessor_session_id = raw.get("predecessor_session_id")
+            successor_session_id = raw.get("successor_session_id")
+            initiator_device_id = raw.get("initiator_device_id")
+            recipient_device_id = raw.get("recipient_device_id")
+            prekey_id = raw.get("prekey_id")
+            ephemeral_key = raw.get("ephemeral_key")
+            identity_key = raw.get("identity_key")
+            public_key = raw.get("public_key")
+            created_at = raw.get("created_at")
+            for name, value in (("rotation_id", rotation_id),
+                                ("predecessor_session_id",
+                                 predecessor_session_id),
+                                ("successor_session_id", successor_session_id),
+                                ("initiator_device_id", initiator_device_id),
+                                ("recipient_device_id", recipient_device_id),
+                                ("prekey_id", prekey_id),
+                                ("ephemeral_key", ephemeral_key),
+                                ("identity_key", identity_key),
+                                ("public_key", public_key),
+                                ("created_at", created_at)):
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"{where}.{name} must be a non-empty string")
+            last_sequence = raw.get("predecessor_last_sequence")
+            if not isinstance(last_sequence, int) \
+                    or isinstance(last_sequence, bool) or last_sequence < 0:
+                raise ValueError(
+                    f"{where}.predecessor_last_sequence must be a non-negative "
+                    f"integer")
+            if rotation_id in session_rotations:
+                raise ValueError(
+                    f"duplicate session rotation in state: {rotation_id}")
+            if predecessor_session_id == successor_session_id:
+                raise ValueError(
+                    f"{where} successor session must differ from its "
+                    f"predecessor: {successor_session_id}")
+            predecessor = sessions.get(predecessor_session_id)
+            if predecessor is None:
+                raise ValueError(
+                    f"{where} references an unknown predecessor session: "
+                    f"{predecessor_session_id}")
+            successor = sessions.get(successor_session_id)
+            if successor is None:
+                raise ValueError(
+                    f"{where} references an unknown successor session: "
+                    f"{successor_session_id}")
+            if predecessor_session_id in session_rotation_predecessors:
+                raise ValueError(
+                    f"{where} forks predecessor session: "
+                    f"{predecessor_session_id}")
+            if successor_session_id in session_rotation_successors:
+                raise ValueError(
+                    f"{where} successor session already produced by another "
+                    f"rotation: {successor_session_id}")
+            if initiator_device_id not in device_index \
+                    or recipient_device_id not in device_index:
+                raise ValueError(
+                    f"{where} references an unknown rotation endpoint")
+            # The successor preserves the predecessor's two endpoints.
+            if initiator_device_id != predecessor.initiator_device_id \
+                    or recipient_device_id != predecessor.recipient_device_id:
+                raise ValueError(
+                    f"{where} endpoints do not match the predecessor session")
+            if successor.initiator_device_id != initiator_device_id \
+                    or successor.recipient_device_id != recipient_device_id:
+                raise ValueError(
+                    f"{where} endpoints do not match the successor session")
+            recipient_key = device_index[recipient_device_id]
+            recipient_device = devices[recipient_key]
+            if not any(pk.key_id == prekey_id
+                       for pk in recipient_device.prekeys):
+                raise ValueError(
+                    f"{where} prekey_id does not belong to recipient "
+                    f"{recipient_device_id}: {prekey_id}")
+            # The frozen public material must equal the successor snapshot.
+            if successor.prekey_id != prekey_id \
+                    or successor.ephemeral_key != ephemeral_key \
+                    or successor.identity_key != identity_key \
+                    or successor.public_key != public_key \
+                    or successor.created_at != created_at:
+                raise ValueError(
+                    f"{where} frozen values do not match the successor "
+                    f"session snapshot")
+            session_rotation_predecessors.add(predecessor_session_id)
+            session_rotation_successors.add(successor_session_id)
+            session_rotations[rotation_id] = SessionRotation(
+                rotation_id=rotation_id,
+                predecessor_session_id=predecessor_session_id,
+                successor_session_id=successor_session_id,
+                initiator_device_id=initiator_device_id,
+                recipient_device_id=recipient_device_id,
+                prekey_id=prekey_id,
+                ephemeral_key=ephemeral_key,
+                identity_key=identity_key,
+                public_key=public_key,
+                predecessor_last_sequence=last_sequence,
+                created_at=created_at)
+
         messages: Dict[str, List[Message]] = {}
         for sid, stream in raw_messages.items():
             if not isinstance(sid, str) or not isinstance(stream, list):
@@ -9246,6 +9583,20 @@ class DeviceStore:
                     message_id=message_id, sequence=sequence, nonce=nonce,
                     ciphertext=ciphertext, created_at=created_at))
             messages[sid] = parsed
+
+        # Cross-check the 1:1 rotation records' predecessor_last_sequence
+        # against the parsed predecessor streams (sequences are 1..n, so the
+        # last stored sequence is the stream length; 0 when there are no
+        # messages). This runs after both sections are parsed.
+        for rotation in session_rotations.values():
+            predecessor_stream = messages.get(
+                rotation.predecessor_session_id, [])
+            actual_last = (predecessor_stream[-1].sequence
+                           if predecessor_stream else 0)
+            if rotation.predecessor_last_sequence != actual_last:
+                raise ValueError(
+                    "session_rotations predecessor_last_sequence does not "
+                    f"match predecessor messages: {rotation.rotation_id}")
 
         # Session-scoped replay protection. Older version-1 files predate the
         # section: rebuild it from stored message history, which lists every
@@ -11281,6 +11632,13 @@ class DeviceStore:
             self._rotation_by_successor = {
                 rotation.successor_session_id: rotation
                 for rotation in group_session_rotations.values()}
+            self._session_rotations = session_rotations
+            self._session_rotation_by_predecessor = {
+                rotation.predecessor_session_id: rotation
+                for rotation in session_rotations.values()}
+            self._session_rotation_by_successor = {
+                rotation.successor_session_id: rotation
+                for rotation in session_rotations.values()}
             self._messages = messages
             self._delivery = delivery
             self._group_delivery = group_delivery
