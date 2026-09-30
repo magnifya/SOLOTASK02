@@ -3755,6 +3755,100 @@ class DeviceStore:
                      "renewal_id": renewal_id,
                      "leased_until": leased_until}, 201)
 
+    def group_inbox_lease_get(
+            self, device_id: str, lease_id: str
+    ) -> Dict[str, Any]:
+        """Read one occupied group-inbox lease's current state (read-only).
+
+        ``GET /v1/devices/{device_id}/group-inbox/leases/{lease_id}``.
+        Group counterpart of :meth:`inbox_lease_get` (group leases have no
+        completions). Under the one store lock (shared with group claims,
+        renewals, releases, group acks, group retries and revocation), the
+        lease is resolved first: a never-committed *lease_id* raises
+        ``lease_not_found`` (404/lease_id) and one owned by another device
+        — or committed in the 1:1 namespace, since the id is global —
+        raises ``lease_id_conflict`` (409/lease_id), regardless of the
+        path device's state. A matching lease is returned even when its
+        device has since been revoked: the lookup deliberately performs no
+        device state check, so a lease stays inspectable after revocation.
+
+        The body keys are ``device_id``, ``lease_id``, ``limit``,
+        ``state``, ``leased_until``, ``released_at`` and ``messages`` in
+        that order. ``limit`` is the claim's frozen limit;
+        ``leased_until`` is the current effective deadline (the claim
+        value, or the last renewal's after one or more renewals);
+        ``released_at`` is the release timestamp or ``None``. ``state``
+        is one of ``released`` / ``active`` / ``expired``: a release
+        wins, and an unreleased lease is active only while the query
+        instant precedes its effective deadline. ``messages`` lists the
+        claimed messages in claim (group-inbox) order; each item is
+        ``session_id``/``message_id``/``sequence``/``acked``/
+        ``attempts`` with the per-device group delivery record's current
+        values (an ack never removes an item). The query writes nothing
+        and advances no commit generation, so an unchanged state answers
+        byte-identically and a rebuild after restart yields the same
+        result.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            existing = self._find_group_inbox_lease_locked(lease_id)
+            if existing is None:
+                # lease_id is global: one held by a 1:1 lease lives in
+                # another namespace, so it is a conflict (owned
+                # elsewhere), never a not-found.
+                if self._find_inbox_lease_locked(lease_id) is not None:
+                    raise InboxLeaseError(INBOX_LEASE_CONFLICT)
+                raise InboxLeaseError(INBOX_LEASE_NOT_FOUND)
+            owner, limit, _claim_deadline, _released, ordered_keys = \
+                existing
+            # A cross-device lookup is a conflict regardless of the path
+            # device's current state, mirroring the mutating lease routes.
+            if owner != device_id:
+                raise InboxLeaseError(INBOX_LEASE_CONFLICT)
+
+            # The lease copies on every group delivery record are
+            # identical by restore validation; gather them in claim order.
+            leases: List[MessageLease] = []
+            for key in ordered_keys:
+                lease = next(item for item in self._group_delivery[key]
+                             .leases if item.lease_id == lease_id)
+                leases.append(lease)
+            first_lease = leases[0]
+            if first_lease.released_at is not None:
+                state = "released"
+            elif self._lease_is_active_locked(first_lease, now):
+                state = "active"
+            else:
+                state = "expired"
+            # Current effective deadline as a stored string: the claim
+            # value, or the last renewal's after one or more renewals.
+            leased_until = first_lease.renewals[-1].leased_until \
+                if first_lease.renewals else first_lease.leased_until
+            messages: List[Dict[str, Any]] = []
+            for hit_session_id, hit_message_id, _hit_device_id \
+                    in ordered_keys:
+                delivery = self._group_delivery[
+                    (hit_session_id, hit_message_id, device_id)]
+                sequence = next(m.sequence
+                                for m in self._messages[hit_session_id]
+                                if m.message_id == hit_message_id)
+                messages.append({
+                    "session_id": hit_session_id,
+                    "message_id": hit_message_id,
+                    "sequence": sequence,
+                    "acked": delivery.acked,
+                    "attempts": delivery.attempts,
+                })
+            return {
+                "device_id": device_id,
+                "lease_id": lease_id,
+                "limit": limit,
+                "state": state,
+                "leased_until": leased_until,
+                "released_at": first_lease.released_at,
+                "messages": messages,
+            }
+
     def inbox_lease_release_batch(
             self, device_id: str,
             items: List[str]

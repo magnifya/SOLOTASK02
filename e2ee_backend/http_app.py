@@ -674,6 +674,42 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"message": "device not found",
                                       "field": "device_id"})
                 return
+            if "/group-inbox/leases/" in suffix:
+                # {device_id}/group-inbox/leases/{lease_id} — split on raw
+                # slashes only; a percent-encoded slash inside an id
+                # segment is part of it. Both segments must be non-empty
+                # and strictly percent-decodable as UTF-8, device_id first
+                # (its 400 precedes a bad lease_id escape). A deeper path
+                # (a raw slash after the lease segment) is 404/lease_id;
+                # renew/release are POST-only sub-handlers.
+                head, _, lease_segment = suffix.partition(
+                    "/group-inbox/leases/")
+                if head and "/" not in head and lease_segment:
+                    if "/" in lease_segment:
+                        self._send_json(404, {
+                            "message": "lease not found",
+                            "field": "lease_id"})
+                        return
+                    device_id = _strict_percent_decode(head)
+                    if device_id is None:
+                        self._send_json(400, {
+                            "message": "device_id has a malformed percent "
+                                       "escape or is not valid UTF-8",
+                            "field": "device_id"})
+                        return
+                    lease_id = _strict_percent_decode(lease_segment)
+                    if lease_id is None:
+                        self._send_json(400, {
+                            "message": "lease_id has a malformed percent "
+                                       "escape or is not valid UTF-8",
+                            "field": "lease_id"})
+                        return
+                    self._handle_device_group_inbox_lease_get(
+                        device_id, lease_id)
+                    return
+                self._send_json(404, {"message": "device not found",
+                                      "field": "device_id"})
+                return
             if suffix.endswith("/inbox/leases"):
                 device_id = suffix[:-len("/inbox/leases")]
                 if not device_id or "/" in device_id:
@@ -1403,6 +1439,38 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(status_code, body)
+
+    def _handle_device_group_inbox_lease_get(
+            self, device_id: str, lease_id: str) -> None:
+        # The single group-inbox lease query takes no request body and no
+        # query parameters: a non-empty body is 400/request_body, however
+        # it is legally framed (Content-Length or chunked transfer
+        # encoding), and any query parameter (a bare ``?foo`` flag
+        # included) is 400/query. The path identifiers are already
+        # strictly percent-decoded as UTF-8 by the router. Validation
+        # order matches the body-less group routes: non-empty body
+        # (request_body), then any query parameter (query). A trailing
+        # ``?`` with no parameter at all is accepted.
+        body = self._read_framed_body()
+        if body is None:
+            return  # a 400 response was already sent
+        if body:
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        if query:
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        try:
+            body = self.service.group_inbox_lease_get(device_id, lease_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
 
     def _handle_device_inbox_claim(self, device_id: str) -> None:
         payload = self._read_json_request()
