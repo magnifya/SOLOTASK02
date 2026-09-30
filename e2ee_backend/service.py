@@ -100,7 +100,9 @@ from .storage import (
     INBOX_LEASE_NOT_DELIVERED,
     INBOX_LEASE_NOT_FOUND,
     INBOX_LEASE_UNAVAILABLE,
+    IDENTITY_NOT_ED25519,
     PREKEY_CONFLICT,
+    PREKEY_SIGNATURE_INVALID,
     REDELIVERY_JOB_CONFLICT,
     REDELIVERY_JOB_DEVICE_INACTIVE,
     REDELIVERY_JOB_DEVICE_UNKNOWN,
@@ -528,6 +530,56 @@ class DeviceService:
             raise self._device_update_error(error, device_id)
         return view, 201 if created else 200
 
+    def add_prekey_verified(self, device_id: str,
+                            payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and append an identity-authorized pre-key.
+
+        The post-registration counterpart of :meth:`add_prekey`; same body
+        fields plus a ``signature``. ``key_id`` and ``public_key`` must be
+        non-empty strings and the key must parse as a public key;
+        ``signature`` must be a non-empty string that is canonical standard
+        base64 decoding to exactly 64 bytes. Fields are validated in
+        ``key_id``, ``public_key``, ``signature`` order before the device is
+        touched, and a non-object body is 400/field=request_body — all the
+        same field paths as the request carries.
+
+        Only then is the store entered: unknown device 404, revoked device
+        409 (field ``device_id``). A new id is accepted only when the
+        device's *current* identity key is Ed25519 (400/field=identity_key)
+        and the signature verifies over the E2EE-SIGNED-PREKEY-V1 canonical
+        proof for the device's current user and this request's ids (400/
+        field=signature). A verified new id appends in order (201); an
+        existing, non-revoked id with the identical key is an idempotent
+        replay (200) resolved from the stored tuple without re-verifying; a
+        changed key or revoked id conflicts (409/key_id). Every failure
+        writes nothing. Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("key_id", "public_key", "signature"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if load_public_key(payload["public_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: public_key", "public_key")
+        signature = decode_ed25519_signature(payload["signature"])
+        if signature is None:
+            raise ServiceError(
+                "field must be a standard base64 64-byte Ed25519 "
+                "signature: signature", "signature")
+
+        try:
+            view, created = self.store.add_prekey_verified(
+                device_id, payload["key_id"], payload["public_key"],
+                signature)
+        except DeviceUpdateError as error:
+            raise self._device_update_error(error, device_id)
+        return view, 201 if created else 200
+
     @staticmethod
     def _device_update_error(error: DeviceUpdateError,
                              device_id: str) -> ServiceError:
@@ -542,6 +594,14 @@ class DeviceService:
             return ServiceError(
                 "key_id already exists with a different key or is revoked",
                 "key_id", status_code=409)
+        if error.reason == IDENTITY_NOT_ED25519:
+            return ServiceError(
+                "current identity_key is not an Ed25519 public key",
+                "identity_key", status_code=400)
+        if error.reason == PREKEY_SIGNATURE_INVALID:
+            return ServiceError(
+                "signed pre-key proof failed verification",
+                "signature", status_code=400)
         raise  # pragma: no cover - defensive
 
     # -- one-time pre-key claims ------------------------------------------

@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from .crypto import load_ed25519_public_key, verify_signed_prekey
 from .models import (
     BatchClaimDevice,
     BatchClaimSessionBinding,
@@ -121,6 +122,12 @@ DEVICE_UNKNOWN = "device_unknown"
 DEVICE_REVOKED = "device_revoked"
 #: Outcome code for a pre-key add conflict (same id, changed key, or revoked).
 PREKEY_CONFLICT = "prekey_conflict"
+#: Outcome code for a verified pre-key add whose device's current identity
+#: key is not an Ed25519 public key (400/field=identity_key).
+IDENTITY_NOT_ED25519 = "identity_not_ed25519"
+#: Outcome code for a verified pre-key add whose Ed25519 proof does not verify
+#: against the device's current identity key (400/field=signature).
+PREKEY_SIGNATURE_INVALID = "prekey_signature_invalid"
 
 #: Outcome codes for group creation / membership changes.
 GROUP_UNKNOWN = "group_unknown"
@@ -1448,6 +1455,69 @@ class DeviceStore:
                              "key_id": existing.key_id,
                              "public_key": existing.public_key}, False)
                 raise DeviceUpdateError(PREKEY_CONFLICT)
+            self._migrate_pending_anchors()
+            prekey = SignedPreKey(key_id=key_id, public_key=public_key)
+            device.prekeys.append(prekey)
+            self._append_key_event(
+                device_id, KEY_EVENT_PREKEY_ADDED,
+                {"key_id": key_id, "public_key": public_key})
+            self._notify_change()
+            return ({"device_id": device.device_id,
+                     "key_id": prekey.key_id,
+                     "public_key": prekey.public_key}, True)
+
+    def add_prekey_verified(self, device_id: str, key_id: str,
+                            public_key: str, signature: bytes
+                            ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically append an identity-authorized pre-key.
+
+        The identity-authorized counterpart of :meth:`add_prekey`: every
+        stored-state outcome is resolved exactly as there (a new id appends
+        and reports ``created`` True/201; an existing, non-revoked key with
+        the same ``public_key`` is an idempotent replay/200; an existing id
+        with a changed key or a revoked id is ``prekey_conflict``/409;
+        unknown device -> ``device_unknown``/404; revoked device ->
+        ``device_revoked``/409), so idempotent replays, concurrent claims
+        and revocations and durable commits keep the ordinary entry's
+        deterministic results.
+
+        Only the create branch needs authorization: it loads the device's
+        *current* identity key under this same lock, requires it to be an
+        Ed25519 public key (``identity_not_ed25519``) and verifies *signature*
+        over the E2EE-SIGNED-PREKEY-V1 canonical proof for the device's
+        current ``user_id`` and this request's ``device_id``/``key_id``/
+        ``public_key`` (``prekey_signature_invalid``). Loading the identity,
+        verifying and appending are one locked transaction, so a concurrent
+        identity rotation or device/key revocation is linearized wholly
+        before or after this call and the proof can never be checked against
+        a superseded key. A failed check writes nothing: no pre-key, no audit
+        event, no persistence generation.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                raise DeviceUpdateError(DEVICE_UNKNOWN)
+            if device.revoked:
+                raise DeviceUpdateError(DEVICE_REVOKED)
+            existing = next((pk for pk in device.prekeys
+                             if pk.key_id == key_id), None)
+            if existing is not None:
+                # The stored tuple alone decides the replay/conflict, exactly
+                # like the ordinary entry; an already-committed authorized key
+                # is not re-verified against a possibly-rotated identity.
+                if not existing.revoked and existing.public_key == public_key:
+                    return ({"device_id": device.device_id,
+                             "key_id": existing.key_id,
+                             "public_key": existing.public_key}, False)
+                raise DeviceUpdateError(PREKEY_CONFLICT)
+            identity = load_ed25519_public_key(device.identity_key)
+            if identity is None:
+                raise DeviceUpdateError(IDENTITY_NOT_ED25519)
+            if not verify_signed_prekey(
+                    identity, signature, device.user_id, device_id,
+                    key_id, public_key):
+                raise DeviceUpdateError(PREKEY_SIGNATURE_INVALID)
             self._migrate_pending_anchors()
             prekey = SignedPreKey(key_id=key_id, public_key=public_key)
             device.prekeys.append(prekey)

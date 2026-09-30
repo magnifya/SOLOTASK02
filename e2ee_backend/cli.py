@@ -193,6 +193,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="pre-key public key (string), or @path to read it from a file")
     p_add_prekey.set_defaults(handler=cmd_add_prekey)
 
+    p_add_prekey_verified = sub.add_parser(
+        "add-prekey-verified",
+        help="append an identity-authorized signed pre-key to a device")
+    p_add_prekey_verified.add_argument("--device-id", required=True)
+    p_add_prekey_verified.add_argument("--key-id", required=True)
+    p_add_prekey_verified.add_argument(
+        "--public-key", required=True,
+        help="pre-key public key (string), or @path to read it from a file")
+    p_add_prekey_verified.add_argument(
+        "--signature", required=True,
+        help="standard-base64 64-byte Ed25519 signature over the pre-key "
+             "proof (string), or @path to read it from a file")
+    p_add_prekey_verified.set_defaults(handler=cmd_add_prekey_verified)
+
     p_claim_prekey = sub.add_parser(
         "claim-prekey", help="claim one of a device's one-time pre-keys")
     p_claim_prekey.add_argument("--recipient-device-id", required=True)
@@ -609,6 +623,28 @@ def cmd_add_prekey(args: argparse.Namespace) -> int:
            f"{quote(args.device_id, safe='')}/prekeys")
     payload = {"key_id": args.key_id,
                "public_key": _read_key_argument(args.public_key)}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_add_prekey_verified(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/{id}/prekeys/verified; 201 created or 200 replay.
+
+    The Ed25519 proof authorizes the pre-key against the device's current
+    identity key. Either success status prints the single-line JSON on stdout
+    and exits 0; any failure prints the server's single-line JSON with its
+    field on stderr and exits non-zero.
+    """
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/devices/"
+           f"{quote(args.device_id, safe='')}/prekeys/verified")
+    payload = {"key_id": args.key_id,
+               "public_key": _read_key_argument(args.public_key),
+               "signature": _read_key_argument(args.signature)}
     try:
         status, response = _request_json("POST", url, body=payload)
     except ServerUnavailable:
