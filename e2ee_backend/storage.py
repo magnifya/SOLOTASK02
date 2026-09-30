@@ -52,6 +52,8 @@ from .models import (
     utc_now_iso,
 )
 
+from .crypto import load_ed25519_public_key, verify_signed_prekey
+
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
 SESSION_RECIPIENT_UNKNOWN = "recipient_unknown"
@@ -121,6 +123,11 @@ DEVICE_UNKNOWN = "device_unknown"
 DEVICE_REVOKED = "device_revoked"
 #: Outcome code for a pre-key add conflict (same id, changed key, or revoked).
 PREKEY_CONFLICT = "prekey_conflict"
+#: Outcome code for a verified pre-key add whose device's current identity key
+#: is not an Ed25519 public key (the proof cannot be checked against it).
+PREKEY_IDENTITY_NOT_ED25519 = "identity_not_ed25519"
+#: Outcome code for a verified pre-key proof that fails signature verification.
+PREKEY_SIGNATURE_INVALID = "prekey_signature_invalid"
 
 #: Outcome codes for group creation / membership changes.
 GROUP_UNKNOWN = "group_unknown"
@@ -1447,6 +1454,79 @@ class DeviceStore:
                     return ({"device_id": device.device_id,
                              "key_id": existing.key_id,
                              "public_key": existing.public_key}, False)
+                raise DeviceUpdateError(PREKEY_CONFLICT)
+            self._migrate_pending_anchors()
+            prekey = SignedPreKey(key_id=key_id, public_key=public_key)
+            device.prekeys.append(prekey)
+            self._append_key_event(
+                device_id, KEY_EVENT_PREKEY_ADDED,
+                {"key_id": key_id, "public_key": public_key})
+            self._notify_change()
+            return ({"device_id": device.device_id,
+                     "key_id": prekey.key_id,
+                     "public_key": prekey.public_key}, True)
+
+    def add_prekey_verified(self, device_id: str, key_id: str,
+                            public_key: str, signature: bytes
+                            ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically append an identity-authorized (signed) pre-key.
+
+        The whole check-and-append runs under the store lock — the same lock
+        identity rotation, device/key revocation and pre-key claims take — so
+        the proof is always checked against the device's *current* identity
+        key and the lookup, verification, idempotency decision and append are
+        one linearizable transaction: a concurrent rotation, revocation or
+        claim can never interleave between the check and the write.
+
+        The signature is an already-decoded 64-byte Ed25519 signature over the
+        domain-separated canonical proof for *device_id* / *key_id* /
+        *public_key* and the device's stored ``user_id``; the caller has
+        already validated the request fields and the signature encoding.
+
+        A new ``key_id`` whose proof verifies is appended in order and
+        reported with ``created`` True (201), appending exactly one
+        ``prekey_added`` key-audit event in the same transaction. An
+        existing, non-revoked key with the same ``public_key`` and a valid
+        proof is idempotent (200, ``created`` False): it appends no event,
+        notifies no change and consumes no commit generation. An existing id
+        with a changed key, or an id whose key was revoked, is a
+        :class:`DeviceUpdateError` ``prekey_conflict`` (409/key_id) even with
+        a valid proof. Unknown device -> ``device_unknown`` (404); revoked
+        device -> ``device_revoked`` (409); a current identity key that is not
+        Ed25519 -> ``identity_not_ed25519`` (400/identity_key); a proof that
+        does not verify -> ``prekey_signature_invalid`` (400/signature). On
+        any failure nothing is written, no event is appended and the durable
+        generation is untouched.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                raise DeviceUpdateError(DEVICE_UNKNOWN)
+            if device.revoked:
+                raise DeviceUpdateError(DEVICE_REVOKED)
+            identity = load_ed25519_public_key(device.identity_key)
+            if identity is None:
+                raise DeviceUpdateError(PREKEY_IDENTITY_NOT_ED25519)
+            # The proof is always verified against the current identity key
+            # before the idempotency/conflict decision, so an invalid
+            # signature (400/signature) takes precedence over an existing-id
+            # conflict (409/key_id), mirroring the endpoint's fixed order.
+            if not verify_signed_prekey(
+                    identity, signature, device.user_id,
+                    device.device_id, key_id, public_key):
+                raise DeviceUpdateError(PREKEY_SIGNATURE_INVALID)
+            existing = next((pk for pk in device.prekeys
+                             if pk.key_id == key_id), None)
+            if existing is not None:
+                if not existing.revoked and existing.public_key == public_key:
+                    # Identical, non-revoked key with a valid proof: a
+                    # state-free idempotent replay — no event, no change
+                    # notification, no durable generation.
+                    return ({"device_id": device.device_id,
+                             "key_id": existing.key_id,
+                             "public_key": existing.public_key}, False)
+                # Same id with a changed key, or an id whose key was revoked.
                 raise DeviceUpdateError(PREKEY_CONFLICT)
             self._migrate_pending_anchors()
             prekey = SignedPreKey(key_id=key_id, public_key=public_key)

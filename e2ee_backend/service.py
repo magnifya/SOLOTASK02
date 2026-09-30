@@ -101,6 +101,8 @@ from .storage import (
     INBOX_LEASE_NOT_FOUND,
     INBOX_LEASE_UNAVAILABLE,
     PREKEY_CONFLICT,
+    PREKEY_IDENTITY_NOT_ED25519,
+    PREKEY_SIGNATURE_INVALID,
     REDELIVERY_JOB_CONFLICT,
     REDELIVERY_JOB_DEVICE_INACTIVE,
     REDELIVERY_JOB_DEVICE_UNKNOWN,
@@ -528,6 +530,59 @@ class DeviceService:
             raise self._device_update_error(error, device_id)
         return view, 201 if created else 200
 
+    def add_prekey_verified(self, device_id: str,
+                            payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and append an identity-authorized (signed) pre-key.
+
+        The body is a JSON object with three non-empty strings:
+        ``key_id``, ``public_key`` and ``signature``. ``public_key`` uses the
+        usual public-key encodings; ``signature`` is standard base64 decoding
+        to exactly 64 bytes — an Ed25519 signature verified against the
+        device's *current* identity key over the same domain-separated
+        canonical proof (``E2EE-SIGNED-PREKEY-V1``) as verified registration,
+        for the stored ``user_id`` and the request's ``device_id`` /
+        ``key_id`` / ``public_key`` strings taken verbatim.
+
+        A body that is not an object is 400/field=request_body; a missing or
+        wrongly-typed field, an invalid public key, or an invalid signature
+        encoding is 400 naming ``key_id``, ``public_key`` or ``signature``.
+        The proof and the device/identity checks then run atomically in the
+        store: unknown device is 404/field=device_id, a revoked device
+        409/field=device_id, a current identity key that is not Ed25519
+        400/field=identity_key, and a proof that does not verify
+        400/field=signature. A verified new id appends and returns 201; the
+        same id with the same, non-revoked key and a valid proof is
+        idempotent (200); the same id with a changed key or a revoked id is
+        409/field=key_id. On failure no device, pre-key, audit-chain, sync
+        cursor or durable generation is changed. Returns ``(body,
+        status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("key_id", "public_key", "signature"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if load_public_key(payload["public_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: public_key", "public_key")
+        signature = decode_ed25519_signature(payload["signature"])
+        if signature is None:
+            raise ServiceError(
+                "field must be a standard base64 64-byte Ed25519 "
+                "signature: signature", "signature")
+
+        try:
+            view, created = self.store.add_prekey_verified(
+                device_id, payload["key_id"], payload["public_key"],
+                signature)
+        except DeviceUpdateError as error:
+            raise self._device_update_error(error, device_id)
+        return view, 201 if created else 200
+
     @staticmethod
     def _device_update_error(error: DeviceUpdateError,
                              device_id: str) -> ServiceError:
@@ -538,6 +593,14 @@ class DeviceService:
         if error.reason == DEVICE_REVOKED:
             return ServiceError("device_id is revoked",
                                 "device_id", status_code=409)
+        if error.reason == PREKEY_IDENTITY_NOT_ED25519:
+            return ServiceError(
+                "field is not a valid Ed25519 public key: identity_key",
+                "identity_key")
+        if error.reason == PREKEY_SIGNATURE_INVALID:
+            return ServiceError(
+                "signed pre-key proof failed verification: signature",
+                "signature")
         if error.reason == PREKEY_CONFLICT:
             return ServiceError(
                 "key_id already exists with a different key or is revoked",

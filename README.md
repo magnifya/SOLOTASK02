@@ -45,6 +45,8 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 - `POST /v1/devices/{device_id}/prekeys/{key_id}/revoke`：撤销单个预密钥。成功 `200`，响应体 `{"device_id":...,"key_id":...,"revoked":true}`；重复调用幂等；未知设备 `404/field=device_id`，设备存在但 `key_id` 未知 `404/field=key_id`。仅排除目标 key，其他 key 与同用户的其他设备不受影响。
 - `POST /v1/devices/{device_id}/identity-key/rotate`：轮换身份公钥。`identity_key` 须为非空合法公钥，否则 `400/field=identity_key`；设备未知/已撤销 `404/409/field=device_id`。`rotated_at` 初值等于 `registered_at`；相同原始公钥 `200` 且时间戳不变，不同公钥更新并生成新的 UTC ISO-8601（`+00:00`）。响应含 `device_id`/`identity_key`/`rotated_at`。轮换只影响此后新建的会话，既有会话快照冻结。
 - `POST /v1/devices/{device_id}/prekeys`：补充预密钥。`key_id`、`public_key` 非空且公钥合法，否则 `400`（`public_key` 非法时 `field=public_key`）；设备未知/已撤销 `404/409/field=device_id`。新 `key_id` 顺序追加返回 `201`（`device_id`/`key_id`/`public_key`）；同 id 同原始公钥且未撤销幂等 `200`；同 id 异值或该 id 已撤销 `409/field=key_id`。撤销的 key 无法用同 id 重新补充。
+- `POST /v1/devices/{device_id}/prekeys/verified`：注册后凭设备**当前身份公钥授权**补充预密钥，不改变注册、普通补充、领取、会话、消息与同步入口语义。请求体为 `key_id`/`public_key`/`signature` 三个非空字符串：`public_key` 沿用现有公钥编码；`signature` 为标准 base64、解码恰为 64 字节的 Ed25519 签名，被签字节沿用可验证注册公开的 `E2EE-SIGNED-PREKEY-V1` 规则和按 `device_id`/`key_id`/`public_key`/`user_id` 排序的紧凑 JSON（Unicode 与请求字符串原样参与；`user_id` 取设备注册时存储值）。请求体不是对象 `400/field=request_body`；字段缺失或类型错误、公钥非法、签名编码非法分别按 `key_id`/`public_key`/`signature` 返回 `400`；设备未知 `404/field=device_id`，已撤销 `409/field=device_id`；当前 `identity_key` 非 Ed25519 `400/field=identity_key`；验签失败 `400/field=signature`（验签先于 key_id 冲突判定）。验签通过后新 `key_id` 追加返回 `201`，响应为 `device_id`/`key_id`/`public_key`；同 `key_id` 同原始 `public_key` 且未撤销时幂等返回 `200`（需同样验签通过）；同 `key_id` 异值或该 id 已撤销返回 `409/field=key_id`。全部检查（含验签）与追加、键审计事件、version=1 持久化在同一存储锁事务内提交；失败不改变设备、预密钥、审计链、同步游标或持久化代次，落盘失败回滚并经 HTTP 返回 `503/field=data_file`。追加的 key 与普通补充同构（领取、撤销、审计 `prekey_added` 事件、重启恢复语义一致）。
+
 - `POST /v1/prekeys/claim`：领取一次性预密钥。体含非空字符串 `recipient_device_id`、`claim_id`，缺失或类型错误 `400`/对应 `field`。接收方设备未知 `404/field=recipient_device_id`，已撤销 `409/同字段`，无未撤销未消费预密钥 `409/field=prekey_id`。按注册顺序选首个未撤销、未消费 key，原子标记消费后 `201` 返回 `claim_id`/`recipient_device_id`/`identity_key`/`key_id`/`public_key`/`claimed_at`（UTC ISO-8601，`+00:00`）。重复 `claim_id` 返回 `200` 及与首次完全相同的响应且不再消费；不同 `claim_id` 领取下一个 key。已消费 key 从 `GET /v1/devices/{id}` 的 `prekey_ids` 排除；用该 `key_id` 创建会话返回 `409/field=prekey_id`；撤销设备或 key 后不可领取。领取、会话创建、撤销共享存储同一把锁线性化，并发竞态仅一个领取成功。记录落于状态文件 `prekey_claims`（含 `device_id`、`key_id` 及上述字段），旧文件缺该字段且 key 无 `consumed` 标记按未消费加载；该段存在时校验 claim_id 与 (device,key) 唯一、字段类型、对已注册设备及其自有 key 的引用、与 key 的 `consumed` 标记一致，畸形拒启。落盘失败回滚（内存与文件均不前移）并经 HTTP 返回 `503/field=data_file`，重启后恢复领取映射。
 - `POST /v1/prekeys/claim-batch`：为用户多台设备批量领取预钥（单领接口契约不变）。体含非空字符串 `user_id`、`claim_id`，缺失或类型错误 `400`/对应 `field`。用户不存在（无任何设备）`404/field=user_id`，设备全部已撤销（无活跃设备）`409/field=device_id`。按注册顺序枚举该用户全部未撤销设备，每台取首个未撤销且未消费预钥；任一活跃设备无可用项则 `409/field=prekey_id` 且所有设备的所有项均不消费（先全量选取、后一次性消费）。成功在存储锁内一次性消费全部选中 key 并持久化，`201` 返回 `claim_id`/`user_id`/`claimed_at`/`devices`；`devices` 按上述注册顺序排列，每项含 `device_id`/`identity_key`/`key_id`/`public_key`，身份与预钥材料在领取时冻结，`claimed_at` 为 UTC ISO-8601（`+00:00`）。重复批量 `claim_id` 返回 `200` 及与首次完全相同的响应且不再消费（即便此后设备或 key 被撤销、身份密钥轮换）。`claim_id` 与单领共用同一全局幂等命名空间：已被另一类领取使用的 id 返回 `409/field=claim_id`。批量选取与消费和单领、撤销、补钥、会话创建共享存储同一把锁线性化，任何失败不改状态。记录落于 version=1 状态文件新增 `prekey_batch_claims` 段，旧文件缺该段按空加载；该段存在时校验批次 claim_id 唯一且不与 `prekey_claims` 冲突、每个设备属于该批次 `user_id`、每个预钥归属于该设备、冻结 `identity_key`/`public_key` 与当前存储一致、每个 (device,key) 恰被一条领取（单领或批量）记录支撑且与 key 的 `consumed` 标记一致，矛盾拒启。落盘失败返回 `503/field=data_file` 并回滚（内存与文件均不前移，本次未消费任何 key）。
 - `POST /v1/groups`：创建群组。`group_id`、`creator_device_id` 非空字符串，`member_device_ids` 非空字符串数组（元素非空），否则 `400`/对应 `field`；创建者未知/已撤销 `404/409/field=creator_device_id`；重复 `group_id` `409/field=group_id`。成员 id 不要求已注册；创建者恒居首位，其余按序去重。成功 `201` 返回 `group_id`/`revision`（初值 1）/`members`/`created_at`。
@@ -203,6 +205,13 @@ python3 -m e2ee_backend add-prekey \
   --device-id laptop --key-id 3 --public-key BASE64_OR_PEM_PUBLIC_KEY
 # => {"device_id":"laptop","key_id":"3","public_key":"…"}
 
+# 凭当前身份公钥授权补充预密钥（signature 为 E2EE-SIGNED-PREKEY-V1 证明的
+# 标准 base64 64 字节 Ed25519 签名；201 新建 / 200 幂等重放，均单行输出到 stdout）
+python3 -m e2ee_backend add-prekey-verified \
+  --device-id laptop --key-id 4 \
+  --public-key BASE64_OR_PEM_PUBLIC_KEY --signature BASE64_ED25519_SIGNATURE
+# => {"device_id":"laptop","key_id":"4","public_key":"…"}
+
 # 协商会话（ephemeral-key 同样支持 PEM/base64/hex 公钥与 @文件）
 python3 -m e2ee_backend create-session \
   --initiator-device-id laptop --recipient-device-id phone \
@@ -357,6 +366,6 @@ e2ee_backend/
   locking.py      # --data-file 状态文件的进程级非阻塞独占锁：POSIX flock、Windows msvcrt.locking 字节区间锁，锁文件只创建不截断、不参与崩溃遗留扫描
   service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/群组/群会话/群会话轮换/消息/投递/群同步）
   http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、群组创建/查询/成员增删、群组会话协商/查询/轮换、消息投递/幂等提交与拉取、重试/确认/状态、群会话同步与检查点、会话同步批量确认 sync/ack、补投事件保留 event-gc、只读持久化完整性探针 /v1/persistence/integrity）
-  cli.py          # register/register-verified/show/key-events/revoke-*/rotate-identity-key/add-prekey/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
+  cli.py          # register/register-verified/show/key-events/revoke-*/rotate-identity-key/add-prekey/add-prekey-verified/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/serve 命令行入口
 tests/            # unittest 测试
 ```
