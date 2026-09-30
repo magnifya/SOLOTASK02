@@ -199,6 +199,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_show_session.add_argument("session_id")
     p_show_session.set_defaults(handler=cmd_show_session)
 
+    p_rotate_session = sub.add_parser(
+        "rotate-session",
+        help="rotate a one-to-one session into a fresh successor")
+    p_rotate_session.add_argument("session_id")
+    p_rotate_session.add_argument("--rotation-id", required=True)
+    p_rotate_session.add_argument(
+        "--actor-device-id", required=True,
+        help="the predecessor session's initiator device")
+    p_rotate_session.add_argument(
+        "--prekey-id", required=True,
+        help="a currently valid pre-key of the recipient")
+    p_rotate_session.add_argument(
+        "--ephemeral-key", required=True,
+        help="new ephemeral public key (string), or @path to read from a file")
+    p_rotate_session.set_defaults(handler=cmd_rotate_session)
+
     p_group_create = sub.add_parser("group-create", help="create a member group")
     p_group_create.add_argument("--group-id", required=True)
     p_group_create.add_argument("--creator-device-id", required=True)
@@ -650,6 +666,27 @@ def cmd_show_session(args: argparse.Namespace) -> int:
     stream = sys.stdout if status == 200 else sys.stderr
     print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
     return 0 if status == 200 else 1
+
+
+def cmd_rotate_session(args: argparse.Namespace) -> int:
+    """Call POST /v1/sessions/{sid}/rotate; 201 or 200 both succeed."""
+    from urllib.parse import quote
+
+    payload = {
+        "rotation_id": args.rotation_id,
+        "actor_device_id": args.actor_device_id,
+        "prekey_id": args.prekey_id,
+        "ephemeral_key": _read_key_argument(args.ephemeral_key),
+    }
+    url = (f"{args.base_url}/v1/sessions/"
+           f"{quote(args.session_id, safe='')}/rotate")
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status in (200, 201) else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status in (200, 201) else 1
 
 
 def cmd_group_create(args: argparse.Namespace) -> int:

@@ -700,6 +700,31 @@ class MessageSyncCursor:
 
 
 @dataclass
+class SessionRotation:
+    """The durable record of one one-to-one session rotation.
+
+    Rotating a predecessor 1:1 session creates a fresh 1:1 session between
+    the same two endpoints with new public key material; the predecessor
+    snapshot itself is never altered and its message history stays filed
+    under the old id. The record is idempotent on ``rotation_id`` for the
+    same predecessor: replaying it returns the original successor. A given
+    predecessor may be rotated at most once (no forks), a given
+    ``rotation_id`` may succeed for at most one predecessor, and a successor
+    session is produced by exactly one rotation. ``predecessor_last_sequence``
+    freezes the length (highest sequence) of the predecessor's message stream
+    at commit time, so the history cutoff is durable even though messages
+    keep their old ids.
+    """
+
+    rotation_id: str
+    predecessor_session_id: str
+    successor_session_id: str
+    actor_device_id: str
+    predecessor_last_sequence: int
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class Session:
     """An immutable snapshot of a negotiated session.
 
