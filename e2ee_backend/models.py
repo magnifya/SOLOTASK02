@@ -226,16 +226,17 @@ class MessageSubmission:
 
 @dataclass
 class MessageLeaseRenewal:
-    """One committed renewal of a 1:1-inbox redelivery lease.
+    """One committed renewal of an inbox redelivery lease (1:1 or group).
 
-    ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/renew`` extends
-    the lease's effective deadline by exactly 30 seconds per renewal. The
-    record freezes the client-chosen ``renewal_id`` (unique within one
-    lease, but reusable across different leases) together with the new
-    effective ``leased_until`` deadline produced by that renewal, so a
-    replayed renewal returns its first response byte-identically. Every
-    delivery record the lease appears on carries an item-by-item identical
-    copy of the renewal list.
+    ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/renew`` and its
+    ``group-inbox`` counterpart each extend the lease's effective deadline
+    by exactly 30 seconds per renewal. The record freezes the
+    client-chosen ``renewal_id`` (unique within one lease, but reusable
+    across different leases) together with the new effective
+    ``leased_until`` deadline produced by that renewal, so a replayed
+    renewal returns its first response byte-identically. Every delivery
+    record the lease appears on carries an item-by-item identical copy of
+    the renewal list.
     """
 
     renewal_id: str

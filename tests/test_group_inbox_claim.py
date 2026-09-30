@@ -364,10 +364,11 @@ class GroupLeasePersistenceTest(GroupLeaseMixin, unittest.TestCase):
             self.assertEqual(len(record["leases"]), 1)
             self.assertEqual(list(record["leases"][0]),
                              ["lease_id", "limit", "leased_until",
-                              "released_at"])
+                              "released_at", "renewals"])
             self.assertEqual(record["leases"][0]["lease_id"], "L1")
             self.assertEqual(record["leases"][0]["limit"], 2)
             self.assertIsNone(record["leases"][0]["released_at"])
+            self.assertEqual(record["leases"][0]["renewals"], [])
 
     def test_empty_claim_and_replay_consume_no_generation(self) -> None:
         self.service.group_inbox_claim(
@@ -449,7 +450,15 @@ class GroupLeasePersistenceTest(GroupLeaseMixin, unittest.TestCase):
         self._assert_refuses_startup(self._malformed_group_document(mutate))
 
         def mutate(document):
-            document["group_delivery"][0]["leases"][0]["renewals"] = []
+            document["group_delivery"][0]["leases"][0]["renewals"] = {}
+        self._assert_refuses_startup(self._malformed_group_document(mutate))
+
+        def mutate(document):
+            first = next(record for record in document["group_delivery"]
+                         if record.get("leases"))
+            first["leases"][0]["renewals"] = [
+                {"renewal_id": "R1",
+                 "leased_until": "2000-01-01T00:00:00.000000+00:00"}]
         self._assert_refuses_startup(self._malformed_group_document(mutate))
 
     def test_restore_rejects_inconsistent_binding(self) -> None:
