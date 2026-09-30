@@ -2008,6 +2008,36 @@ class DeviceService:
                                "device_id", status_code=409)
         return body, status_code
 
+    def group_inbox_lease_get(self, device_id: str,
+                              lease_id: str) -> Dict[str, Any]:
+        """Return one occupied group-inbox lease's current state (read-only).
+
+        ``GET /v1/devices/{device_id}/group-inbox/leases/{lease_id}``.
+        The GET takes no request body and no query parameters: the HTTP
+        layer rejects a non-empty body with 400/field ``request_body`` and
+        any query string with 400/field ``query``. A never-committed
+        ``lease_id`` is 404/field ``lease_id`` and a lease owned by another
+        device — or committed in the 1:1 namespace, since the id is global
+        — is 409/field ``lease_id``, both decided in the store under the
+        lock ahead of everything else; a matching lease is returned even
+        if its device has since been revoked, and the lookup is purely
+        read-only (no write, no ``commit_seq`` change). On success the
+        body keys are ``device_id``, ``lease_id``, ``limit``, ``state``,
+        ``leased_until``, ``released_at`` and ``messages`` in that order;
+        ``state`` is one of ``active``, ``expired`` or ``released``.
+        """
+        try:
+            return self.store.group_inbox_lease_get(device_id, lease_id)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            raise
+
     def group_inbox_release(self, device_id: str,
                             lease_id: str) -> Tuple[Dict[str, Any], int]:
         """Release one occupied group-inbox lease before its deadline.

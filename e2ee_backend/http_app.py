@@ -659,6 +659,42 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_key_events(unquote(device_id))
                 return
+            if "/group-inbox/leases/" in suffix:
+                # {device_id}/group-inbox/leases/{lease_id} — split on
+                # raw slashes only; a percent-encoded slash inside an id
+                # segment is part of it. Both segments must be non-empty
+                # and strictly percent-decodable as UTF-8, device_id
+                # first (its 400 precedes a bad lease_id escape). A
+                # deeper path under the lease is 404/lease_id; this
+                # exact pattern has no sub-handler (renew/release are
+                # POST-only), so any other mismatch is not this route.
+                head, _, lease_segment = \
+                    suffix.partition("/group-inbox/leases/")
+                if head and "/" not in head and lease_segment:
+                    if "/" in lease_segment:
+                        self._send_json(404, {"message": "lease not found",
+                                              "field": "lease_id"})
+                        return
+                    device_id = _strict_percent_decode(head)
+                    if device_id is None:
+                        self._send_json(400, {
+                            "message": "device_id has a malformed percent "
+                                       "escape or is not valid UTF-8",
+                            "field": "device_id"})
+                        return
+                    lease_id = _strict_percent_decode(lease_segment)
+                    if lease_id is None:
+                        self._send_json(400, {
+                            "message": "lease_id has a malformed percent "
+                                       "escape or is not valid UTF-8",
+                            "field": "lease_id"})
+                        return
+                    self._handle_device_group_inbox_lease_get(
+                        device_id, lease_id)
+                    return
+                self._send_json(404, {"message": "device not found",
+                                      "field": "device_id"})
+                return
             if "/inbox/leases/" in suffix:
                 # {device_id}/inbox/leases/{lease_id} — split on raw slashes
                 # only; a percent-encoded slash inside an id segment is part
@@ -1349,6 +1385,38 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(status_code, body)
+
+    def _handle_device_group_inbox_lease_get(
+            self, device_id: str, lease_id: str) -> None:
+        # The lease query takes no request body and no query parameters:
+        # a non-empty body is 400/request_body (checked first, like the
+        # other body-less group-inbox lease routes) and any parameter —
+        # keep_blank_values so a bare ``?foo`` flag counts, while a
+        # trailing empty ``?`` does not — is 400/query.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"message": "invalid Content-Length header",
+                                  "field": "Content-Length"})
+            return
+        if length > 0:
+            # Drain the body so the connection stays usable, then reject.
+            self.rfile.read(length)
+            self._send_json(400, {"message": "request body must be empty",
+                                  "field": "request_body"})
+            return
+        if parse_qs(urlsplit(self.path).query,
+                    keep_blank_values=True):
+            self._send_json(400, {"message": "query parameters are not "
+                                             "accepted",
+                                  "field": "query"})
+            return
+        try:
+            body = self.service.group_inbox_lease_get(device_id, lease_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
 
     def _handle_device_group_inbox_lease_release(
             self, device_id: str, lease_id: str) -> None:
