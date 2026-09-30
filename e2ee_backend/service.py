@@ -2042,6 +2042,107 @@ class DeviceService:
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
 
+    def group_inbox_claim(self, device_id: str,
+                          payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one group-inbox redelivery lease claim.
+
+        ``POST /v1/devices/{device_id}/group-inbox/claim``. The body must
+        be a JSON object carrying only a non-empty string ``lease_id`` and
+        a non-boolean integer ``limit`` in 1..100. A bad/non-object body is
+        400/field ``request_body``; an unexpected key is 400 named by that
+        key; a missing, empty or wrongly typed field is 400 with the
+        corresponding field (``lease_id`` / ``limit``; floats, booleans and
+        out-of-range values all fail the ``limit`` check).
+
+        The ``lease_id`` is globally bound: replaying it for the same
+        device and limit returns the frozen first response with 200 and
+        writes nothing; the same id on another device, with another limit,
+        or already bound to a 1:1-inbox lease is 409/field ``lease_id``,
+        decided ahead of the path device's state. The device itself is
+        resolved under the store lock (unknown/revoked ->
+        409/field=device_id). A fresh claim that leases at least one
+        unacked, not-validly-leased group message returns 201 with
+        ``device_id``, ``lease_id``, ``leased_until`` (30 seconds out, UTC
+        ISO-8601 with six microsecond digits and ``+00:00``) and
+        ``messages`` in group-inbox order; an empty selection returns 200
+        with ``leased_until`` null and ``messages`` empty, occupying no id
+        and writing nothing.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        extras = [key for key in payload if key not in ("lease_id", "limit")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        if "lease_id" not in payload:
+            raise ServiceError("missing required field: lease_id",
+                               "lease_id")
+        if not is_nonempty_string(payload["lease_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: lease_id", "lease_id")
+        if "limit" not in payload:
+            raise ServiceError("missing required field: limit", "limit")
+        limit = payload["limit"]
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or not 1 <= limit <= 100:
+            raise ServiceError(
+                "field must be an integer in 1..100: limit", "limit")
+
+        try:
+            body, status_code, _ = self.store.group_inbox_claim(
+                device_id, payload["lease_id"], limit)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is already used by another device or with a "
+                    "different limit", "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+        return body, status_code
+
+    def group_inbox_release(self, device_id: str,
+                            lease_id: str) -> Tuple[Dict[str, Any], int]:
+        """Release one occupied group-inbox lease before its deadline.
+
+        ``POST /v1/devices/{device_id}/group-inbox/leases/{lease_id}/
+        release`` (no request body or query string; the HTTP layer rejects
+        either with 400/field ``request_body`` or ``query``). A
+        never-committed group ``lease_id`` is 404/field ``lease_id`` and
+        one owned by another device is 409/field ``lease_id``; both are
+        decided under the store lock ahead of the path device's state. A
+        first release on an unknown or revoked device is
+        409/field=device_id.
+
+        A first release returns 201 with ``device_id``, ``lease_id``,
+        ``released_at`` (UTC ISO-8601, six microsecond digits,
+        ``+00:00``) and ``released_count`` in that key order and persists
+        one generation; a repeat release returns the first response
+        byte-identically with 200, even if the device has since been
+        revoked. Released messages become claimable under a new lease,
+        while replaying the original claim still returns its frozen
+        response. Acknowledgements, attempts and attempt-id dedup sets are
+        never touched.
+        """
+        try:
+            return self.store.group_inbox_release(device_id, lease_id)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
     def inbox_lease_renew(self, device_id: str, lease_id: str,
                           payload: object) -> Tuple[Dict[str, Any], int]:
         """Validate and apply one 1:1-inbox lease renewal.
