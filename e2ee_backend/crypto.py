@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 
@@ -33,6 +34,10 @@ AES_KEY_BYTES = 32
 
 #: Domain-separation prefix for the signed pre-key proof message.
 SIGNED_PREKEY_PROOF_PREFIX = "E2EE-SIGNED-PREKEY-V1"
+#: Domain-separation prefix for the identity-key fingerprint message.
+IDENTITY_FINGERPRINT_PREFIX = "E2EE-IDENTITY-FINGERPRINT-V1"
+#: Length of a fingerprint: SHA-256 rendered as lowercase hexadecimal.
+IDENTITY_FINGERPRINT_HEX_LEN = 64
 #: Length of an Ed25519 signature in bytes.
 ED25519_SIGNATURE_BYTES = 64
 
@@ -325,3 +330,49 @@ def verify_signed_prekey(identity_key: ed25519.Ed25519PublicKey,
     except InvalidSignature:
         return False
     return True
+
+
+def canonical_public_key_bytes(value: str) -> Optional[bytes]:
+    """Return the canonical encoding of the public key in *value*.
+
+    Accepts the same encodings as :func:`load_public_key` (PEM text,
+    base64/hex DER SubjectPublicKeyInfo, or base64/hex raw 32-byte
+    X25519/Ed25519 point). Two wire spellings of the same key canonicalize
+    to the same bytes: an X25519/Ed25519 key in any encoding becomes its raw
+    32-byte point, while any other key type becomes its DER
+    SubjectPublicKeyInfo. Returns ``None`` when *value* does not parse as a
+    public key.
+    """
+    key = load_public_key(value)
+    if key is None:
+        return None
+    if isinstance(key, (x25519.X25519PublicKey, ed25519.Ed25519PublicKey)):
+        return key.public_bytes(serialization.Encoding.Raw,
+                                serialization.PublicFormat.Raw)
+    return key.public_bytes(serialization.Encoding.DER,
+                            serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def identity_fingerprint(identity_key: str) -> Optional[str]:
+    """Compute the domain-separated SHA-256 fingerprint of an identity key.
+
+    The fingerprint is the lowercase hex SHA-256 of the UTF-8 bytes of the
+    ``E2EE-IDENTITY-FINGERPRINT-V1`` domain prefix, one newline and the
+    canonical public-key bytes (see
+    :func:`canonical_public_key_bytes`). Because the key is canonicalized
+    first, PEM, DER (base64 or hex) and raw-point (base64 or hex) spellings
+    of the same key yield the same 64-character fingerprint. Returns
+    ``None`` when *identity_key* does not parse as a public key.
+    """
+    canonical = canonical_public_key_bytes(identity_key)
+    if canonical is None:
+        return None
+    message = (IDENTITY_FINGERPRINT_PREFIX + "\n").encode("utf-8") + canonical
+    return hashlib.sha256(message).hexdigest()
+
+
+def is_fingerprint_format(value: object) -> bool:
+    """Return True iff *value* is 64 lowercase hexadecimal characters."""
+    return (isinstance(value, str)
+            and len(value) == IDENTITY_FINGERPRINT_HEX_LEN
+            and all(char in "0123456789abcdef" for char in value))

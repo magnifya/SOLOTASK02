@@ -1613,7 +1613,8 @@ def _candidate_is_section_complete(document: Dict[str, Any]) -> bool:
     """Require the durable-transaction sections a real snapshot always has.
 
     Every snapshot produced by :meth:`JsonStateStore.save` is one full
-    transaction and therefore carries the per-device sync cursor sections
+    transaction and therefore carries the ``identity_verifications``
+    section, the per-device sync cursor sections
     (``group_sync_cursors`` and ``message_sync_cursors``) and the
     ``key_events`` audit-chain section, each as a list — an empty list when
     the section has no records, but never absent. A leftover that parses and
@@ -1624,7 +1625,8 @@ def _candidate_is_section_complete(document: Dict[str, Any]) -> bool:
     normal path; this gate applies only to leftover-snapshot recovery).
     """
     return all(isinstance(document.get(name), list)
-               for name in ("group_sync_cursors", "message_sync_cursors",
+               for name in ("identity_verifications",
+                            "group_sync_cursors", "message_sync_cursors",
                             "key_events"))
 
 

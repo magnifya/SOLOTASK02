@@ -186,6 +186,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
             self._route_revoke(path)
         elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/identity-verifications"):
+            self._route_identity_verifications(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
                 and path.endswith("/identity-key/rotate"):
             self._route_rotate_identity(path)
         elif path.startswith(_DEVICES_PATH + "/") \
@@ -338,6 +341,15 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         parts = suffix.split("/")
         if len(parts) == 1 and parts[0]:
             self._handle_rotate_identity(unquote(parts[0]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_identity_verifications(self, path: str) -> None:
+        suffix = path[len(_DEVICES_PATH) + 1:
+                      -len("/identity-verifications")]
+        if suffix and "/" not in suffix:
+            self._handle_identity_verifications(unquote(suffix))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -689,6 +701,14 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                                           "field": "device_id"})
                     return
                 self._handle_key_events(unquote(device_id))
+                return
+            if suffix.endswith("/identity-fingerprint"):
+                device_id = suffix[:-len("/identity-fingerprint")]
+                if not device_id or "/" in device_id:
+                    self._send_json(404, {"message": "device not found",
+                                          "field": "device_id"})
+                    return
+                self._handle_identity_fingerprint(unquote(device_id))
                 return
             if "/inbox/leases/" in suffix:
                 # {device_id}/inbox/leases/{lease_id} — split on raw slashes
@@ -1135,6 +1155,56 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(200, body)
+
+    def _handle_identity_fingerprint(self, device_id: str) -> None:
+        # keep_blank_values so an explicit ``verifier_device_id=`` is an
+        # empty (hence malformed, 400) value rather than silently absent.
+        query = parse_qs(urlsplit(self.path).query,
+                         keep_blank_values=True)
+        values = query.get("verifier_device_id")
+        if not values:
+            self._send_json(400, {
+                "message": "missing required query parameter: "
+                           "verifier_device_id",
+                "field": "verifier_device_id"})
+            return
+        if len(values) > 1:
+            self._send_json(400, {
+                "message": "query parameter must appear exactly once: "
+                           "verifier_device_id",
+                "field": "verifier_device_id"})
+            return
+        verifier_device_id = values[0]
+        if not verifier_device_id:
+            self._send_json(400, {
+                "message": "query parameter must be non-empty: "
+                           "verifier_device_id",
+                "field": "verifier_device_id"})
+            return
+        if verifier_device_id == device_id:
+            self._send_json(400, {
+                "message": "verifier_device_id must differ from device_id",
+                "field": "verifier_device_id"})
+            return
+        try:
+            body = self.service.identity_fingerprint_view(
+                device_id, verifier_device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_identity_verifications(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.verify_identity(
+                device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
 
     def _handle_add_prekey(self, device_id: str) -> None:
         payload = self._read_json_request()

@@ -46,10 +46,35 @@ class Device:
     rotated_at: Optional[str] = None
     prekeys: List[SignedPreKey] = field(default_factory=list)
     revoked: bool = False
+    #: Identity-key version as seen by this device's peers. Starts at 1; a
+    #: rotation to the same key leaves it unchanged, a different key raises
+    #: it by one. Older version-1 files without the field read as version 1.
+    identity_key_version: int = 1
 
     def __post_init__(self) -> None:
         if self.rotated_at is None:
             self.rotated_at = self.registered_at
+
+
+@dataclass
+class IdentityVerification:
+    """One committed explicit fingerprint verification by one peer device.
+
+    A verifier device records that it compared a peer device's identity
+    fingerprint out-of-band and confirmed *fingerprint* under the
+    client-chosen *verification_id*. Records are immutable history: when the
+    peer later rotates to a different identity key the record stays on file
+    but the pair is read as ``changed``; a fresh verification under a new id
+    supersedes it (becoming the pair's active record), while the old id can
+    never succeed again. Only identifiers, the public fingerprint and a UTC
+    timestamp are retained.
+    """
+
+    verification_id: str
+    verifier_device_id: str
+    device_id: str
+    fingerprint: str
+    confirmed_at: str = field(default_factory=utc_now_iso)
 
 
 @dataclass

@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import (
     decode_ed25519_signature,
+    identity_fingerprint,
+    is_fingerprint_format,
     is_nonempty_string,
     load_ed25519_public_key,
     load_public_key,
@@ -157,6 +159,7 @@ from .storage import (
     SYNC_SELF_SENDER,
     DeviceStore,
     DeviceUpdateError,
+    IdentityVerificationError,
     BatchClaimSessionError,
     ClaimSessionError,
     DeliveryError,
@@ -498,6 +501,114 @@ class DeviceService:
         except DeviceUpdateError as error:
             raise self._device_update_error(error, device_id)
         return view
+
+    # -- identity fingerprint & explicit verification ---------------------
+
+    def _identity_peer_and_verifier(
+            self, device_id: str,
+            verifier_device_id: str) -> Tuple[Device, Device]:
+        """Resolve the two devices of a fingerprint/verification request.
+
+        The peer (*device_id*) is checked first, then the verifier: unknown
+        or revoked is a 404 naming ``device_id`` or ``verifier_device_id``
+        respectively. The two ids must differ.
+        """
+        peer = self.store.find_by_device_id(device_id)
+        if peer is None or peer.revoked:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        verifier = self.store.find_by_device_id(verifier_device_id)
+        if verifier is None or verifier.revoked:
+            raise ServiceError(
+                f"verifier device not found: {verifier_device_id}",
+                "verifier_device_id", status_code=404)
+        return peer, verifier
+
+    def identity_fingerprint_view(self, device_id: str,
+                                  verifier_device_id: str) -> Dict[str, Any]:
+        """Return the verifier's identity-fingerprint view of a peer.
+
+        Answers ``GET /v1/devices/{device_id}/identity-fingerprint``: the
+        peer's current ``identity_key``, its domain-separated 64-char
+        lowercase hex ``fingerprint``, the current ``identity_key_version``
+        (1-based; same-key rotations leave it fixed, different-key rotations
+        raise it), the pair's ``verification_status`` (``unverified``,
+        ``verified`` or ``changed``) and the active ``verification_id`` (null
+        until a first verification).
+        """
+        peer, _verifier = self._identity_peer_and_verifier(
+            device_id, verifier_device_id)
+        fingerprint = identity_fingerprint(peer.identity_key)
+        # A registered identity key always parses; keep an explicit guard so
+        # a corrupt record can never leak a null fingerprint.
+        if fingerprint is None:
+            raise ServiceError(
+                "stored identity key is not a valid public key: "
+                "identity_key", "identity_key")
+        return self.store.identity_fingerprint_view(
+            verifier_device_id, device_id, fingerprint)
+
+    def verify_identity(self, device_id: str,
+                        payload: object) -> Tuple[Dict[str, Any], int]:
+        """Explicitly confirm a peer's fingerprint.
+
+        Handles ``POST .../identity-verifications``. The body carries three
+        non-empty strings: ``verifier_device_id``,
+        ``verification_id`` and ``expected_fingerprint``; the last must be 64
+        lowercase hexadecimal characters. A confirmation that matches the
+        peer's current fingerprint writes the first record (201); repeating
+        the same id for the same verifier/peer/fingerprint while it is still
+        active is an idempotent replay (200). Reusing an id for another pair,
+        reusing a superseded id after the peer's key changed, or confirming a
+        pair that already has an active (still-matching) record under another
+        id is 409/field=verification_id; a well-formed fingerprint that does
+        not match the peer's current key is 409/field=expected_fingerprint.
+        Unknown or revoked devices are 404 (``device_id`` checked first, then
+        ``verifier_device_id``). Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("verifier_device_id", "verification_id",
+                     "expected_fingerprint"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        verifier_device_id = payload["verifier_device_id"]
+        verification_id = payload["verification_id"]
+        expected_fingerprint = payload["expected_fingerprint"]
+        if verifier_device_id == device_id:
+            raise ServiceError(
+                "verifier_device_id must differ from device_id",
+                "verifier_device_id")
+        if not is_fingerprint_format(expected_fingerprint):
+            raise ServiceError(
+                "field must be 64 lowercase hexadecimal characters: "
+                "expected_fingerprint", "expected_fingerprint")
+
+        peer, _verifier = self._identity_peer_and_verifier(
+            device_id, verifier_device_id)
+        current_fingerprint = identity_fingerprint(peer.identity_key)
+        if current_fingerprint is None:
+            raise ServiceError(
+                "stored identity key is not a valid public key: "
+                "identity_key", "identity_key")
+        if expected_fingerprint != current_fingerprint:
+            raise ServiceError(
+                "expected_fingerprint does not match the device's current "
+                "identity key",
+                "expected_fingerprint", status_code=409)
+        try:
+            view, created = self.store.confirm_identity_verification(
+                verifier_device_id, device_id, verification_id,
+                current_fingerprint)
+        except IdentityVerificationError:
+            raise ServiceError(
+                "verification_id conflicts with an existing verification",
+                "verification_id", status_code=409) from None
+        return view, 201 if created else 200
 
     def add_prekey(self, device_id: str,
                    payload: object) -> Tuple[Dict[str, Any], int]:
