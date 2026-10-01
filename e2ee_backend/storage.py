@@ -30,6 +30,7 @@ from .models import (
     GroupSession,
     GroupSessionRotation,
     GroupSyncCursor,
+    IdentityVerification,
     KeyEvent,
     LeaseEventCursor,
     LeaseSubscription,
@@ -52,7 +53,12 @@ from .models import (
     utc_now_iso,
 )
 
-from .crypto import load_ed25519_public_key, verify_signed_prekey
+from .crypto import (
+    identity_fingerprint,
+    is_identity_fingerprint,
+    load_ed25519_public_key,
+    verify_signed_prekey,
+)
 
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
@@ -128,6 +134,20 @@ PREKEY_CONFLICT = "prekey_conflict"
 PREKEY_IDENTITY_NOT_ED25519 = "identity_not_ed25519"
 #: Outcome code for a verified pre-key proof that fails signature verification.
 PREKEY_SIGNATURE_INVALID = "prekey_signature_invalid"
+
+#: Outcome codes for identity-fingerprint verification. The subject is the
+#: device whose fingerprint is confirmed; the verifier is the confirming one.
+IDENTITY_SUBJECT_UNKNOWN = "subject_unknown"
+IDENTITY_SUBJECT_REVOKED = "subject_revoked"
+IDENTITY_VERIFIER_UNKNOWN = "verifier_unknown"
+IDENTITY_VERIFIER_REVOKED = "verifier_revoked"
+#: A verification_id was already committed with a different subject/verifier
+#: or fingerprint, or another active confirmation already exists for the
+#: same verifier/device pair.
+IDENTITY_VERIFICATION_CONFLICT = "verification_id_conflict"
+#: The submitted expected_fingerprint does not match the subject's current
+#: identity fingerprint.
+IDENTITY_FINGERPRINT_MISMATCH = "fingerprint_mismatch"
 
 #: Outcome codes for group creation / membership changes.
 GROUP_UNKNOWN = "group_unknown"
@@ -535,6 +555,14 @@ class DeviceUpdateError(Exception):
         self.reason = reason
 
 
+class IdentityVerificationError(Exception):
+    """An atomic fingerprint lookup/confirmation failed; nothing changed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class PreKeyClaimError(Exception):
     """An atomic pre-key claim failed (unknown/revoked device, no key)."""
 
@@ -880,6 +908,7 @@ INTEGRITY_SECTION_KEYS = (
     "cleanup_lease_events",
     "lease_event_cursors",
     "lease_subscriptions",
+    "identity_verifications",
 )
 
 #: Empty default for every canonical section; ``messages`` and
@@ -892,7 +921,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 28 canonical
+    """Project a store snapshot/document payload onto the 29 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -938,6 +967,15 @@ class DeviceStore:
         self._condition = threading.Condition(self._lock)
         self._devices: Dict[Tuple[str, str], Device] = {}
         self._device_index: Dict[str, Tuple[str, str]] = {}
+        # Explicit identity-fingerprint confirmations keyed by the
+        # client-chosen verification_id (globally unique). A second index
+        # maps each (verifier_device_id, subject_device_id) pair to the id
+        # of its latest (active) confirmation; superseded records stay in
+        # the primary map with active=False so an old id can never be
+        # silently replayed.
+        self._identity_verifications: Dict[str, IdentityVerification] = {}
+        self._identity_verification_by_pair: \
+            Dict[Tuple[str, str], str] = {}
         self._sessions: Dict[str, Session] = {}
         # Committed one-to-one session rotations, keyed by the client-chosen
         # rotation_id (globally unique). Two derived indexes make replay, the
@@ -1421,6 +1459,7 @@ class DeviceStore:
                 old_identity_key = device.identity_key
                 device.identity_key = identity_key
                 device.rotated_at = utc_now_iso()
+                device.identity_key_version += 1
                 self._append_key_event(
                     device_id, KEY_EVENT_IDENTITY_ROTATED,
                     {"old_identity_key": old_identity_key,
@@ -1557,6 +1596,149 @@ class DeviceStore:
                                if not pk.revoked and not pk.consumed],
                 "registered_at": device.registered_at,
             }
+
+    # -- identity fingerprints & explicit verification --------------------
+
+    def identity_fingerprint_view(self, device_id: str,
+                                  verifier_device_id: str
+                                  ) -> Dict[str, Any]:
+        """Atomically build one verifier's view of a device's fingerprint.
+
+        Both devices must exist and be active (an unknown or revoked device
+        raises :class:`IdentityVerificationError` naming the subject's or
+        verifier's reason). The view carries the subject's current
+        ``identity_key``, its lowercase-hex ``fingerprint`` and
+        ``identity_key_version``, plus the verification state relative to
+        *verifier_device_id*: ``unverified`` with ``verification_id`` null
+        until the verifier confirms a fingerprint, ``verified`` with the
+        active confirmation's id while the confirmed fingerprint still
+        matches, and ``changed`` (the active id retained) once the subject
+        rotates to different identity material.
+        """
+        with self._lock:
+            subject_key = self._device_index.get(device_id)
+            subject = self._devices.get(subject_key) \
+                if subject_key is not None else None
+            if subject is None:
+                raise IdentityVerificationError(IDENTITY_SUBJECT_UNKNOWN)
+            if subject.revoked:
+                raise IdentityVerificationError(IDENTITY_SUBJECT_REVOKED)
+            verifier_key = self._device_index.get(verifier_device_id)
+            verifier = self._devices.get(verifier_key) \
+                if verifier_key is not None else None
+            if verifier is None:
+                raise IdentityVerificationError(IDENTITY_VERIFIER_UNKNOWN)
+            if verifier.revoked:
+                raise IdentityVerificationError(IDENTITY_VERIFIER_REVOKED)
+            fingerprint = identity_fingerprint(subject.identity_key)
+            return self._identity_fingerprint_view_locked(
+                subject, verifier_device_id, fingerprint)
+
+    def _identity_fingerprint_view_locked(
+            self, device: Device, verifier_device_id: str,
+            fingerprint: str) -> Dict[str, Any]:
+        """Build the five-field fingerprint view; caller holds the lock."""
+        verification_id: Optional[str] = None
+        verification_status = "unverified"
+        active_id = self._identity_verification_by_pair.get(
+            (verifier_device_id, device.device_id))
+        if active_id is not None:
+            record = self._identity_verifications[active_id]
+            verification_id = record.verification_id
+            verification_status = ("verified"
+                                   if record.fingerprint == fingerprint
+                                   else "changed")
+        return {
+            "identity_key": device.identity_key,
+            "fingerprint": fingerprint,
+            "identity_key_version": device.identity_key_version,
+            "verification_status": verification_status,
+            "verification_id": verification_id,
+        }
+
+    @staticmethod
+    def identity_verification_view(
+            record: IdentityVerification) -> Dict[str, Any]:
+        """Copy one confirmation record into its public six-field view."""
+        return {
+            "verification_id": record.verification_id,
+            "device_id": record.device_id,
+            "verifier_device_id": record.verifier_device_id,
+            "fingerprint": record.fingerprint,
+            "verified_at": record.verified_at,
+            "active": record.active,
+        }
+
+    def confirm_identity_verification(
+            self, device_id: str, verifier_device_id: str,
+            verification_id: str, expected_fingerprint: str
+            ) -> Tuple[Dict[str, Any], int]:
+        """Atomically confirm a device's fingerprint on a verifier's behalf.
+
+        Returns ``(record_view, status_code)``: 201 for a first confirmation
+        of the pair, 200 for an exact replay of the pair's active
+        confirmation id with the same fingerprint, and 409 (raised as
+        :class:`IdentityVerificationError` ``verification_id_conflict``) when
+        the id is already committed for another pair/fingerprint, when the
+        pair already has another active confirmation, or when an old,
+        superseded id is reused. A new id whose
+        ``expected_fingerprint`` does not equal the subject's current
+        fingerprint raises ``fingerprint_mismatch`` instead. Unknown or
+        revoked subject/verifier raise the matching lookup reason.
+        """
+        with self._lock:
+            subject_key = self._device_index.get(device_id)
+            subject = self._devices.get(subject_key) \
+                if subject_key is not None else None
+            if subject is None:
+                raise IdentityVerificationError(IDENTITY_SUBJECT_UNKNOWN)
+            if subject.revoked:
+                raise IdentityVerificationError(IDENTITY_SUBJECT_REVOKED)
+            verifier_key = self._device_index.get(verifier_device_id)
+            verifier = self._devices.get(verifier_key) \
+                if verifier_key is not None else None
+            if verifier is None:
+                raise IdentityVerificationError(IDENTITY_VERIFIER_UNKNOWN)
+            if verifier.revoked:
+                raise IdentityVerificationError(IDENTITY_VERIFIER_REVOKED)
+            current_fingerprint = identity_fingerprint(subject.identity_key)
+            pair = (verifier_device_id, device_id)
+            existing = self._identity_verifications.get(verification_id)
+            active_id = self._identity_verification_by_pair.get(pair)
+            if existing is not None:
+                if (existing.verifier_device_id == verifier_device_id
+                        and existing.device_id == device_id
+                        and existing.fingerprint == expected_fingerprint
+                        and existing.verification_id == active_id):
+                    # Exact replay of the pair's still-active confirmation.
+                    return (self.identity_verification_view(existing), 200)
+                raise IdentityVerificationError(
+                    IDENTITY_VERIFICATION_CONFLICT)
+            if active_id is not None:
+                active = self._identity_verifications[active_id]
+                if expected_fingerprint != current_fingerprint:
+                    # A confirmation can only ever bind to the subject's
+                    # current fingerprint; an outdated or invented one is a
+                    # mismatch even on the supersede path.
+                    raise IdentityVerificationError(
+                        IDENTITY_FINGERPRINT_MISMATCH)
+                if active.fingerprint == current_fingerprint:
+                    # The pair's active confirmation already covers this
+                    # (current) fingerprint; a second new id may not
+                    # duplicate it — a new id may only supersede after the
+                    # subject rotated to different material.
+                    raise IdentityVerificationError(
+                        IDENTITY_VERIFICATION_CONFLICT)
+                active.active = False
+            record = IdentityVerification(
+                verification_id=verification_id,
+                device_id=device_id,
+                verifier_device_id=verifier_device_id,
+                fingerprint=expected_fingerprint)
+            self._identity_verifications[verification_id] = record
+            self._identity_verification_by_pair[pair] = verification_id
+            self._notify_change()
+            return (self.identity_verification_view(record), 201)
 
     # -- key-audit chain ---------------------------------------------------
 
@@ -8212,6 +8394,7 @@ class DeviceStore:
                     "identity_key": device.identity_key,
                     "registered_at": device.registered_at,
                     "rotated_at": device.rotated_at,
+                    "identity_key_version": device.identity_key_version,
                     "revoked": device.revoked,
                     "prekeys": [{"key_id": pk.key_id,
                                  "public_key": pk.public_key,
@@ -8477,6 +8660,14 @@ class DeviceStore:
                 "lease_id": record.lease_id,
                 "after": record.after,
             } for record in self._lease_subscriptions.values()]
+            identity_verifications = [{
+                "verification_id": record.verification_id,
+                "device_id": record.device_id,
+                "verifier_device_id": record.verifier_device_id,
+                "fingerprint": record.fingerprint,
+                "verified_at": record.verified_at,
+                "active": record.active,
+            } for record in self._identity_verifications.values()]
             document = {"devices": devices, "sessions": sessions,
                         "prekey_claims": prekey_claims,
                         "prekey_batch_claims": prekey_batch_claims,
@@ -8503,7 +8694,8 @@ class DeviceStore:
                         "cleanup_leases": cleanup_leases,
                         "cleanup_lease_events": cleanup_lease_events,
                         "lease_event_cursors": lease_event_cursors,
-                        "lease_subscriptions": lease_subscriptions}
+                        "lease_subscriptions": lease_subscriptions,
+                        "identity_verifications": identity_verifications}
             # While a legacy (section-less) file is only loaded and no change
             # has anchored its chains yet, keep the section absent — never
             # persist a present-but-empty chain section, and keep the snapshot
@@ -8693,6 +8885,7 @@ class DeviceStore:
         raw_cleanup_lease_events = state.get("cleanup_lease_events", [])
         raw_lease_event_cursors = state.get("lease_event_cursors", [])
         raw_lease_subscriptions = state.get("lease_subscriptions", [])
+        raw_identity_verifications = state.get("identity_verifications", [])
         raw_key_events = state.get("key_events")
         if not (isinstance(raw_devices, list) and isinstance(raw_sessions, list)
                 and isinstance(raw_prekey_claims, list)
@@ -8719,7 +8912,8 @@ class DeviceStore:
                 and isinstance(raw_cleanup_leases, list)
                 and isinstance(raw_cleanup_lease_events, list)
                 and isinstance(raw_lease_event_cursors, list)
-                and isinstance(raw_lease_subscriptions, list)):
+                and isinstance(raw_lease_subscriptions, list)
+                and isinstance(raw_identity_verifications, list)):
             raise ValueError("state document has a malformed top-level section")
 
         devices: Dict[Tuple[str, str], Device] = {}
@@ -8757,6 +8951,18 @@ class DeviceStore:
             revoked_value = raw.get("revoked", False)
             if not isinstance(revoked_value, bool):
                 raise ValueError(f"{where}.revoked must be a boolean")
+            # Older version-1 files predate identity_key_version; the first
+            # identity key is version 1 (the dataclass default).
+            identity_key_version = 1
+            if "identity_key_version" in raw:
+                version_value = raw["identity_key_version"]
+                if (not isinstance(version_value, int)
+                        or isinstance(version_value, bool)
+                        or version_value < 1):
+                    raise ValueError(
+                        f"{where}.identity_key_version must be a positive "
+                        f"integer")
+                identity_key_version = version_value
             raw_prekeys = raw.get("prekeys")
             if not isinstance(raw_prekeys, list):
                 raise ValueError(f"{where}.prekeys must be a list")
@@ -8795,7 +9001,9 @@ class DeviceStore:
             device = Device(
                 user_id=user_id, device_id=device_id,
                 identity_key=identity_key, registered_at=registered_at,
-                rotated_at=rotated_at, prekeys=prekeys, revoked=revoked_value)
+                rotated_at=rotated_at,
+                identity_key_version=identity_key_version,
+                prekeys=prekeys, revoked=revoked_value)
             key = (device.user_id, device.device_id)
             if key in devices or device.device_id in device_index:
                 raise ValueError(
@@ -11008,6 +11216,76 @@ class DeviceStore:
                 consumer_id=ls_consumer_id, lease_id=ls_lease_id,
                 after=ls_after)
 
+        # Explicit identity-fingerprint confirmations. Older version-1 files
+        # predate the section: it is absent and every pair reads as
+        # unverified. A present section holds one item per committed
+        # confirmation (including superseded, active=False ones), each with
+        # exactly verification_id/device_id/verifier_device_id/fingerprint/
+        # verified_at/active in that order, referencing registered devices
+        # and carrying a 64-char lowercase-hex fingerprint. The
+        # verification_id is globally unique and at most one active record
+        # may exist per (verifier_device_id, device_id) pair; any
+        # contradiction refuses startup.
+        identity_verifications: Dict[str, IdentityVerification] = {}
+        identity_verification_by_pair: Dict[Tuple[str, str], str] = {}
+        for index, raw in enumerate(raw_identity_verifications):
+            where = f"identity_verifications[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            if list(raw) != ["verification_id", "device_id",
+                             "verifier_device_id", "fingerprint",
+                             "verified_at", "active"]:
+                raise ValueError(
+                    f"{where} must have exactly the keys 'verification_id', "
+                    f"'device_id', 'verifier_device_id', 'fingerprint', "
+                    f"'verified_at' and 'active' in order")
+            iv_verification_id = raw["verification_id"]
+            iv_device_id = raw["device_id"]
+            iv_verifier_device_id = raw["verifier_device_id"]
+            iv_fingerprint = raw["fingerprint"]
+            iv_verified_at = raw["verified_at"]
+            iv_active = raw["active"]
+            for name, value in (
+                    ("verification_id", iv_verification_id),
+                    ("device_id", iv_device_id),
+                    ("verifier_device_id", iv_verifier_device_id),
+                    ("verified_at", iv_verified_at)):
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"{where}.{name} must be a non-empty string")
+            if not is_identity_fingerprint(iv_fingerprint):
+                raise ValueError(
+                    f"{where}.fingerprint must be 64 lowercase hex "
+                    f"characters")
+            if not isinstance(iv_active, bool):
+                raise ValueError(f"{where}.active must be a boolean")
+            if iv_device_id not in device_index:
+                raise ValueError(
+                    f"{where}.device_id references an unknown device: "
+                    f"{iv_device_id}")
+            if iv_verifier_device_id not in device_index:
+                raise ValueError(
+                    f"{where}.verifier_device_id references an unknown "
+                    f"device: {iv_verifier_device_id}")
+            if iv_verification_id in identity_verifications:
+                raise ValueError(
+                    f"duplicate verification_id in state: "
+                    f"{iv_verification_id}")
+            pair = (iv_verifier_device_id, iv_device_id)
+            if iv_active:
+                if pair in identity_verification_by_pair:
+                    raise ValueError(
+                        f"{where} is a second active verification for the "
+                        f"same verifier/device pair")
+                identity_verification_by_pair[pair] = iv_verification_id
+            identity_verifications[iv_verification_id] = IdentityVerification(
+                verification_id=iv_verification_id,
+                device_id=iv_device_id,
+                verifier_device_id=iv_verifier_device_id,
+                fingerprint=iv_fingerprint,
+                verified_at=iv_verified_at,
+                active=iv_active)
+
         # Per-device redelivery-job lifecycle event chains. Older version-1
         # files predate the section: it is absent and treated as empty (a
         # job without any event is simply older than the section and stays
@@ -11696,6 +11974,9 @@ class DeviceStore:
             self._cleanup_lease_events = cleanup_lease_events
             self._lease_event_cursors = lease_event_cursors
             self._lease_subscriptions = lease_subscriptions
+            self._identity_verifications = identity_verifications
+            self._identity_verification_by_pair = \
+                identity_verification_by_pair
             self._key_events = key_events
             # A file without the section predates the audit chain: every
             # registered device is chainless and gets a lazily-built anchor

@@ -44,12 +44,45 @@ class Device:
     #: Timestamp of the last identity-key rotation. A device starts unrotated,
     #: so this equals ``registered_at`` until the key is actually replaced.
     rotated_at: Optional[str] = None
+    #: Version of the current identity key. Starts at 1; replacing the key
+    #: with different material advances it by one, while re-publishing the
+    #: same key leaves it unchanged. Legacy files without the field read as 1.
+    identity_key_version: int = 1
     prekeys: List[SignedPreKey] = field(default_factory=list)
     revoked: bool = False
 
     def __post_init__(self) -> None:
         if self.rotated_at is None:
             self.rotated_at = self.registered_at
+
+
+@dataclass
+class IdentityVerification:
+    """One explicit fingerprint confirmation of one device by another.
+
+    A verifier device explicitly confirms that it recognizes the subject
+    device's identity fingerprint captured in ``fingerprint`` at confirmation
+    time. The record is keyed by the client-chosen ``verification_id``
+    (globally unique) and is idempotent for the exact same
+    ``(verifier_device_id, device_id, fingerprint)`` triple. Confirming a
+    pair supersedes any earlier confirmation of the same pair by the same
+    verifier: the old record stays stored (so replaying its id can be
+    rejected as a conflict) but is no longer active. The confirmation never
+    follows an identity-key rotation on its own — the pair's effective
+    status is derived on read by comparing ``fingerprint`` with the
+    subject's current fingerprint (``verified`` while equal, ``changed``
+    once the subject rotates to different key material).
+    """
+
+    verification_id: str
+    device_id: str
+    verifier_device_id: str
+    fingerprint: str
+    verified_at: str = field(default_factory=utc_now_iso)
+    #: True while this is the latest confirmation of this
+    #: ``(verifier_device_id, device_id)`` pair; a newer confirmation by the
+    #: same verifier flips the previous one to False (the record is retained).
+    active: bool = True
 
 
 @dataclass

@@ -44,6 +44,12 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 - `POST /v1/devices/{device_id}/revoke`：撤销设备及其全部预密钥。已存在设备返回 `200`，响应体 `{"device_id":...,"revoked":true}`；重复调用幂等；未知设备返回 `404`（`field=device_id`）。撤销后 `GET` 的 `prekey_ids` 为空，`identity_key` 与 `registered_at` 不变。
 - `POST /v1/devices/{device_id}/prekeys/{key_id}/revoke`：撤销单个预密钥。成功 `200`，响应体 `{"device_id":...,"key_id":...,"revoked":true}`；重复调用幂等；未知设备 `404/field=device_id`，设备存在但 `key_id` 未知 `404/field=key_id`。仅排除目标 key，其他 key 与同用户的其他设备不受影响。
 - `POST /v1/devices/{device_id}/identity-key/rotate`：轮换身份公钥。`identity_key` 须为非空合法公钥，否则 `400/field=identity_key`；设备未知/已撤销 `404/409/field=device_id`。`rotated_at` 初值等于 `registered_at`；相同原始公钥 `200` 且时间戳不变，不同公钥更新并生成新的 UTC ISO-8601（`+00:00`）。响应含 `device_id`/`identity_key`/`rotated_at`。轮换只影响此后新建的会话，既有会话快照冻结。
+- 身份指纹与显式确认：
+  - 设备记录新增 `identity_key_version`：从 1 开始，轮换为**不同**身份公钥时加 1，相同公钥幂等轮换不变。
+  - `GET /v1/devices/{device_id}/identity-fingerprint?verifier_device_id=...`：须恰好携带一个非空且与 `device_id` 不同的 `verifier_device_id`；缺失、重复、为空或两端相同均 `400/field=verifier_device_id`；对端（`device_id`）未知或已撤销 `404/field=device_id`，验证者未知或已撤销 `404/field=verifier_device_id`。返回 `identity_key`、`fingerprint`（域分隔串 `E2EE-IDENTITY-FINGERPRINT-V1\n` 后接规范 DER SubjectPublicKeyInfo 字节的 SHA-256，64 个小写十六进制字符；同一公钥的 PEM、DER、base64、十六进制写法结果一致）、`identity_key_version`、`verification_status`（`unverified`/`verified`/`changed`）与 `verification_id`（未验证为 `null`）。对端轮换为不同身份公钥后，既有确认状态变为 `changed` 且保留旧 `verification_id`，不自动跟随。
+  - `POST /v1/devices/{device_id}/identity-verifications`：请求体为 `verifier_device_id`、`verification_id`、`expected_fingerprint` 三个非空字符串，末项须为 64 个小写十六进制字符；缺失或非法 `400` 并以对应字段为 `field`，两端相同 `400/field=verifier_device_id`；对端/验证者未知或撤销的 404 语义同 GET。`expected_fingerprint` 匹配当前指纹且该对（验证者, 对端）首次确认写入 `201`；同 `verification_id` 同主体同指纹重放 `200`；同 id 改绑其他主体/验证者/指纹、同对设备已存在另一条 active 确认（当前指纹未变时）、或已被新确认取代的旧 id 再使用均 `409/field=verification_id`；`changed` 后须用**新 id** 确认当前指纹方可恢复 `verified`（旧 id 再用仍 `409/field=verification_id`），新 id 携带的指纹不匹配当前值为 `409/field=expected_fingerprint`。成功响应含 `verification_id`/`device_id`/`verifier_device_id`/`fingerprint`/`verified_at`/`active`。
+  - 持久化于 version=1 文件：设备段新增 `identity_key_version`，新状态写入新段 `identity_verifications`（含被取代的记录，`active=false`），随其余状态原子提交并纳入完整性快照；旧文件缺字段/缺段时按版本 1、未验证读取。重启后版本、指纹、验证状态与 201/200/409 幂等结果一致。
+  - 命令行：`fingerprint DEVICE_ID --verifier-device-id ID` 与 `verify-identity --device-id ID --verifier-device-id ID --verification-id ID --expected-fingerprint 64hex`，输出字段与 HTTP 完全对齐。
 - `POST /v1/devices/{device_id}/prekeys`：补充预密钥。`key_id`、`public_key` 非空且公钥合法，否则 `400`（`public_key` 非法时 `field=public_key`）；设备未知/已撤销 `404/409/field=device_id`。新 `key_id` 顺序追加返回 `201`（`device_id`/`key_id`/`public_key`）；同 id 同原始公钥且未撤销幂等 `200`；同 id 异值或该 id 已撤销 `409/field=key_id`。撤销的 key 无法用同 id 重新补充。
 - `POST /v1/devices/{device_id}/prekeys/verified`：注册后凭设备**当前身份公钥授权**补充预密钥，不改变注册、普通补充、领取、会话、消息与同步入口语义。请求体为 `key_id`/`public_key`/`signature` 三个非空字符串：`public_key` 沿用现有公钥编码；`signature` 为标准 base64、解码恰为 64 字节的 Ed25519 签名，被签字节沿用可验证注册公开的 `E2EE-SIGNED-PREKEY-V1` 规则和按 `device_id`/`key_id`/`public_key`/`user_id` 排序的紧凑 JSON（Unicode 与请求字符串原样参与；`user_id` 取设备注册时存储值）。请求体不是对象 `400/field=request_body`；字段缺失或类型错误、公钥非法、签名编码非法分别按 `key_id`/`public_key`/`signature` 返回 `400`；设备未知 `404/field=device_id`，已撤销 `409/field=device_id`；当前 `identity_key` 非 Ed25519 `400/field=identity_key`；验签失败 `400/field=signature`（验签先于 key_id 冲突判定）。验签通过后新 `key_id` 追加返回 `201`，响应为 `device_id`/`key_id`/`public_key`；同 `key_id` 同原始 `public_key` 且未撤销时幂等返回 `200`（需同样验签通过）；同 `key_id` 异值或该 id 已撤销返回 `409/field=key_id`。全部检查（含验签）与追加、键审计事件、version=1 持久化在同一存储锁事务内提交；失败不改变设备、预密钥、审计链、同步游标或持久化代次，落盘失败回滚并经 HTTP 返回 `503/field=data_file`。追加的 key 与普通补充同构（领取、撤销、审计 `prekey_added` 事件、重启恢复语义一致）。
 
@@ -199,6 +205,21 @@ python3 -m e2ee_backend revoke-device --device-id laptop
 python3 -m e2ee_backend rotate-identity-key \
   --device-id laptop --identity-key BASE64_OR_PEM_NEW_PUBLIC_KEY
 # => {"device_id":"laptop","identity_key":"…","rotated_at":"2026-09-19T10:14:02.345678+00:00"}
+
+# 查看身份指纹（必须给出非空且与自身不同的验证者设备 id；
+# 指纹为 E2EE-IDENTITY-FINGERPRINT-V1 域分隔 SHA-256 的 64 位小写 hex，
+# 同一公钥的 PEM/DER/base64/hex/裸 32 字节写法结果相同）
+python3 -m e2ee_backend fingerprint laptop --verifier-device-id phone
+# => {"identity_key":"…","fingerprint":"64hex","identity_key_version":1,
+#     "verification_status":"unverified","verification_id":null}
+
+# 显式确认对端身份指纹（首次匹配 201；同 id 同主体同指纹重放 200）
+python3 -m e2ee_backend verify-identity \
+  --device-id laptop --verifier-device-id phone \
+  --verification-id VERIFY-1 --expected-fingerprint 64hex
+# => {"verification_id":"VERIFY-1","device_id":"laptop",
+#     "verifier_device_id":"phone","fingerprint":"64hex",
+#     "verified_at":"…","active":true}
 
 # 补充预密钥（新 id 返回 201；同 id 同公钥幂等返回 200）
 python3 -m e2ee_backend add-prekey \

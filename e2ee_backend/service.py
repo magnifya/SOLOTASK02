@@ -9,7 +9,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import (
     decode_ed25519_signature,
+    identity_fingerprint,
     is_nonempty_string,
+    is_identity_fingerprint,
     load_ed25519_public_key,
     load_public_key,
     verify_signed_prekey,
@@ -54,6 +56,12 @@ from .storage import (
     DELIVERY_SESSION_UNKNOWN,
     DEVICE_REVOKED,
     DEVICE_UNKNOWN,
+    IDENTITY_FINGERPRINT_MISMATCH,
+    IDENTITY_SUBJECT_REVOKED,
+    IDENTITY_SUBJECT_UNKNOWN,
+    IDENTITY_VERIFICATION_CONFLICT,
+    IDENTITY_VERIFIER_REVOKED,
+    IDENTITY_VERIFIER_UNKNOWN,
     GROUP_ACTOR_NOT_CREATOR,
     GROUP_ACTOR_REVOKED,
     GROUP_ACTOR_UNKNOWN,
@@ -164,6 +172,7 @@ from .storage import (
     GroupSessionRotationError,
     GroupSyncError,
     GroupSyncAckBatchError,
+    IdentityVerificationError,
     MessageCreateError,
     MessageListError,
     InboxRetryBatchError,
@@ -415,6 +424,104 @@ class DeviceService:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
         return view
+
+    # -- identity fingerprints & explicit verification --------------------
+
+    @staticmethod
+    def _identity_verification_error(error: IdentityVerificationError
+                                     ) -> ServiceError:
+        """Translate a fingerprint/verification storage failure."""
+        if error.reason == IDENTITY_SUBJECT_UNKNOWN:
+            return ServiceError("device not found", "device_id",
+                                status_code=404)
+        if error.reason == IDENTITY_SUBJECT_REVOKED:
+            return ServiceError("device_id is revoked", "device_id",
+                                status_code=404)
+        if error.reason == IDENTITY_VERIFIER_UNKNOWN:
+            return ServiceError("verifier device not found",
+                                "verifier_device_id", status_code=404)
+        if error.reason == IDENTITY_VERIFIER_REVOKED:
+            return ServiceError("verifier_device_id is revoked",
+                                "verifier_device_id", status_code=404)
+        if error.reason == IDENTITY_VERIFICATION_CONFLICT:
+            return ServiceError(
+                "verification_id conflicts with an existing confirmation",
+                "verification_id", status_code=409)
+        if error.reason == IDENTITY_FINGERPRINT_MISMATCH:
+            return ServiceError(
+                "expected_fingerprint does not match the current identity "
+                "fingerprint",
+                "expected_fingerprint", status_code=409)
+        raise  # pragma: no cover - defensive
+
+    def identity_fingerprint(self, device_id: str,
+                             verifier_device_id: str) -> Dict[str, Any]:
+        """Return one verifier's fingerprint view of a device.
+
+        The subject's stored identity key must still parse (a corrupt stored
+        key is 400/field=identity_key). Lookup failures map to 404 naming
+        ``device_id`` (unknown or revoked subject) or
+        ``verifier_device_id`` (unknown or revoked verifier).
+        """
+        if verifier_device_id == device_id:
+            raise ServiceError(
+                "verifier_device_id must differ from device_id",
+                "verifier_device_id")
+        subject = self.store.find_by_device_id(device_id)
+        if subject is not None and not subject.revoked \
+                and identity_fingerprint(subject.identity_key) is None:
+            raise ServiceError(
+                "field is not a valid public key: identity_key",
+                "identity_key")
+        try:
+            return self.store.identity_fingerprint_view(
+                device_id, verifier_device_id)
+        except IdentityVerificationError as error:
+            raise self._identity_verification_error(error)
+
+    def confirm_identity(self, device_id: str,
+                         payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and commit an explicit fingerprint confirmation.
+
+        The body carries three non-empty strings: ``verifier_device_id``,
+        ``verification_id`` and ``expected_fingerprint``; the last must be a
+        64-char lowercase-hex fingerprint. The verifier must be a different,
+        active device. A first match of the current fingerprint writes 201;
+        replaying the same active id with the same subject and fingerprint is
+        200; reusing an id with different bindings/fingerprint, confirming a
+        pair that already has another active confirmation, or reusing a
+        superseded old id is 409/field=verification_id. After the subject
+        rotates to different key material a new id may confirm the new
+        current fingerprint; an expected fingerprint that does not match the
+        current one is 409/field=expected_fingerprint.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("verifier_device_id", "verification_id",
+                     "expected_fingerprint"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if not is_identity_fingerprint(payload["expected_fingerprint"]):
+            raise ServiceError(
+                "field must be 64 lowercase hexadecimal characters: "
+                "expected_fingerprint",
+                "expected_fingerprint")
+        verifier_device_id = payload["verifier_device_id"]
+        if verifier_device_id == device_id:
+            raise ServiceError(
+                "verifier_device_id must differ from device_id",
+                "verifier_device_id")
+        try:
+            return self.store.confirm_identity_verification(
+                device_id, verifier_device_id,
+                payload["verification_id"],
+                payload["expected_fingerprint"])
+        except IdentityVerificationError as error:
+            raise self._identity_verification_error(error)
 
     # -- key-audit chain ---------------------------------------------------
 

@@ -184,6 +184,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="new identity public key (string), or @path to read it from a file")
     p_rotate_identity.set_defaults(handler=cmd_rotate_identity_key)
 
+    p_fingerprint = sub.add_parser(
+        "fingerprint",
+        help="show a device's identity fingerprint as seen by a verifier")
+    p_fingerprint.add_argument("device_id")
+    p_fingerprint.add_argument(
+        "--verifier-device-id", required=True,
+        help="id of the device on whose behalf the fingerprint is viewed")
+    p_fingerprint.set_defaults(handler=cmd_fingerprint)
+
+    p_verify_identity = sub.add_parser(
+        "verify-identity",
+        help="explicitly confirm a device's identity fingerprint")
+    p_verify_identity.add_argument("--device-id", required=True)
+    p_verify_identity.add_argument("--verifier-device-id", required=True)
+    p_verify_identity.add_argument("--verification-id", required=True)
+    p_verify_identity.add_argument(
+        "--expected-fingerprint", required=True,
+        help="64 lowercase hexadecimal characters expected for the device")
+    p_verify_identity.set_defaults(handler=cmd_verify_identity)
+
     p_add_prekey = sub.add_parser(
         "add-prekey", help="append a signed pre-key to a device")
     p_add_prekey.add_argument("--device-id", required=True)
@@ -608,6 +628,39 @@ def cmd_rotate_identity_key(args: argparse.Namespace) -> int:
     url = (f"{args.base_url}/v1/devices/"
            f"{quote(args.device_id, safe='')}/identity-key/rotate")
     payload = {"identity_key": _read_key_argument(args.identity_key)}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_fingerprint(args: argparse.Namespace) -> int:
+    """Call GET /v1/devices/{id}/identity-fingerprint and print the JSON."""
+    from urllib.parse import quote, urlencode
+
+    query = urlencode({"verifier_device_id": args.verifier_device_id})
+    url = (f"{args.base_url}/v1/devices/"
+           f"{quote(args.device_id, safe='')}/identity-fingerprint?{query}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status == 200 else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False),
+          file=stream)
+    return 0 if status == 200 else 1
+
+
+def cmd_verify_identity(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/{id}/identity-verifications; 201 or 200."""
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/devices/"
+           f"{quote(args.device_id, safe='')}/identity-verifications")
+    payload = {"verifier_device_id": args.verifier_device_id,
+               "verification_id": args.verification_id,
+               "expected_fingerprint": args.expected_fingerprint}
     try:
         status, response = _request_json("POST", url, body=payload)
     except ServerUnavailable:

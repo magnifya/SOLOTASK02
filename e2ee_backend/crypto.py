@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 
@@ -33,8 +34,12 @@ AES_KEY_BYTES = 32
 
 #: Domain-separation prefix for the signed pre-key proof message.
 SIGNED_PREKEY_PROOF_PREFIX = "E2EE-SIGNED-PREKEY-V1"
+#: Domain-separation prefix for an identity-key fingerprint.
+IDENTITY_FINGERPRINT_PREFIX = "E2EE-IDENTITY-FINGERPRINT-V1"
 #: Length of an Ed25519 signature in bytes.
 ED25519_SIGNATURE_BYTES = 64
+#: Length of a lowercase-hex SHA-256 identity fingerprint.
+IDENTITY_FINGERPRINT_HEX_LEN = 64
 
 
 class CryptoError(Exception):
@@ -269,6 +274,46 @@ def load_ed25519_public_key(value: str) -> Optional[ed25519.Ed25519PublicKey]:
         if der is not None:
             return der
     return None
+
+
+def canonical_public_key_der(value: str) -> Optional[bytes]:
+    """Return the canonical DER SubjectPublicKeyInfo bytes of a public key.
+
+    Every accepted wire encoding of the *same* key (PEM text, base64/hex DER,
+    base64/hex raw 32-byte X25519/Ed25519 point) normalizes to the same byte
+    string, so fingerprints are independent of how the client published the
+    key. Returns ``None`` when *value* does not parse as a public key.
+    """
+    key = load_public_key(value)
+    if key is None:
+        return None
+    return key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def identity_fingerprint(value: str) -> Optional[str]:
+    """Compute the domain-separated SHA-256 fingerprint of a public key.
+
+    The fingerprint is the lowercase hex SHA-256 of the UTF-8 bytes of the
+    domain prefix ``E2EE-IDENTITY-FINGERPRINT-V1``, one newline, and the
+    key's canonical DER SubjectPublicKeyInfo bytes (see
+    :func:`canonical_public_key_der`). Returns ``None`` when *value* is not a
+    parseable public key.
+    """
+    der = canonical_public_key_der(value)
+    if der is None:
+        return None
+    document = IDENTITY_FINGERPRINT_PREFIX + "\n"
+    digest = hashlib.sha256(document.encode("utf-8") + der).hexdigest()
+    return digest
+
+
+def is_identity_fingerprint(value: object) -> bool:
+    """Return True iff *value* is a 64-char lowercase-hex fingerprint string."""
+    return (isinstance(value, str)
+            and len(value) == IDENTITY_FINGERPRINT_HEX_LEN
+            and all(char in "0123456789abcdef" for char in value))
 
 
 def decode_ed25519_signature(value: object) -> Optional[bytes]:
