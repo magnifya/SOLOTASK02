@@ -69,6 +69,9 @@ from .storage import (
     GROUP_SESSION_INITIATOR_NOT_MEMBER,
     GROUP_SESSION_INITIATOR_UNKNOWN,
     GROUP_UNKNOWN,
+    IDENTITY_ROTATION_NOT_ED25519,
+    IDENTITY_ROTATION_SIGNATURE_INVALID,
+    IDENTITY_ROTATION_VERSION_MISMATCH,
     LEASE_EVENT_CURSOR_EXPECTED_CONFLICT,
     LEASE_SUBSCRIPTION_AFTER_CONFLICT,
     LEASE_SUBSCRIPTION_EXPECTED_CONFLICT,
@@ -535,6 +538,103 @@ class DeviceService:
         except DeviceUpdateError as error:
             raise self._device_update_error(error, device_id)
         return view
+
+    def rotate_identity_key_verified(self, device_id: str,
+                                     payload: object) -> Dict[str, Any]:
+        """Validate and apply a signature-authorized identity-key rotation.
+
+        The body is a JSON object with ``identity_key``, ``expected_version``
+        and ``signature``. ``identity_key`` must be a non-empty string that
+        parses as an Ed25519 public key (the usual encodings); the device's
+        *current* key must also be Ed25519 so the authorization can be
+        checked against it. ``expected_version`` is the
+        ``identity_key_version`` shown by the fingerprint query: a positive
+        integer (booleans are refused) that must equal the device's current
+        version. ``signature`` is standard base64 decoding to exactly 64
+        bytes — an Ed25519 signature verified against the device's current
+        identity key over the domain-separated canonical rotation message
+        (``E2EE-IDENTITY-ROTATION-V1``) for the stored ``user_id`` and the
+        request's ``device_id`` / ``identity_key`` / ``expected_version``.
+
+        A body that is not an object is 400/field=request_body; a missing
+        field, empty string, wrong type, out-of-range version, bad signature
+        encoding or wrong key algorithm is 400 naming the field. The
+        device/identity/version/signature checks then run atomically in the
+        store: unknown device is 404/field=device_id, revoked 409/field=
+        device_id, a non-Ed25519 current key 400/field=identity_key, a
+        version mismatch 409/field=expected_version and a failed
+        verification 400/field=signature. Success returns the ordinary
+        rotation view (200): rotating to the same raw key with a valid
+        authorization is a no-op that changes no timestamp, version, audit
+        event or commit generation; a different key refreshes the identity
+        and timestamp, raises the version by one and appends the usual
+        ``identity_rotated`` event. On failure nothing is written.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("identity_key", "expected_version", "signature"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+        if not is_nonempty_string(payload["identity_key"]):
+            raise ServiceError(
+                "field must be a non-empty string: identity_key",
+                "identity_key")
+        if not is_nonempty_string(payload["signature"]):
+            raise ServiceError(
+                "field must be a non-empty string: signature", "signature")
+        expected_version = payload["expected_version"]
+        if not isinstance(expected_version, int) \
+                or isinstance(expected_version, bool):
+            raise ServiceError(
+                "field must be a positive integer: expected_version",
+                "expected_version")
+        if expected_version < 1:
+            raise ServiceError(
+                "field must be a positive integer: expected_version",
+                "expected_version")
+        signature = decode_ed25519_signature(payload["signature"])
+        if signature is None:
+            raise ServiceError(
+                "field must be a standard base64 64-byte Ed25519 "
+                "signature: signature", "signature")
+        if load_ed25519_public_key(payload["identity_key"]) is None:
+            raise ServiceError(
+                "field is not a valid Ed25519 public key: identity_key",
+                "identity_key")
+
+        try:
+            view, _changed = self.store.rotate_identity_key_verified(
+                device_id, payload["identity_key"], expected_version,
+                signature)
+        except DeviceUpdateError as error:
+            raise self._rotation_verified_error(error, device_id)
+        return view
+
+    @staticmethod
+    def _rotation_verified_error(error: DeviceUpdateError,
+                                 device_id: str) -> ServiceError:
+        """Translate a verified-rotation storage failure to a ServiceError."""
+        if error.reason == DEVICE_UNKNOWN:
+            return ServiceError(f"device not found: {device_id}",
+                                "device_id", status_code=404)
+        if error.reason == DEVICE_REVOKED:
+            return ServiceError("device_id is revoked",
+                                "device_id", status_code=409)
+        if error.reason == IDENTITY_ROTATION_NOT_ED25519:
+            return ServiceError(
+                "stored identity key is not an Ed25519 public key: "
+                "identity_key", "identity_key")
+        if error.reason == IDENTITY_ROTATION_VERSION_MISMATCH:
+            return ServiceError(
+                "expected_version does not match the device's current "
+                "identity_key_version",
+                "expected_version", status_code=409)
+        if error.reason == IDENTITY_ROTATION_SIGNATURE_INVALID:
+            return ServiceError(
+                "identity rotation proof failed verification: signature",
+                "signature")
+        raise  # pragma: no cover - defensive
 
     # -- identity fingerprint & explicit verification ---------------------
 
