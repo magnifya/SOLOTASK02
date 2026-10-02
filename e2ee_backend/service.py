@@ -16,7 +16,7 @@ from .crypto import (
     load_public_key,
     verify_signed_prekey,
 )
-from .models import Device, SignedPreKey
+from .models import Device, SignedPreKey, SignedPreKeyProof
 from .persistence import IntegrityCheckError
 from .storage import (
     BATCH_CLAIM_NO_ACTIVE_DEVICE,
@@ -385,7 +385,14 @@ class DeviceService:
                     f"signed pre-key proof failed verification: {prefix}.signature",
                     f"{prefix}.signature")
             seen_key_ids.add(element["key_id"])
-            prekeys.append(SignedPreKey(element["key_id"], element["public_key"]))
+            # A verifiable first publish retains the public signature proof,
+            # freezing the identity-key string just verified and the
+            # original signature string, verbatim.
+            prekeys.append(SignedPreKey(
+                element["key_id"], element["public_key"],
+                proof=SignedPreKeyProof(
+                    identity_key=payload["identity_key"],
+                    signature=element["signature"])))
 
         device = Device(
             user_id=payload["user_id"],
@@ -418,6 +425,35 @@ class DeviceService:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
         return view
+
+    def get_prekey_proof(self, device_id: str,
+                         key_id: str) -> Dict[str, Any]:
+        """Return the retained signature proof of one pre-key.
+
+        The device is resolved first (revoked devices still resolve), then
+        the pre-key (revoked/consumed keys still resolve). An unknown device
+        is 404/field=device_id; an unknown key on a known device is
+        404/field=key_id. When the key exists but carries no retained proof
+        (an ordinary publish, legacy data, or an idempotent verified entry
+        whose first publish was ordinary), the answer is
+        409/field=signature. Otherwise the frozen six-string proof view is
+        returned. The lookup is read-only: it never consumes a pre-key and
+        never changes the audit chain, cursors, delivery state or commit
+        generation.
+        """
+        reason, proof = self.store.get_signed_prekey_proof(
+            device_id, key_id)
+        if reason == "device_unknown":
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        if reason == "key_unknown":
+            raise ServiceError(f"pre-key not found: {key_id}",
+                               "key_id", status_code=404)
+        if proof is None:
+            raise ServiceError(
+                "pre-key has no retained signature proof: signature",
+                "signature", status_code=409)
+        return proof
 
     # -- key-audit chain ---------------------------------------------------
 
@@ -689,7 +725,7 @@ class DeviceService:
         try:
             view, created = self.store.add_prekey_verified(
                 device_id, payload["key_id"], payload["public_key"],
-                signature)
+                signature, signature_text=payload["signature"])
         except DeviceUpdateError as error:
             raise self._device_update_error(error, device_id)
         return view, 201 if created else 200

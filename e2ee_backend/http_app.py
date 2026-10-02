@@ -694,6 +694,53 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             suffix = path[len(_DEVICES_PATH) + 1:]
             # A real slash means a sub-path (…/devices/a/b); a percent-encoded
             # slash within a single segment is part of the device id.
+            if "/prekeys/" in suffix and suffix.endswith("/proof"):
+                # GET {device_id}/prekeys/{key_id}/proof — routing splits on
+                # raw slashes only, so a percent-encoded slash inside an id
+                # segment is part of the identifier and decodes to an
+                # ordinary '/'. Both identifiers are strictly
+                # percent-decoded as UTF-8, device_id first: an empty
+                # decoded id, a malformed escape or invalid UTF-8 is 400
+                # with the offending identifier as field. A deeper path
+                # (any extra raw slash) never matches this route and falls
+                # through to 404/device_id; an empty identifier segment of
+                # an otherwise well-shaped path is a 400 for that
+                # identifier.
+                head, _, key_segment = suffix[:-len("/proof")].partition(
+                    "/prekeys/")
+                if "/" not in head and "/" not in key_segment:
+                    if not head:
+                        self._send_json(400, {
+                            "message": "device_id must be a non-empty "
+                                       "segment with a well-formed percent "
+                                       "escape and valid UTF-8 encoding",
+                            "field": "device_id"})
+                        return
+                    if not key_segment:
+                        self._send_json(400, {
+                            "message": "key_id must be a non-empty segment "
+                                       "with a well-formed percent escape "
+                                       "and valid UTF-8 encoding",
+                            "field": "key_id"})
+                        return
+                    device_id = _strict_percent_decode(head)
+                    if device_id is None:
+                        self._send_json(400, {
+                            "message": "device_id must be a non-empty "
+                                       "segment with a well-formed percent "
+                                       "escape and valid UTF-8 encoding",
+                            "field": "device_id"})
+                        return
+                    key_id = _strict_percent_decode(key_segment)
+                    if key_id is None:
+                        self._send_json(400, {
+                            "message": "key_id must be a non-empty segment "
+                                       "with a well-formed percent escape "
+                                       "and valid UTF-8 encoding",
+                            "field": "key_id"})
+                        return
+                    self._handle_prekey_proof(device_id, key_id)
+                    return
             if suffix.endswith("/key-events"):
                 device_id = suffix[:-len("/key-events")]
                 if not device_id or "/" in device_id:
@@ -970,6 +1017,16 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_show(self, device_id: str) -> None:
         try:
             body = self.service.get_device(device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_prekey_proof(self, device_id: str, key_id: str) -> None:
+        # A pure read: the request body and query string are ignored
+        # entirely, no pre-key is consumed and no state changes.
+        try:
+            body = self.service.get_prekey_proof(device_id, key_id)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

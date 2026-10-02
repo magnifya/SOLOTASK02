@@ -16,6 +16,23 @@ def utc_now_iso() -> str:
 
 
 @dataclass
+class SignedPreKeyProof:
+    """The public signature proof retained for one verified pre-key.
+
+    Only pre-keys first created through a verifiable entry (verified
+    registration or the verified pre-key replenishment route) carry a proof.
+    The values are frozen verbatim from the successful publish: the
+    standard-base64 Ed25519 ``signature`` over the E2EE-SIGNED-PREKEY-V1
+    canonical proof, and the ``identity_key`` string the signature was
+    verified against at publish time. The frozen identity key is never
+    replaced after an identity rotation.
+    """
+
+    identity_key: str
+    signature: str
+
+
+@dataclass
 class SignedPreKey:
     """A signed pre-key: an identifier plus a public key, revocable.
 
@@ -31,6 +48,11 @@ class SignedPreKey:
     #: the distinct flag records *why* it left the available pool. Like
     #: revocation, consumption is durable and never reset.
     consumed: bool = False
+    #: The retained public signature proof, present only for a pre-key first
+    #: created through a verifiable entry. ``None`` marks an ordinary publish
+    #: or restored legacy data with no proof; it is never filled in later
+    #: (an idempotent verified replay neither creates nor replaces it).
+    proof: Optional[SignedPreKeyProof] = None
 
 
 @dataclass

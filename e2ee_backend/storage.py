@@ -50,10 +50,15 @@ from .models import (
     Session,
     SessionRotation,
     SignedPreKey,
+    SignedPreKeyProof,
     utc_now_iso,
 )
 
-from .crypto import load_ed25519_public_key, verify_signed_prekey
+from .crypto import (
+    decode_ed25519_signature,
+    load_ed25519_public_key,
+    verify_signed_prekey,
+)
 
 #: Outcome codes for a failed atomic session creation.
 SESSION_INITIATOR_UNKNOWN = "initiator_unknown"
@@ -1590,9 +1595,17 @@ class DeviceStore:
                      "public_key": prekey.public_key}, True)
 
     def add_prekey_verified(self, device_id: str, key_id: str,
-                            public_key: str, signature: bytes
+                            public_key: str, signature: bytes,
+                            signature_text: str = ""
                             ) -> Tuple[Dict[str, Any], bool]:
         """Atomically append an identity-authorized (signed) pre-key.
+
+        *signature_text* is the request's original standard-base64 signature
+        string; the store re-verifies against the device's current identity
+        and, on a first append, freezes the device's current identity-key
+        string plus *signature_text* verbatim as the retained proof. A
+        successful first append persists the proof in the same transaction;
+        an idempotent replay neither adds nor replaces it.
 
         The whole check-and-append runs under the store lock — the same lock
         identity rotation, device/key revocation and pre-key claims take — so
@@ -1645,14 +1658,20 @@ class DeviceStore:
                 if not existing.revoked and existing.public_key == public_key:
                     # Identical, non-revoked key with a valid proof: a
                     # state-free idempotent replay — no event, no change
-                    # notification, no durable generation.
+                    # notification, no durable generation and, crucially,
+                    # no proof back-fill or replacement: a key first created
+                    # through an ordinary publish keeps no proof forever.
                     return ({"device_id": device.device_id,
                              "key_id": existing.key_id,
                              "public_key": existing.public_key}, False)
                 # Same id with a changed key, or an id whose key was revoked.
                 raise DeviceUpdateError(PREKEY_CONFLICT)
             self._migrate_pending_anchors()
-            prekey = SignedPreKey(key_id=key_id, public_key=public_key)
+            prekey = SignedPreKey(
+                key_id=key_id, public_key=public_key,
+                proof=SignedPreKeyProof(
+                    identity_key=device.identity_key,
+                    signature=signature_text))
             device.prekeys.append(prekey)
             self._append_key_event(
                 device_id, KEY_EVENT_PREKEY_ADDED,
@@ -1661,6 +1680,41 @@ class DeviceStore:
             return ({"device_id": device.device_id,
                      "key_id": prekey.key_id,
                      "public_key": prekey.public_key}, True)
+
+    def get_signed_prekey_proof(
+            self, device_id: str, key_id: str
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Look up one pre-key's retained signature proof.
+
+        Read-only and lock-atomic. Returns ``("device_unknown", None)`` when
+        no device has *device_id* (revoked devices still resolve),
+        ``("key_unknown", None)`` when the device has no pre-key with
+        *key_id* (revoked or consumed keys still resolve), or ``("ok",
+        proof)`` where *proof* is the six-field public proof view, or
+        ``None`` when the key exists but has no retained proof (an ordinary
+        publish or restored legacy data). The proof values are the frozen
+        publish-time strings; a later identity rotation never substitutes
+        the current identity key.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                return DEVICE_UNKNOWN, None
+            prekey = next((pk for pk in device.prekeys
+                           if pk.key_id == key_id), None)
+            if prekey is None:
+                return "key_unknown", None
+            if prekey.proof is None:
+                return "ok", None
+            return "ok", {
+                "user_id": device.user_id,
+                "device_id": device.device_id,
+                "key_id": prekey.key_id,
+                "public_key": prekey.public_key,
+                "identity_key": prekey.proof.identity_key,
+                "signature": prekey.proof.signature,
+            }
 
     def public_view(self, device_id: str) -> Optional[Dict[str, Any]]:
         """Atomically build the public snapshot of a device.
@@ -8337,11 +8391,20 @@ class DeviceStore:
                     "rotated_at": device.rotated_at,
                     "revoked": device.revoked,
                     "identity_key_version": device.identity_key_version,
-                    "prekeys": [{"key_id": pk.key_id,
-                                 "public_key": pk.public_key,
-                                 "revoked": pk.revoked,
-                                 "consumed": pk.consumed}
-                                for pk in device.prekeys],
+                    "prekeys": [{
+                        "key_id": pk.key_id,
+                        "public_key": pk.public_key,
+                        "revoked": pk.revoked,
+                        "consumed": pk.consumed,
+                        # The retained signature proof is part of the same
+                        # version=1 transaction. Absent for proof-less keys
+                        # (ordinary publishes, legacy data), so old files
+                        # stay byte/semantics-compatible.
+                        **({"proof": {
+                            "identity_key": pk.proof.identity_key,
+                            "signature": pk.proof.signature}}
+                           if pk.proof is not None else {}),
+                    } for pk in device.prekeys],
                 })
             identity_verifications = [{
                 "verification_id": record.verification_id,
@@ -8930,6 +8993,56 @@ class DeviceStore:
                 if not isinstance(pk_consumed, bool):
                     raise ValueError(
                         f"{pk_where}.consumed must be a boolean")
+                # The retained signature proof is optional (older files and
+                # ordinary publishes omit it). A present proof must be a
+                # complete, self-consistent E2EE-SIGNED-PREKEY-V1 record:
+                # both fields non-empty strings, the signature canonical
+                # standard-base64 decoding to 64 bytes, the frozen
+                # identity_key an Ed25519 public key, the proof belonging to
+                # this exact device/pre-key entry, and the signature
+                # verifying against the frozen (not the current) identity
+                # key. Any defect refuses the whole document at startup.
+                proof: Optional[SignedPreKeyProof] = None
+                if "proof" in pk:
+                    raw_proof = pk["proof"]
+                    proof_where = f"{pk_where}.proof"
+                    if not isinstance(raw_proof, dict):
+                        raise ValueError(
+                            f"{proof_where} must be an object")
+                    proof_identity = raw_proof.get("identity_key")
+                    proof_signature = raw_proof.get("signature")
+                    if not isinstance(proof_identity, str) \
+                            or not proof_identity:
+                        raise ValueError(
+                            f"{proof_where}.identity_key must be a "
+                            f"non-empty string")
+                    if not isinstance(proof_signature, str) \
+                            or not proof_signature:
+                        raise ValueError(
+                            f"{proof_where}.signature must be a non-empty "
+                            f"string")
+                    proof_key = load_ed25519_public_key(proof_identity)
+                    if proof_key is None:
+                        raise ValueError(
+                            f"{proof_where}.identity_key must be an "
+                            f"Ed25519 public key")
+                    proof_raw_signature = decode_ed25519_signature(
+                        proof_signature)
+                    if proof_raw_signature is None:
+                        raise ValueError(
+                            f"{proof_where}.signature must be a canonical "
+                            f"standard-base64 64-byte Ed25519 signature")
+                    if not verify_signed_prekey(
+                            proof_key, proof_raw_signature,
+                            user_id, device_id, key_id, public_key):
+                        raise ValueError(
+                            f"{proof_where} signature does not verify over "
+                            f"the E2EE-SIGNED-PREKEY-V1 proof for the "
+                            f"stored user/device/key/public_key with its "
+                            f"frozen identity key")
+                    proof = SignedPreKeyProof(
+                        identity_key=proof_identity,
+                        signature=proof_signature)
                 if key_id in seen_key_ids:
                     raise ValueError(
                         f"duplicate prekey key_id in device "
@@ -8937,7 +9050,7 @@ class DeviceStore:
                 seen_key_ids.add(key_id)
                 prekeys.append(SignedPreKey(
                     key_id=key_id, public_key=public_key, revoked=pk_revoked,
-                    consumed=pk_consumed))
+                    consumed=pk_consumed, proof=proof))
             device = Device(
                 user_id=user_id, device_id=device_id,
                 identity_key=identity_key, registered_at=registered_at,
