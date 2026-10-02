@@ -36,6 +36,8 @@ AES_KEY_BYTES = 32
 SIGNED_PREKEY_PROOF_PREFIX = "E2EE-SIGNED-PREKEY-V1"
 #: Domain-separation prefix for the identity-key fingerprint message.
 IDENTITY_FINGERPRINT_PREFIX = "E2EE-IDENTITY-FINGERPRINT-V1"
+#: Domain-separation prefix for the message-envelope AAD document.
+MESSAGE_ENVELOPE_PREFIX = "E2EE-MESSAGE-ENVELOPE-V1"
 #: Length of a fingerprint: SHA-256 rendered as lowercase hexadecimal.
 IDENTITY_FINGERPRINT_HEX_LEN = 64
 #: Length of an Ed25519 signature in bytes.
@@ -70,14 +72,79 @@ def _load_aes_key(key_b64: str) -> AESGCM:
     return AESGCM(key)
 
 
+def message_envelope_aad(session_id: str, sender_device_id: str,
+                         message_id: str, sequence: int) -> bytes:
+    """Build the AAD bytes that bind a ciphertext to its message envelope.
+
+    The document is the domain prefix ``E2EE-MESSAGE-ENVELOPE-V1``, one
+    newline, then compact JSON of the four fields with keys sorted
+    (``message_id``, ``sender_device_id``, ``sequence``, ``session_id``) and
+    Unicode written as-is. The string values are used exactly as given — no
+    trimming or normalization — and ``sequence`` is serialized as a JSON
+    integer.
+    """
+    document = json.dumps(
+        {"message_id": message_id, "sender_device_id": sender_device_id,
+         "sequence": sequence, "session_id": session_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (MESSAGE_ENVELOPE_PREFIX + "\n" + document).encode("utf-8")
+
+
+def _validate_envelope_metadata(sender_device_id: object,
+                                message_id: object,
+                                sequence: object) -> None:
+    """Validate the envelope metadata group once any field is present.
+
+    Reports the first missing or invalid field in the fixed order
+    ``sender_device_id``, ``message_id``, ``sequence``.
+    """
+    if not is_nonempty_string(sender_device_id):
+        raise CryptoError(
+            "field must be a non-empty string: sender_device_id",
+            "sender_device_id")
+    if not is_nonempty_string(message_id):
+        raise CryptoError("field must be a non-empty string: message_id",
+                          "message_id")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) \
+            or sequence < 1:
+        raise CryptoError("field must be a positive integer: sequence",
+                          "sequence")
+
+
+def _message_aad(session_id: str, sender_device_id: Optional[str],
+                 message_id: Optional[str],
+                 sequence: Optional[int]) -> bytes:
+    """Pick the AAD for one message: legacy session-only or full envelope.
+
+    With all three metadata fields omitted the legacy AAD (the session id's
+    UTF-8 bytes) is used; otherwise the metadata group is validated and the
+    envelope AAD is built. There is no mixing: exactly one AAD is tried.
+    """
+    if sender_device_id is None and message_id is None and sequence is None:
+        return session_id.encode("utf-8")
+    _validate_envelope_metadata(sender_device_id, message_id, sequence)
+    return message_envelope_aad(session_id, sender_device_id, message_id,
+                                sequence)
+
+
 def encrypt_message(session_id: str, key_b64: str,
-                    plaintext: str) -> dict:
+                    plaintext: str,
+                    sender_device_id: Optional[str] = None,
+                    message_id: Optional[str] = None,
+                    sequence: Optional[int] = None) -> dict:
     """Encrypt *plaintext* (UTF-8) with AES-256-GCM.
 
     The 12-byte nonce is generated randomly; the session id is bound to the
     ciphertext as additional authenticated data. Returns a dict with
     ``session_id``, ``nonce`` and ``ciphertext`` (both base64; the ciphertext
     carries the 16-byte GCM tag appended).
+
+    When *sender_device_id*, *message_id* and *sequence* are all given, the
+    AAD instead becomes the message-envelope document (see
+    :func:`message_envelope_aad`) binding those values to the ciphertext.
+    The three fields form a group: supplying only some of them, empty
+    strings, wrong types, or a non-positive/boolean sequence raises
+    :class:`CryptoError` naming the first offending field.
     """
     if not is_nonempty_string(session_id):
         raise CryptoError("field must be a non-empty string: session_id",
@@ -85,9 +152,9 @@ def encrypt_message(session_id: str, key_b64: str,
     if not isinstance(plaintext, str):
         raise CryptoError("field must be a string: plaintext", "plaintext")
     cipher = _load_aes_key(key_b64)
+    aad = _message_aad(session_id, sender_device_id, message_id, sequence)
     nonce = os.urandom(GCM_NONCE_BYTES)
-    ciphertext = cipher.encrypt(nonce, plaintext.encode("utf-8"),
-                                session_id.encode("utf-8"))
+    ciphertext = cipher.encrypt(nonce, plaintext.encode("utf-8"), aad)
     return {
         "session_id": session_id,
         "nonce": base64.b64encode(nonce).decode("ascii"),
@@ -96,12 +163,17 @@ def encrypt_message(session_id: str, key_b64: str,
 
 
 def decrypt_message(session_id: str, key_b64: str, nonce_b64: str,
-                    ciphertext_b64: str) -> dict:
+                    ciphertext_b64: str,
+                    sender_device_id: Optional[str] = None,
+                    message_id: Optional[str] = None,
+                    sequence: Optional[int] = None) -> dict:
     """Decrypt a payload produced by :func:`encrypt_message`.
 
     Returns a dict with ``session_id`` and the UTF-8 ``plaintext``. Any
     decoding or authentication failure raises :class:`CryptoError` naming the
-    offending field.
+    offending field. The optional envelope metadata selects the same AAD
+    mode as encryption; a mode or metadata mismatch fails authentication
+    with ``field=ciphertext`` — the other mode is never retried.
     """
     if not is_nonempty_string(session_id):
         raise CryptoError("field must be a non-empty string: session_id",
@@ -124,9 +196,9 @@ def decrypt_message(session_id: str, key_b64: str, nonce_b64: str,
         raise CryptoError("ciphertext is too short to carry a GCM tag",
                           "ciphertext")
 
+    aad = _message_aad(session_id, sender_device_id, message_id, sequence)
     try:
-        plaintext = cipher.decrypt(nonce, ciphertext,
-                                   session_id.encode("utf-8"))
+        plaintext = cipher.decrypt(nonce, ciphertext, aad)
     except InvalidTag:
         raise CryptoError("ciphertext failed authentication", "ciphertext") \
             from None

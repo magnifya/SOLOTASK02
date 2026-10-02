@@ -87,6 +87,41 @@ def _parse_verified_prekey(spec: str) -> Dict[str, str]:
             "signature": parts[2].strip()}
 
 
+def _add_envelope_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the optional message-envelope metadata group to a crypto command.
+
+    The three flags form an all-or-none group: omitting all of them keeps
+    the legacy session-id-only AAD, while supplying any of them requires
+    all three to be valid. ``--sequence`` is parsed leniently here (no
+    ``type=int``) so an invalid value is reported through the same
+    single-line JSON error contract (exit 2) as the other crypto failures
+    instead of an argparse usage error.
+    """
+    parser.add_argument("--sender-device-id",
+                        help="sender device id bound to the ciphertext")
+    parser.add_argument("--message-id",
+                        help="message id bound to the ciphertext")
+    parser.add_argument("--sequence",
+                        help="positive integer sequence bound to the "
+                             "ciphertext")
+
+
+def _parse_sequence_argument(value: Optional[str]) -> Any:
+    """Convert ``--sequence`` text to an int; pass unparseable text through.
+
+    The crypto layer validates the metadata group in a fixed field order
+    (sender device id, message id, sequence), so an unparseable sequence is
+    forwarded as-is and reported there as ``field=sequence`` after any
+    sender/message problem.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 def _request_json(method: str, url: str, body: Any = None) -> Tuple[int, Any]:
     data = None
     headers = {"Accept": "application/json"}
@@ -460,6 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_encrypt.add_argument(
         "--plaintext", required=True,
         help="UTF-8 plaintext, or @path to read it from a file")
+    _add_envelope_arguments(p_encrypt)
     p_encrypt.set_defaults(handler=cmd_encrypt_message)
 
     p_decrypt = sub.add_parser(
@@ -473,6 +509,7 @@ def build_parser() -> argparse.ArgumentParser:
                            help="base64-encoded 12-byte nonce")
     p_decrypt.add_argument("--ciphertext", required=True,
                            help="base64-encoded ciphertext with appended GCM tag")
+    _add_envelope_arguments(p_decrypt)
     p_decrypt.set_defaults(handler=cmd_decrypt_message)
 
     p_integrity_history_page = sub.add_parser(
@@ -1192,7 +1229,11 @@ def cmd_encrypt_message(args: argparse.Namespace) -> int:
     try:
         result = encrypt_message(args.session_id,
                                  _read_key_argument(args.key),
-                                 _read_key_argument(args.plaintext))
+                                 _read_key_argument(args.plaintext),
+                                 sender_device_id=args.sender_device_id,
+                                 message_id=args.message_id,
+                                 sequence=_parse_sequence_argument(
+                                     args.sequence))
     except OSError as error:
         return _emit_crypto_error(CryptoError(str(error), "plaintext"))
     except CryptoError as error:
@@ -1206,7 +1247,11 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
     try:
         result = decrypt_message(args.session_id,
                                  _read_key_argument(args.key),
-                                 args.nonce, args.ciphertext)
+                                 args.nonce, args.ciphertext,
+                                 sender_device_id=args.sender_device_id,
+                                 message_id=args.message_id,
+                                 sequence=_parse_sequence_argument(
+                                     args.sequence))
     except OSError as error:
         return _emit_crypto_error(CryptoError(str(error), "key"))
     except CryptoError as error:
