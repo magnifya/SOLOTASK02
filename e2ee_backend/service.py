@@ -105,6 +105,8 @@ from .storage import (
     PREKEY_CONFLICT,
     PREKEY_IDENTITY_NOT_ED25519,
     PREKEY_SIGNATURE_INVALID,
+    PROOF_DEVICE_UNKNOWN,
+    PROOF_PREKEY_UNKNOWN,
     REDELIVERY_JOB_CONFLICT,
     REDELIVERY_JOB_DEVICE_INACTIVE,
     REDELIVERY_JOB_DEVICE_UNKNOWN,
@@ -385,7 +387,13 @@ class DeviceService:
                     f"signed pre-key proof failed verification: {prefix}.signature",
                     f"{prefix}.signature")
             seen_key_ids.add(element["key_id"])
-            prekeys.append(SignedPreKey(element["key_id"], element["public_key"]))
+            # Keep the published proof verbatim, frozen against the identity
+            # public key presented with this registration; ordinary
+            # publication (register()) stores no proof.
+            prekeys.append(SignedPreKey(
+                element["key_id"], element["public_key"],
+                signature=element["signature"],
+                proof_identity_key=payload["identity_key"]))
 
         device = Device(
             user_id=payload["user_id"],
@@ -418,6 +426,32 @@ class DeviceService:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
         return view
+
+    def get_prekey_proof(self, device_id: str,
+                         key_id: str) -> Dict[str, str]:
+        """Return the frozen published proof of one signed pre-key.
+
+        The device is resolved before the key: an unknown device is
+        404/field=device_id, a key it does not own is 404/field=key_id.
+        Revoked devices/keys and consumed keys are still found — saved
+        proofs are immutable history. A key without a saved proof
+        (ordinary publication, legacy data, or any non-verified origin) is
+        409/field=signature. The query is read-only: it consumes no key and
+        changes no audit chain, cursor, delivery state or commit
+        generation.
+        """
+        proof = self.store.prekey_proof(device_id, key_id)
+        if proof == PROOF_DEVICE_UNKNOWN:
+            raise ServiceError(f"device not found: {device_id}",
+                               "device_id", status_code=404)
+        if proof == PROOF_PREKEY_UNKNOWN:
+            raise ServiceError(f"pre-key not found: {key_id}",
+                               "key_id", status_code=404)
+        if proof is None:
+            raise ServiceError(
+                "pre-key has no published signed proof: signature",
+                "signature", status_code=409)
+        return proof
 
     # -- key-audit chain ---------------------------------------------------
 
@@ -689,7 +723,7 @@ class DeviceService:
         try:
             view, created = self.store.add_prekey_verified(
                 device_id, payload["key_id"], payload["public_key"],
-                signature)
+                signature, payload["signature"])
         except DeviceUpdateError as error:
             raise self._device_update_error(error, device_id)
         return view, 201 if created else 200

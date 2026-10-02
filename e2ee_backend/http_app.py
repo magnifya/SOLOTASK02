@@ -694,6 +694,43 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             suffix = path[len(_DEVICES_PATH) + 1:]
             # A real slash means a sub-path (…/devices/a/b); a percent-encoded
             # slash within a single segment is part of the device id.
+            if suffix.endswith("/proof") and "/prekeys/" in suffix:
+                # {device_id}/prekeys/{key_id}/proof — split on raw slashes
+                # only, so a percent-encoded slash inside either id segment
+                # decodes to an ordinary '/' that stays part of the
+                # identifier. Decoding order is device first, then key.
+                head, _, key_segment = suffix.partition("/prekeys/")
+                key_segment = key_segment[:-len("/proof")]
+                # Device segment is decoded and checked first. A raw slash
+                # makes the path a different shape (404); an empty or
+                # ill-encoded segment is 400 naming that identifier.
+                if "/" in head:
+                    self._send_json(404, {
+                        "message": "device not found",
+                        "field": "device_id"})
+                    return
+                device_id = _strict_percent_decode(head) if head else None
+                if device_id is None:
+                    self._send_json(400, {
+                        "message": "device_id must decode to a non-empty "
+                                   "UTF-8 string",
+                        "field": "device_id"})
+                    return
+                if "/" in key_segment:
+                    self._send_json(404, {
+                        "message": "pre-key not found",
+                        "field": "key_id"})
+                    return
+                key_id = (_strict_percent_decode(key_segment)
+                          if key_segment else None)
+                if key_id is None:
+                    self._send_json(400, {
+                        "message": "key_id must decode to a non-empty "
+                                   "UTF-8 string",
+                        "field": "key_id"})
+                    return
+                self._handle_prekey_proof(device_id, key_id)
+                return
             if suffix.endswith("/key-events"):
                 device_id = suffix[:-len("/key-events")]
                 if not device_id or "/" in device_id:
@@ -970,6 +1007,16 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_show(self, device_id: str) -> None:
         try:
             body = self.service.get_device(device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_prekey_proof(self, device_id: str, key_id: str) -> None:
+        # A pure read: the query string and any request body are ignored,
+        # the pre-key is not consumed and no state is written.
+        try:
+            body = self.service.get_prekey_proof(device_id, key_id)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

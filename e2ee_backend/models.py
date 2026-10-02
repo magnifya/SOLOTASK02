@@ -31,6 +31,17 @@ class SignedPreKey:
     #: the distinct flag records *why* it left the available pool. Like
     #: revocation, consumption is durable and never reset.
     consumed: bool = False
+    #: Publicly published E2EE-SIGNED-PREKEY-V1 proof, kept verbatim from
+    #: the request that first created the key through a verified entry
+    #: (verified registration or verified replenishment). ``None`` marks an
+    #: ordinary publication, an old file predating proofs, or a key whose
+    #: first creation was not through a verified entry: such keys have no
+    #: proof and the two fields stay ``None`` together.
+    signature: Optional[str] = None
+    #: Identity public key (the request's original string) against which
+    #: ``signature`` was verified at publication time. It is frozen history:
+    #: a later identity rotation never replaces it.
+    proof_identity_key: Optional[str] = None
 
 
 @dataclass
