@@ -460,6 +460,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_encrypt.add_argument(
         "--plaintext", required=True,
         help="UTF-8 plaintext, or @path to read it from a file")
+    p_encrypt.add_argument(
+        "--sender-device-id",
+        help="envelope binding: sender device id (requires the other two)")
+    p_encrypt.add_argument(
+        "--message-id",
+        help="envelope binding: message id (requires the other two)")
+    p_encrypt.add_argument(
+        "--sequence",
+        help="envelope binding: positive integer sequence (requires the "
+             "other two)")
     p_encrypt.set_defaults(handler=cmd_encrypt_message)
 
     p_decrypt = sub.add_parser(
@@ -473,6 +483,16 @@ def build_parser() -> argparse.ArgumentParser:
                            help="base64-encoded 12-byte nonce")
     p_decrypt.add_argument("--ciphertext", required=True,
                            help="base64-encoded ciphertext with appended GCM tag")
+    p_decrypt.add_argument(
+        "--sender-device-id",
+        help="envelope binding: sender device id (requires the other two)")
+    p_decrypt.add_argument(
+        "--message-id",
+        help="envelope binding: message id (requires the other two)")
+    p_decrypt.add_argument(
+        "--sequence",
+        help="envelope binding: positive integer sequence (requires the "
+             "other two)")
     p_decrypt.set_defaults(handler=cmd_decrypt_message)
 
     p_integrity_history_page = sub.add_parser(
@@ -1187,12 +1207,34 @@ def _emit_crypto_error(error: CryptoError) -> int:
     return 2
 
 
+def _envelope_kwargs(args: argparse.Namespace) -> Dict[str, object]:
+    """Collect the optional envelope flags for the crypto entry points.
+
+    The sequence flag is converted from strict ASCII decimal only when the
+    group is in use; non-numeric spellings are passed through as strings so
+    the shared crypto validation reports them as ``field=sequence`` (rather
+    than letting argparse abort with a non-contract error).
+    """
+    if (args.sender_device_id is None and args.message_id is None
+            and args.sequence is None):
+        return {"sender_device_id": None, "message_id": None,
+                "sequence": None}
+    sequence = args.sequence
+    if (isinstance(sequence, str) and sequence
+            and all(char in "0123456789" for char in sequence)
+            and len(sequence) <= 18):
+        sequence = int(sequence)
+    return {"sender_device_id": args.sender_device_id,
+            "message_id": args.message_id, "sequence": sequence}
+
+
 def cmd_encrypt_message(args: argparse.Namespace) -> int:
     """Encrypt locally and print ``session_id``/``nonce``/``ciphertext``."""
     try:
         result = encrypt_message(args.session_id,
                                  _read_key_argument(args.key),
-                                 _read_key_argument(args.plaintext))
+                                 _read_key_argument(args.plaintext),
+                                 **_envelope_kwargs(args))
     except OSError as error:
         return _emit_crypto_error(CryptoError(str(error), "plaintext"))
     except CryptoError as error:
@@ -1206,7 +1248,8 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
     try:
         result = decrypt_message(args.session_id,
                                  _read_key_argument(args.key),
-                                 args.nonce, args.ciphertext)
+                                 args.nonce, args.ciphertext,
+                                 **_envelope_kwargs(args))
     except OSError as error:
         return _emit_crypto_error(CryptoError(str(error), "key"))
     except CryptoError as error:
