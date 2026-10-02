@@ -34,6 +34,8 @@ AES_KEY_BYTES = 32
 
 #: Domain-separation prefix for the signed pre-key proof message.
 SIGNED_PREKEY_PROOF_PREFIX = "E2EE-SIGNED-PREKEY-V1"
+#: Domain-separation prefix for the identity-rotation authorization message.
+IDENTITY_ROTATION_PREFIX = "E2EE-IDENTITY-ROTATION-V1"
 #: Domain-separation prefix for the identity-key fingerprint message.
 IDENTITY_FINGERPRINT_PREFIX = "E2EE-IDENTITY-FINGERPRINT-V1"
 #: Domain-separation prefix for the message-envelope AAD document.
@@ -397,6 +399,43 @@ def verify_signed_prekey(identity_key: ed25519.Ed25519PublicKey,
     """
     message = signed_prekey_proof_message(
         user_id, device_id, key_id, public_key)
+    try:
+        identity_key.verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def identity_rotation_message(user_id: str, device_id: str,
+                              identity_key: str,
+                              expected_version: int) -> bytes:
+    """Build the exact bytes the current identity key signs to authorize a rotation.
+
+    The message is the domain prefix ``E2EE-IDENTITY-ROTATION-V1``, one
+    newline, then compact JSON of the four fields with keys sorted
+    (``device_id``, ``expected_version``, ``identity_key``, ``user_id``) and
+    Unicode written as-is. ``user_id`` is the device's stored registration
+    value; the other strings are the request's original values and
+    ``expected_version`` is serialized as a JSON integer.
+    """
+    document = json.dumps(
+        {"device_id": device_id, "expected_version": expected_version,
+         "identity_key": identity_key, "user_id": user_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (IDENTITY_ROTATION_PREFIX + "\n" + document).encode("utf-8")
+
+
+def verify_identity_rotation(identity_key: ed25519.Ed25519PublicKey,
+                             signature: bytes, user_id: str, device_id: str,
+                             new_identity_key: str,
+                             expected_version: int) -> bool:
+    """Verify one identity-rotation authorization against the Ed25519 identity key.
+
+    Returns ``True`` iff *signature* is valid over
+    :func:`identity_rotation_message` for the four field values.
+    """
+    message = identity_rotation_message(
+        user_id, device_id, new_identity_key, expected_version)
     try:
         identity_key.verify(signature, message)
     except InvalidSignature:

@@ -219,6 +219,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="new identity public key (string), or @path to read it from a file")
     p_rotate_identity.set_defaults(handler=cmd_rotate_identity_key)
 
+    p_rotate_identity_verified = sub.add_parser(
+        "rotate-identity-key-verified",
+        help="rotate a device's identity public key under a signed, "
+             "version-checked authorization")
+    p_rotate_identity_verified.add_argument("--device-id", required=True)
+    p_rotate_identity_verified.add_argument(
+        "--identity-key", required=True,
+        help="new Ed25519 identity public key (string), or @path to read it "
+             "from a file")
+    p_rotate_identity_verified.add_argument(
+        "--expected-version", required=True, type=int,
+        help="the device's current identity_key_version (positive integer)")
+    p_rotate_identity_verified.add_argument(
+        "--signature", required=True,
+        help="standard-base64 64-byte Ed25519 signature over the rotation "
+             "authorization, or @path to read it from a file")
+    p_rotate_identity_verified.set_defaults(
+        handler=cmd_rotate_identity_key_verified)
+
     p_fingerprint = sub.add_parser(
         "fingerprint",
         help="show a device's identity fingerprint as seen by a verifier")
@@ -669,6 +688,29 @@ def cmd_rotate_identity_key(args: argparse.Namespace) -> int:
     url = (f"{args.base_url}/v1/devices/"
            f"{quote(args.device_id, safe='')}/identity-key/rotate")
     payload = {"identity_key": _read_key_argument(args.identity_key)}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_rotate_identity_key_verified(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/{id}/identity-key/rotate-verified (200 success).
+
+    The signature is the standard-base64 64-byte Ed25519 authorization over
+    the rotation message, verified server-side against the device's current
+    identity key together with the expected version. Success prints the
+    single-line JSON on stdout and exits 0; any failure prints the server's
+    single-line JSON with its ``field`` on stderr and exits non-zero.
+    """
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/devices/"
+           f"{quote(args.device_id, safe='')}/identity-key/rotate-verified")
+    payload = {"identity_key": _read_key_argument(args.identity_key),
+               "expected_version": args.expected_version,
+               "signature": _read_key_argument(args.signature)}
     try:
         status, response = _request_json("POST", url, body=payload)
     except ServerUnavailable:

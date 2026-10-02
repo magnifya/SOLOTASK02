@@ -56,6 +56,7 @@ from .models import (
 from .crypto import (
     decode_ed25519_signature,
     load_ed25519_public_key,
+    verify_identity_rotation,
     verify_signed_prekey,
 )
 
@@ -130,9 +131,19 @@ DEVICE_REVOKED = "device_revoked"
 PREKEY_CONFLICT = "prekey_conflict"
 #: Outcome code for a verified pre-key add whose device's current identity key
 #: is not an Ed25519 public key (the proof cannot be checked against it).
+#: Shared by verified identity rotation, whose authorization is checked
+#: against the same current key.
 PREKEY_IDENTITY_NOT_ED25519 = "identity_not_ed25519"
 #: Outcome code for a verified pre-key proof that fails signature verification.
 PREKEY_SIGNATURE_INVALID = "prekey_signature_invalid"
+#: Outcome code for a verified identity rotation whose ``expected_version``
+#: does not match the device's current ``identity_key_version``
+#: (409/field=expected_version).
+IDENTITY_ROTATION_VERSION_MISMATCH = "identity_version_mismatch"
+#: Outcome code for a verified identity rotation whose authorization
+#: signature fails verification against the current identity key
+#: (400/field=signature).
+IDENTITY_ROTATION_SIGNATURE_INVALID = "identity_rotation_signature_invalid"
 #: Sentinel results of the read-only signed pre-key proof lookup.
 PROOF_DEVICE_UNKNOWN = "proof_device_unknown"
 PROOF_PREKEY_UNKNOWN = "proof_prekey_unknown"
@@ -1456,6 +1467,75 @@ class DeviceStore:
                 raise DeviceUpdateError(DEVICE_UNKNOWN)
             if device.revoked:
                 raise DeviceUpdateError(DEVICE_REVOKED)
+            changed = identity_key != device.identity_key
+            if changed:
+                self._migrate_pending_anchors()
+                old_identity_key = device.identity_key
+                device.identity_key = identity_key
+                device.rotated_at = utc_now_iso()
+                device.identity_key_version += 1
+                self._append_key_event(
+                    device_id, KEY_EVENT_IDENTITY_ROTATED,
+                    {"old_identity_key": old_identity_key,
+                     "new_identity_key": identity_key})
+                self._notify_change()
+            return self.identity_view(device), changed
+
+    def rotate_identity_key_verified(
+            self, device_id: str, identity_key: str, expected_version: int,
+            signature: bytes) -> Tuple[Dict[str, Any], bool]:
+        """Atomically rotate a device's identity key under current-key authorization.
+
+        The whole check-and-rotate runs under the store lock — the same lock
+        ordinary rotation, device revocation and verified pre-key adds take —
+        so the authorization is always checked against the device's *current*
+        identity key and version, and the lookup, verification and mutation
+        are one linearizable transaction.
+
+        The signature is an already-decoded 64-byte Ed25519 signature over
+        the domain-separated canonical rotation message
+        (``E2EE-IDENTITY-ROTATION-V1``) for the device's stored ``user_id``,
+        its ``device_id`` and the request's *identity_key* /
+        *expected_version* values; the caller has already validated the
+        request fields, the new key's Ed25519 algorithm and the signature
+        encoding.
+
+        Checks run in a fixed order: unknown device ->
+        ``device_unknown`` (404); revoked device -> ``device_revoked``
+        (409); a current identity key that is not Ed25519 ->
+        ``identity_not_ed25519`` (400/identity_key); an *expected_version*
+        that differs from the device's current ``identity_key_version`` ->
+        ``identity_version_mismatch`` (409/expected_version); an
+        authorization that does not verify ->
+        ``identity_rotation_signature_invalid`` (400/signature). On any
+        failure nothing is written, no event is appended and the durable
+        generation is untouched.
+
+        Returns ``(view, changed)``. A verified rotation to the same raw
+        public key is a state-free idempotent replay (``changed`` False):
+        no timestamp, version, audit-chain or commit-generation change. A
+        verified rotation to a different key stamps a fresh UTC ISO-8601
+        ``rotated_at``, raises ``identity_key_version`` by one and appends
+        exactly one ``identity_rotated`` key-audit event in the same
+        transaction; rotating back to a previously used key is an ordinary
+        change and never resets the version.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                raise DeviceUpdateError(DEVICE_UNKNOWN)
+            if device.revoked:
+                raise DeviceUpdateError(DEVICE_REVOKED)
+            current = load_ed25519_public_key(device.identity_key)
+            if current is None:
+                raise DeviceUpdateError(PREKEY_IDENTITY_NOT_ED25519)
+            if expected_version != device.identity_key_version:
+                raise DeviceUpdateError(IDENTITY_ROTATION_VERSION_MISMATCH)
+            if not verify_identity_rotation(
+                    current, signature, device.user_id, device.device_id,
+                    identity_key, expected_version):
+                raise DeviceUpdateError(IDENTITY_ROTATION_SIGNATURE_INVALID)
             changed = identity_key != device.identity_key
             if changed:
                 self._migrate_pending_anchors()

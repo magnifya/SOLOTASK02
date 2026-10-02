@@ -189,6 +189,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 and path.endswith("/identity-verifications"):
             self._route_identity_verifications(path)
         elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/identity-key/rotate-verified"):
+            self._route_rotate_identity_verified(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
                 and path.endswith("/identity-key/rotate"):
             self._route_rotate_identity(path)
         elif path.startswith(_DEVICES_PATH + "/") \
@@ -341,6 +344,19 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         parts = suffix.split("/")
         if len(parts) == 1 and parts[0]:
             self._handle_rotate_identity(unquote(parts[0]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_rotate_identity_verified(self, path: str) -> None:
+        # {device_id}/identity-key/rotate-verified — split on raw slashes
+        # only; a percent-encoded slash inside the id segment is part of it,
+        # exactly as on the ordinary rotation route.
+        suffix = path[len(_DEVICES_PATH) + 1:
+                      -len("/identity-key/rotate-verified")]
+        parts = suffix.split("/")
+        if len(parts) == 1 and parts[0]:
+            self._handle_rotate_identity_verified(unquote(parts[0]))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -1198,6 +1214,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self.service.rotate_identity_key(device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_rotate_identity_verified(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.rotate_identity_key_verified(
+                device_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
