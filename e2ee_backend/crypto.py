@@ -241,6 +241,23 @@ def _decode_private_key_bytes(value: object) -> bytes:
     return raw
 
 
+def _load_x25519_public_key(value: object, field: str) -> x25519.X25519PublicKey:
+    """Parse *value* strictly as an X25519 public key, naming *field*.
+
+    Accepts the same encodings as :func:`load_public_key` (PEM text,
+    base64/hex DER SubjectPublicKeyInfo, or base64/hex raw 32-byte point),
+    but only an X25519 key is accepted: a raw 32-byte point is interpreted
+    as X25519, while a key carrying an Ed25519 or any other algorithm
+    identifier is rejected with a :class:`CryptoError` naming *field*.
+    """
+    if not is_nonempty_string(value):
+        raise CryptoError(f"field must be a non-empty string: {field}", field)
+    key = load_public_key(value)
+    if not isinstance(key, x25519.X25519PublicKey):
+        raise CryptoError(f"{field} must be an X25519 public key", field)
+    return key
+
+
 def _load_x25519_peer_public_key(value: object) -> x25519.X25519PublicKey:
     """Parse the peer public key strictly as an X25519 public key.
 
@@ -250,15 +267,7 @@ def _load_x25519_peer_public_key(value: object) -> x25519.X25519PublicKey:
     as X25519, while a key carrying an Ed25519 or any other algorithm
     identifier is rejected with ``field=peer_public_key``.
     """
-    if not is_nonempty_string(value):
-        raise CryptoError("field must be a non-empty string: peer_public_key",
-                          "peer_public_key")
-    key = load_public_key(value)
-    if not isinstance(key, x25519.X25519PublicKey):
-        raise CryptoError(
-            "peer_public_key must be an X25519 public key",
-            "peer_public_key")
-    return key
+    return _load_x25519_public_key(value, "peer_public_key")
 
 
 def derive_session_key(session_id: str, private_key: str,
@@ -681,4 +690,118 @@ def verify_prekey_proof(proof: object, user_id: object, device_id: object,
         "identity_key": proof["identity_key"],
         "signature": proof["signature"],
         "fingerprint": fingerprint,
+    }
+
+
+#: Required fields of the frozen eight-field session snapshot, in check order.
+_SESSION_SNAPSHOT_FIELDS = (
+    "session_id", "initiator_device_id", "recipient_device_id", "prekey_id",
+    "ephemeral_key", "identity_key", "public_key", "created_at")
+
+
+def derive_verified_session_key(session: object, proof: object,
+                                private_key: object, user_id: object,
+                                expected_fingerprint: object) -> dict:
+    """Derive the initiator's one-to-one session key from verified material.
+
+    This is the initiator-side counterpart of :func:`derive_session_key`:
+    instead of trusting a bare peer public key, it cross-checks a frozen
+    session snapshot against a trusted signed pre-key proof and only then
+    runs the exact same X25519 + HKDF-SHA256 protocol, so the derived key is
+    bit-for-bit identical to what the recipient derives from its pre-key
+    private key and the snapshot's ``ephemeral_key`` — and works directly
+    with :func:`encrypt_message`/:func:`decrypt_message`.
+
+    *session* is the immutable eight-field snapshot returned by the public
+    session query (``session_id``, ``initiator_device_id``,
+    ``recipient_device_id``, ``prekey_id``, ``ephemeral_key``,
+    ``identity_key``, ``public_key``, ``created_at``); every required field
+    must be a non-empty string and extra fields are ignored. *proof* is the
+    frozen six-string signed pre-key proof, verified exactly as
+    :func:`verify_prekey_proof` does: it must belong to *user_id* and to the
+    snapshot's ``recipient_device_id``/``prekey_id``, its frozen identity
+    key must match the trusted *expected_fingerprint*, and its signature
+    must verify. The proof's ``device_id``, ``key_id`` and ``public_key``
+    strings must equal the snapshot's verbatim, while the identity public
+    keys are compared by their canonical bytes, so an equivalent re-encoding
+    of the same identity key still matches. *private_key* is the
+    initiator's ephemeral private key in the canonical standard-base64 raw
+    32-byte form required by :func:`derive_session_key`; its corresponding
+    public key must equal the snapshot's ``ephemeral_key``. Both the
+    ephemeral key and the pre-key must be X25519 keys (a raw 32-byte point
+    is interpreted as X25519, as elsewhere).
+
+    The check is purely local and historical: only the frozen snapshot and
+    proof are consulted, so after an identity rotation, pre-key consumption
+    or revocation, an old proof together with its matching old snapshot
+    still derives the old key under the old trusted fingerprint. No server
+    is contacted, no backend state is read or written, the input mappings
+    are never modified, and neither the private key nor the derived key is
+    retained.
+
+    On success returns a new dict with exactly ``session_id`` and ``key``
+    (standard base64 of the 32-byte key). Any failure raises
+    :class:`CryptoError`: a non-object snapshot is ``session``; a missing,
+    wrong-type or empty required snapshot field names that field; proof
+    verification failures keep the fields used by
+    :func:`verify_prekey_proof`; a proof ``public_key``/``identity_key``
+    that disagrees with the snapshot names ``public_key``/``identity_key``;
+    a malformed private key is ``private_key``; an invalid or mismatched
+    ephemeral public key is ``ephemeral_key``; a non-X25519 pre-key or a
+    failed exchange is ``public_key``.
+    """
+    if not isinstance(session, dict):
+        raise CryptoError("session must be a JSON object", "session")
+    for name in _SESSION_SNAPSHOT_FIELDS:
+        if not is_nonempty_string(session.get(name)):
+            raise CryptoError(f"field must be a non-empty string: {name}",
+                              name)
+    session_id = session["session_id"]
+    try:
+        info = (SESSION_KEY_INFO_PREFIX + "\n" + session_id).encode("utf-8")
+    except UnicodeEncodeError:
+        raise CryptoError("session_id must be encodable as UTF-8",
+                          "session_id") from None
+
+    verified = verify_prekey_proof(proof, user_id,
+                                   session["recipient_device_id"],
+                                   session["prekey_id"],
+                                   expected_fingerprint)
+    if verified["public_key"] != session["public_key"]:
+        raise CryptoError(
+            "proof public_key does not match the session snapshot",
+            "public_key")
+    if canonical_public_key_bytes(session["identity_key"]) != \
+            canonical_public_key_bytes(verified["identity_key"]):
+        raise CryptoError(
+            "identity_key does not match the proof's identity key",
+            "identity_key")
+
+    private_bytes = _decode_private_key_bytes(private_key)
+    private = x25519.X25519PrivateKey.from_private_bytes(private_bytes)
+    ephemeral = _load_x25519_public_key(session["ephemeral_key"],
+                                        "ephemeral_key")
+    derived_public = private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    if ephemeral.public_bytes(serialization.Encoding.Raw,
+                              serialization.PublicFormat.Raw) \
+            != derived_public:
+        raise CryptoError(
+            "private_key does not correspond to the session ephemeral_key",
+            "ephemeral_key")
+
+    prekey = _load_x25519_public_key(session["public_key"], "public_key")
+    try:
+        shared = private.exchange(prekey)
+    except ValueError:
+        # X25519 rejects an all-zero shared secret (low-order peer point).
+        raise CryptoError(
+            "public_key does not yield a usable shared secret",
+            "public_key") from None
+
+    key = HKDF(algorithm=hashes.SHA256(), length=SESSION_KEY_BYTES,
+               salt=SESSION_KEY_SALT, info=info).derive(shared)
+    return {
+        "session_id": session_id,
+        "key": base64.b64encode(key).decode("ascii"),
     }

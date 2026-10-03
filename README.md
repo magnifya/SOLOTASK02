@@ -391,6 +391,14 @@ python3 -m e2ee_backend verify-prekey-proof \
   --user-id u1 --device-id d1 --key-id k1 \
   --expected-fingerprint 64位小写hex指纹
 # => {"user_id":"u1","device_id":"d1","key_id":"k1","public_key":"…","identity_key":"…","signature":"…","fingerprint":"…"}
+
+# 发起方本地派生经证明核验的一对一会话密钥（不访问服务器；--session/--proof 可用 @文件路径）
+python3 -m e2ee_backend derive-verified-session-key \
+  --session '{"session_id":"…","initiator_device_id":"…","recipient_device_id":"…","prekey_id":"…","ephemeral_key":"…","identity_key":"…","public_key":"…","created_at":"…"}' \
+  --proof '{"user_id":"…","device_id":"…","key_id":"…","public_key":"…","identity_key":"…","signature":"…"}' \
+  --private-key BASE64_32BYTE_X25519_EPHEMERAL_PRIVATE_KEY \
+  --user-id RECIPIENT_USER_ID --expected-fingerprint 64位小写hex指纹
+# => {"session_id":"…","key":"…"}   # 与 derive-session-key 协议完全一致，可直接作 --key
 ```
 
 默认服务地址为 `http://127.0.0.1:8080`，可用全局参数 `--base-url` 或环境变量 `E2EE_BASE_URL` 覆盖。
@@ -407,13 +415,13 @@ python3 -m unittest discover -s tests -v
 
 ```
 e2ee_backend/
-  crypto.py       # cryptography 公钥解析/校验（PEM、DER、原始曲线点）、AES-256-GCM 本地加解密、X25519+HKDF-SHA256 本地会话密钥派生与离线签名预密钥证明校验
+  crypto.py       # cryptography 公钥解析/校验（PEM、DER、原始曲线点）、AES-256-GCM 本地加解密、X25519+HKDF-SHA256 本地会话密钥派生与离线签名预密钥证明校验（含发起方经证明核验的会话密钥派生）
   models.py       # Device / SignedPreKey / KeyEvent / Session / Group / GroupSession / GroupSessionRotation / GroupSyncCursor / Message / MessageSubmission / MessageDelivery（含收件箱补投租约 MessageLease 及其续期 MessageLeaseRenewal）/ CleanupLease（含续期）与 CleanupLeaseEvent 数据模型
   storage.py      # 线程安全的进程内存储（插入顺序、撤销过滤、原子快照、会话原子创建、群组与冻结群会话、群会话轮换（幂等重放、无分叉）、消息原子追加与分页（群组会话限冻结成员）、幂等消息提交（request_id 重放/冲突）、投递去重/确认、群会话按设备同步分页与检查点游标、统一会话同步批量确认（sync/ack：投递确认与游标同事务，1:1 仅接收方、群组跳过本人消息）、整体状态快照与恢复）
   persistence.py  # version=1 JSON 状态文件：缺失创建、损坏/版本不符拒启、临时文件+fsync+硬链接备份+os.replace+父目录 fsync（平台不支持时安全跳过）原子替换，不可判定失败后在存储锁内同进程自愈（校验并硬链接提升唯一 .bak、清理遗留、再提交当前请求；两个及以上可验证候选拒绝提升、绝不按名或 mtime 选；连正式路径都无法腾空时落 .state-*.block 标记进入阻断态、一切写 503 且不把残留正式文件当权威，路径腾出且唯一可验证备份时才硬链接提升解阻），启动清理/恢复崩溃遗留快照（同代多候选同样拒绝）
   locking.py      # --data-file 状态文件的进程级非阻塞独占锁：POSIX flock、Windows msvcrt.locking 字节区间锁，锁文件只创建不截断、不参与崩溃遗留扫描
   service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/群组/群会话/群会话轮换/消息/投递/群同步）
   http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、群组创建/查询/成员增删、群组会话协商/查询/轮换、消息投递/幂等提交与拉取、重试/确认/状态、群会话同步与检查点、会话同步批量确认 sync/ack、补投事件保留 event-gc、只读持久化完整性探针 /v1/persistence/integrity）
-  cli.py          # register/register-verified/show/key-events/revoke-*/rotate-identity-key/rotate-identity-key-verified/fingerprint/verify-identity/add-prekey/add-prekey-verified/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/derive-session-key/verify-prekey-proof/serve 命令行入口
+  cli.py          # register/register-verified/show/key-events/revoke-*/rotate-identity-key/rotate-identity-key-verified/fingerprint/verify-identity/add-prekey/add-prekey-verified/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/derive-session-key/verify-prekey-proof/derive-verified-session-key/serve 命令行入口
 tests/            # unittest 测试
 ```

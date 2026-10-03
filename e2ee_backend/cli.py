@@ -14,8 +14,8 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from .crypto import (CryptoError, decrypt_message, derive_session_key,
-                     encrypt_message, is_nonempty_string,
-                     verify_prekey_proof)
+                     derive_verified_session_key, encrypt_message,
+                     is_nonempty_string, verify_prekey_proof)
 from .http_app import create_server
 from .locking import StateFileLocked, acquire_state_file_lock
 from .persistence import StateFileError, attach_persistence
@@ -569,6 +569,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-fingerprint",
         help="64 lowercase hex characters of the trusted identity fingerprint")
     p_verify_prekey_proof.set_defaults(handler=cmd_verify_prekey_proof)
+
+    # The options are deliberately not marked required=True: a missing option
+    # must surface through the same single-line JSON error contract (exit 2)
+    # as the other derivation failures, not as an argparse usage error.
+    p_derive_verified = sub.add_parser(
+        "derive-verified-session-key",
+        help="derive a one-to-one session key locally from a session "
+             "snapshot cross-checked against a trusted signed pre-key "
+             "proof (no server needed)")
+    p_derive_verified.add_argument(
+        "--session",
+        help="session snapshot JSON object text, or @path to read it from "
+             "a UTF-8 file")
+    p_derive_verified.add_argument(
+        "--proof",
+        help="proof JSON object text, or @path to read it from a UTF-8 file")
+    p_derive_verified.add_argument(
+        "--private-key",
+        help="canonical standard-base64 raw 32-byte X25519 ephemeral "
+             "private key")
+    p_derive_verified.add_argument(
+        "--user-id", help="expected recipient user id, compared as-is")
+    p_derive_verified.add_argument(
+        "--expected-fingerprint",
+        help="64 lowercase hex characters of the trusted identity fingerprint")
+    p_derive_verified.set_defaults(handler=cmd_derive_verified_session_key)
 
     p_integrity_history_page = sub.add_parser(
         "integrity-history-page",
@@ -1352,6 +1378,33 @@ def cmd_derive_session_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_json_object_argument(value: Optional[str], field: str) -> Any:
+    """Parse a JSON-object option: inline object text, or ``@path`` for a file.
+
+    A missing option, unreadable file, UTF-8 decode failure, invalid JSON or
+    a JSON value that is not an object all raise :class:`CryptoError` naming
+    *field*; the file's UTF-8 text is parsed as-is (no stripping).
+    """
+    if not is_nonempty_string(value):
+        raise CryptoError(f"field must be a non-empty string: {field}", field)
+    text = value
+    if value.startswith("@"):
+        try:
+            with open(value[1:], "r", encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError) as error:
+            raise CryptoError(f"cannot read {field} file: {error}",
+                              field) from None
+    try:
+        element = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise CryptoError(f"{field} must be valid JSON: {error}",
+                          field) from None
+    if not isinstance(element, dict):
+        raise CryptoError(f"{field} must be a JSON object", field)
+    return element
+
+
 def _read_proof_argument(value: Optional[str]) -> Any:
     """Parse the ``--proof`` option: JSON object text, or ``@path`` for a file.
 
@@ -1359,24 +1412,7 @@ def _read_proof_argument(value: Optional[str]) -> Any:
     a JSON value that is not an object all raise :class:`CryptoError` with
     ``field=proof``; the file's UTF-8 text is parsed as-is (no stripping).
     """
-    if not is_nonempty_string(value):
-        raise CryptoError("field must be a non-empty string: proof", "proof")
-    text = value
-    if value.startswith("@"):
-        try:
-            with open(value[1:], "r", encoding="utf-8") as handle:
-                text = handle.read()
-        except (OSError, UnicodeDecodeError) as error:
-            raise CryptoError(f"cannot read proof file: {error}",
-                              "proof") from None
-    try:
-        proof = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise CryptoError(f"proof must be valid JSON: {error}",
-                          "proof") from None
-    if not isinstance(proof, dict):
-        raise CryptoError("proof must be a JSON object", "proof")
-    return proof
+    return _read_json_object_argument(value, "proof")
 
 
 def cmd_verify_prekey_proof(args: argparse.Namespace) -> int:
@@ -1392,6 +1428,27 @@ def cmd_verify_prekey_proof(args: argparse.Namespace) -> int:
         proof = _read_proof_argument(args.proof)
         result = verify_prekey_proof(proof, args.user_id, args.device_id,
                                      args.key_id, args.expected_fingerprint)
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def cmd_derive_verified_session_key(args: argparse.Namespace) -> int:
+    """Derive the initiator's session key from proof-checked frozen material.
+
+    Purely local: no server is contacted and no backend state is read or
+    written. Success prints exactly ``session_id`` and ``key`` as
+    single-line JSON on stdout and exits 0; any failure — including a
+    missing option — prints a single-line JSON with only ``message`` and
+    ``field`` on stderr, leaves stdout empty and exits 2.
+    """
+    try:
+        session = _read_json_object_argument(args.session, "session")
+        proof = _read_json_object_argument(args.proof, "proof")
+        result = derive_verified_session_key(
+            session, proof, args.private_key, args.user_id,
+            args.expected_fingerprint)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
