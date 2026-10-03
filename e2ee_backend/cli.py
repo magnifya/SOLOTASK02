@@ -13,7 +13,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from .crypto import CryptoError, decrypt_message, encrypt_message
+from .crypto import (
+    CryptoError,
+    decrypt_message,
+    derive_session_key,
+    encrypt_message,
+)
 from .http_app import create_server
 from .locking import StateFileLocked, acquire_state_file_lock
 from .persistence import StateFileError, attach_persistence
@@ -529,6 +534,24 @@ def build_parser() -> argparse.ArgumentParser:
                            help="base64-encoded ciphertext with appended GCM tag")
     _add_envelope_arguments(p_decrypt)
     p_decrypt.set_defaults(handler=cmd_decrypt_message)
+
+    # The options are intentionally not ``required=True``: a missing option
+    # must surface as the same single-line JSON error (exit 2) as every
+    # other local crypto failure, not as an argparse usage message.
+    p_derive = sub.add_parser(
+        "derive-session-key",
+        help="derive a one-to-one session key locally (no server needed)")
+    p_derive.add_argument("--session-id",
+                          help="session id bound into the derived key")
+    p_derive.add_argument(
+        "--private-key",
+        help="canonical base64 raw 32-byte X25519 private key, or @path to "
+             "read it from a file")
+    p_derive.add_argument(
+        "--peer-public-key",
+        help="peer's X25519 public key (string), or @path to read it from a "
+             "file")
+    p_derive.set_defaults(handler=cmd_derive_session_key)
 
     p_integrity_history_page = sub.add_parser(
         "integrity-history-page",
@@ -1295,6 +1318,36 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
                                      args.sequence))
     except OSError as error:
         return _emit_crypto_error(CryptoError(str(error), "key"))
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def cmd_derive_session_key(args: argparse.Namespace) -> int:
+    """Derive a one-to-one session key locally; print ``session_id``/``key``.
+
+    Missing options are forwarded as ``None`` so the crypto layer reports
+    them through the same single-line JSON error contract (exit 2) as the
+    other validation failures, in the fixed field order ``session_id``,
+    ``private_key``, ``peer_public_key``.
+    """
+    private_key = args.private_key
+    if private_key is not None:
+        try:
+            private_key = _read_key_argument(private_key)
+        except OSError as error:
+            return _emit_crypto_error(CryptoError(str(error), "private_key"))
+    peer_public_key = args.peer_public_key
+    if peer_public_key is not None:
+        try:
+            peer_public_key = _read_key_argument(peer_public_key)
+        except OSError as error:
+            return _emit_crypto_error(
+                CryptoError(str(error), "peer_public_key"))
+    try:
+        result = derive_session_key(args.session_id, private_key,
+                                    peer_public_key)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
