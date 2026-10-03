@@ -586,3 +586,112 @@ def is_fingerprint_format(value: object) -> bool:
     return (isinstance(value, str)
             and len(value) == IDENTITY_FINGERPRINT_HEX_LEN
             and all(char in "0123456789abcdef" for char in value))
+
+
+#: The six string fields a published signed pre-key proof carries, in the
+#: order they are validated and returned.
+_PROOF_FIELDS = ("user_id", "device_id", "key_id", "public_key",
+                 "identity_key", "signature")
+
+
+def verify_prekey_proof(proof: object, user_id: object, device_id: object,
+                        key_id: object,
+                        expected_fingerprint: object) -> dict:
+    """Verify one published signed pre-key proof offline against a trusted
+    identity fingerprint.
+
+    *proof* is the six-string proof object as published at pre-key
+    publication time (``user_id``, ``device_id``, ``key_id``, ``public_key``,
+    ``identity_key``, ``signature``); extra fields are ignored and the input
+    object is never modified. *user_id*, *device_id* and *key_id* are the
+    expected ownership identifiers, compared against the proof's fields
+    exactly as given — no trimming of whitespace and no normalization of
+    Chinese characters or slashes. *expected_fingerprint* is the trusted
+    fingerprint obtained out of band: 64 lowercase hexadecimal characters
+    that must equal :func:`identity_fingerprint` of the proof's frozen
+    identity key before any signature check runs.
+
+    The proof itself follows the public ``E2EE-SIGNED-PREKEY-V1`` rules: the
+    identity key must parse as an Ed25519 public key (the existing
+    encodings), the pre-key public key must parse under the existing public
+    key rules, and the signature must be canonical standard base64 decoding
+    to exactly 64 bytes and must verify over the proof's four ownership and
+    key strings with the frozen identity key. Because the fingerprint
+    canonicalizes the identity key, an equivalent encoding of the same
+    identity key still matches; because the pre-key public key *string* is
+    signed verbatim, swapping it for an equivalent encoding without
+    re-signing fails verification. Only the publication-time authorization
+    is checked: identity rotation, consumption and revocation of the key do
+    not change this offline verdict, and nothing here contacts a server or
+    touches backend state.
+
+    On success returns a new dict with the proof's six original string
+    values plus ``fingerprint``. Every failure raises :class:`CryptoError`:
+    a non-object proof is ``field=proof``; a missing, mistyped or empty
+    required string, an invalid public key or a bad fingerprint format is
+    the corresponding field; an ownership mismatch is ``user_id``,
+    ``device_id`` or ``key_id``; a fingerprint mismatch is
+    ``expected_fingerprint``; a non-canonical/wrong-length signature or a
+    failed verification is ``signature``.
+    """
+    if not isinstance(proof, dict):
+        raise CryptoError("proof must be a JSON object", "proof")
+    for name in _PROOF_FIELDS:
+        if not is_nonempty_string(proof.get(name)):
+            raise CryptoError(f"field must be a non-empty string: {name}",
+                              name)
+    if load_public_key(proof["public_key"]) is None:
+        raise CryptoError("field is not a valid public key: public_key",
+                          "public_key")
+    identity = load_ed25519_public_key(proof["identity_key"])
+    if identity is None:
+        raise CryptoError(
+            "field is not a valid Ed25519 public key: identity_key",
+            "identity_key")
+    signature = decode_ed25519_signature(proof["signature"])
+    if signature is None:
+        raise CryptoError(
+            "field must be a standard base64 64-byte Ed25519 signature: "
+            "signature", "signature")
+
+    for name, expected in (("user_id", user_id), ("device_id", device_id),
+                           ("key_id", key_id)):
+        if not is_nonempty_string(expected):
+            raise CryptoError(f"field must be a non-empty string: {name}",
+                              name)
+    if not is_nonempty_string(expected_fingerprint):
+        raise CryptoError(
+            "field must be a non-empty string: expected_fingerprint",
+            "expected_fingerprint")
+    if not is_fingerprint_format(expected_fingerprint):
+        raise CryptoError(
+            "field must be 64 lowercase hexadecimal characters: "
+            "expected_fingerprint", "expected_fingerprint")
+
+    for name, expected in (("user_id", user_id), ("device_id", device_id),
+                           ("key_id", key_id)):
+        if proof[name] != expected:
+            raise CryptoError(
+                f"proof does not belong to the expected {name}", name)
+
+    fingerprint = identity_fingerprint(proof["identity_key"])
+    if fingerprint != expected_fingerprint:
+        raise CryptoError(
+            "expected_fingerprint does not match the proof identity key",
+            "expected_fingerprint")
+    if not verify_signed_prekey(identity, signature, proof["user_id"],
+                                proof["device_id"], proof["key_id"],
+                                proof["public_key"]):
+        raise CryptoError(
+            "signed pre-key proof failed verification: signature",
+            "signature")
+
+    return {
+        "user_id": proof["user_id"],
+        "device_id": proof["device_id"],
+        "key_id": proof["key_id"],
+        "public_key": proof["public_key"],
+        "identity_key": proof["identity_key"],
+        "signature": proof["signature"],
+        "fingerprint": fingerprint,
+    }

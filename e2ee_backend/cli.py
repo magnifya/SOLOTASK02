@@ -14,7 +14,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from .crypto import (CryptoError, decrypt_message, derive_session_key,
-                     encrypt_message)
+                     encrypt_message, verify_prekey_proof)
 from .http_app import create_server
 from .locking import StateFileLocked, acquire_state_file_lock
 from .persistence import StateFileError, attach_persistence
@@ -547,6 +547,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--peer-public-key",
         help="peer X25519 public key (any accepted public-key encoding)")
     p_derive.set_defaults(handler=cmd_derive_session_key)
+
+    # Like derive-session-key, the options are deliberately not marked
+    # required=True: a missing option must surface through the same
+    # single-line JSON error contract (exit 2) as the other verification
+    # failures, not as an argparse usage error.
+    p_verify_prekey_proof = sub.add_parser(
+        "verify-prekey-proof",
+        help="verify a signed pre-key proof offline against a trusted "
+             "identity fingerprint (no server needed)")
+    p_verify_prekey_proof.add_argument(
+        "--proof",
+        help="proof JSON object text, or @path to read it from a file")
+    p_verify_prekey_proof.add_argument(
+        "--user-id", help="expected user id (compared verbatim)")
+    p_verify_prekey_proof.add_argument(
+        "--device-id", help="expected device id (compared verbatim)")
+    p_verify_prekey_proof.add_argument(
+        "--key-id", help="expected pre-key id (compared verbatim)")
+    p_verify_prekey_proof.add_argument(
+        "--expected-fingerprint",
+        help="trusted identity fingerprint (64 lowercase hex characters)")
+    p_verify_prekey_proof.set_defaults(handler=cmd_verify_prekey_proof)
 
     p_integrity_history_page = sub.add_parser(
         "integrity-history-page",
@@ -1324,6 +1346,50 @@ def cmd_derive_session_key(args: argparse.Namespace) -> int:
     try:
         result = derive_session_key(args.session_id, args.private_key,
                                     args.peer_public_key)
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def _read_proof_argument(value: str) -> str:
+    """Return the proof JSON text, reading an ``@path`` file as UTF-8.
+
+    Unlike :func:`_read_key_argument` the file contents are not stripped:
+    the JSON parser tolerates surrounding whitespace anyway.
+    """
+    if value.startswith("@"):
+        with open(value[1:], "r", encoding="utf-8") as handle:
+            return handle.read()
+    return value
+
+
+def cmd_verify_prekey_proof(args: argparse.Namespace) -> int:
+    """Verify a signed pre-key proof locally and print the seven-field result.
+
+    Everything runs offline: no server is contacted and no backend state is
+    read or written. Success prints the proof's six original fields plus
+    ``fingerprint`` as single-line JSON on stdout and exits 0. Every failure
+    — a missing option, an unreadable or non-UTF-8 ``@file``, invalid JSON,
+    a non-object proof, a field/format/ownership/fingerprint/signature
+    problem — prints the single-line ``message``/``field`` JSON on stderr
+    and exits 2 with stdout empty.
+    """
+    try:
+        if args.proof is None:
+            raise CryptoError("missing required option: --proof", "proof")
+        try:
+            text = _read_proof_argument(args.proof)
+        except (OSError, UnicodeDecodeError) as error:
+            raise CryptoError(f"cannot read proof: {error}", "proof") \
+                from None
+        try:
+            proof = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise CryptoError(f"proof is not valid JSON: {error}", "proof") \
+                from None
+        result = verify_prekey_proof(proof, args.user_id, args.device_id,
+                                     args.key_id, args.expected_fingerprint)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
