@@ -14,7 +14,8 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from .crypto import (CryptoError, decrypt_message, derive_session_key,
-                     encrypt_message)
+                     encrypt_message, is_nonempty_string,
+                     verify_prekey_proof)
 from .http_app import create_server
 from .locking import StateFileLocked, acquire_state_file_lock
 from .persistence import StateFileError, attach_persistence
@@ -547,6 +548,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--peer-public-key",
         help="peer X25519 public key (any accepted public-key encoding)")
     p_derive.set_defaults(handler=cmd_derive_session_key)
+
+    # The options are deliberately not marked required=True: a missing option
+    # must surface through the same single-line JSON error contract (exit 2)
+    # as the other verification failures, not as an argparse usage error.
+    p_verify_prekey_proof = sub.add_parser(
+        "verify-prekey-proof",
+        help="verify a published signed pre-key proof offline against a "
+             "trusted identity fingerprint (no server needed)")
+    p_verify_prekey_proof.add_argument(
+        "--proof",
+        help="proof JSON object text, or @path to read it from a UTF-8 file")
+    p_verify_prekey_proof.add_argument(
+        "--user-id", help="expected user id, compared with the proof as-is")
+    p_verify_prekey_proof.add_argument(
+        "--device-id", help="expected device id, compared with the proof as-is")
+    p_verify_prekey_proof.add_argument(
+        "--key-id", help="expected pre-key id, compared with the proof as-is")
+    p_verify_prekey_proof.add_argument(
+        "--expected-fingerprint",
+        help="64 lowercase hex characters of the trusted identity fingerprint")
+    p_verify_prekey_proof.set_defaults(handler=cmd_verify_prekey_proof)
 
     p_integrity_history_page = sub.add_parser(
         "integrity-history-page",
@@ -1324,6 +1346,52 @@ def cmd_derive_session_key(args: argparse.Namespace) -> int:
     try:
         result = derive_session_key(args.session_id, args.private_key,
                                     args.peer_public_key)
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def _read_proof_argument(value: Optional[str]) -> Any:
+    """Parse the ``--proof`` option: JSON object text, or ``@path`` for a file.
+
+    A missing option, unreadable file, UTF-8 decode failure, invalid JSON or
+    a JSON value that is not an object all raise :class:`CryptoError` with
+    ``field=proof``; the file's UTF-8 text is parsed as-is (no stripping).
+    """
+    if not is_nonempty_string(value):
+        raise CryptoError("field must be a non-empty string: proof", "proof")
+    text = value
+    if value.startswith("@"):
+        try:
+            with open(value[1:], "r", encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError) as error:
+            raise CryptoError(f"cannot read proof file: {error}",
+                              "proof") from None
+    try:
+        proof = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise CryptoError(f"proof must be valid JSON: {error}",
+                          "proof") from None
+    if not isinstance(proof, dict):
+        raise CryptoError("proof must be a JSON object", "proof")
+    return proof
+
+
+def cmd_verify_prekey_proof(args: argparse.Namespace) -> int:
+    """Verify a signed pre-key proof offline and print it with its fingerprint.
+
+    Purely local: no server is contacted and no backend state is read or
+    written. Success prints the proof's six original fields plus
+    ``fingerprint`` as single-line JSON on stdout and exits 0; any failure —
+    including a missing option — prints a single-line JSON with only
+    ``message`` and ``field`` on stderr, leaves stdout empty and exits 2.
+    """
+    try:
+        proof = _read_proof_argument(args.proof)
+        result = verify_prekey_proof(proof, args.user_id, args.device_id,
+                                     args.key_id, args.expected_fingerprint)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
