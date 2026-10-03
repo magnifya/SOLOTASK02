@@ -828,6 +828,118 @@ class DeviceService:
             raise self._device_update_error(error, device_id)
         return view, 201 if created else 200
 
+    def add_prekeys_verified_batch(self, device_id: str,
+                                   payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and append a batch of identity-authorized pre-keys.
+
+        The body is a JSON object whose ``signed_prekeys`` is a non-empty
+        array; each element carries the same three non-empty strings as the
+        single-item verified entry (``key_id``, ``public_key``,
+        ``signature``), with the same public-key and signature encodings and
+        the same ``E2EE-SIGNED-PREKEY-V1`` proof verified against the
+        device's *current* identity key over the verbatim request strings.
+
+        A body that is not an object is 400/field=request_body; a missing,
+        non-array or empty ``signed_prekeys`` is 400/field=signed_prekeys; a
+        non-object element is 400 naming ``signed_prekeys[i]`` (0-based); a
+        missing/wrongly-typed/empty field, an invalid public key or an
+        invalid signature encoding is 400 naming
+        ``signed_prekeys[i].<field>``; a repeated ``key_id`` is 400 at its
+        second occurrence, naming ``signed_prekeys[i].key_id``. The
+        device/identity checks and per-element proof verification and
+        conflict decisions then run atomically in the store, in array order
+        with each element's proof checked before its conflict decision:
+        unknown device is 404/field=device_id, a revoked device
+        409/field=device_id, a current identity key that is not Ed25519
+        400/field=identity_key, a proof that does not verify 400 naming
+        ``signed_prekeys[i].signature``, and an existing id with a changed
+        key or a revoked id 409 naming ``signed_prekeys[i].key_id``.
+
+        The batch is all-or-nothing: when every element passes, each new id
+        is appended in request order (one ``prekey_added`` event and one
+        frozen proof each, a single durable commit generation for the whole
+        batch) and the response is 201; an existing id with the same,
+        non-revoked key is idempotent (no proof rewrite, no event, no
+        consumed-flag reset), and a batch of only idempotent elements returns
+        200 without consuming a commit generation. On any failure no device,
+        pre-key, audit-chain, sync cursor or durable generation is changed.
+        The response carries ``device_id`` and ``signed_prekeys`` with each
+        element's ``key_id``/``public_key`` in request order. Returns
+        ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "signed_prekeys" not in payload:
+            raise ServiceError("missing required field: signed_prekeys",
+                               "signed_prekeys")
+        raw_prekeys = payload["signed_prekeys"]
+        if not isinstance(raw_prekeys, list) or not raw_prekeys:
+            raise ServiceError(
+                "field must be a non-empty array: signed_prekeys",
+                "signed_prekeys")
+
+        items: List[Dict[str, Any]] = []
+        seen_key_ids: set = set()
+        for index, element in enumerate(raw_prekeys):
+            prefix = f"signed_prekeys[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {prefix}", prefix)
+            for subfield in ("key_id", "public_key", "signature"):
+                path = f"{prefix}.{subfield}"
+                if subfield not in element:
+                    raise ServiceError(f"missing required field: {path}", path)
+                if not is_nonempty_string(element[subfield]):
+                    raise ServiceError(
+                        f"field must be a non-empty string: {path}", path)
+            if element["key_id"] in seen_key_ids:
+                raise ServiceError(
+                    f"duplicate key_id in signed_prekeys: "
+                    f"{element['key_id']}", f"{prefix}.key_id")
+            if load_public_key(element["public_key"]) is None:
+                raise ServiceError(
+                    f"field is not a valid public key: {prefix}.public_key",
+                    f"{prefix}.public_key")
+            signature = decode_ed25519_signature(element["signature"])
+            if signature is None:
+                raise ServiceError(
+                    f"field must be a standard base64 64-byte Ed25519 "
+                    f"signature: {prefix}.signature", f"{prefix}.signature")
+            seen_key_ids.add(element["key_id"])
+            items.append({"key_id": element["key_id"],
+                          "public_key": element["public_key"],
+                          "signature": signature,
+                          "signature_text": element["signature"]})
+
+        try:
+            view, created = self.store.add_prekeys_verified_batch(
+                device_id, items)
+        except DeviceUpdateError as error:
+            raise self._device_batch_update_error(error, device_id)
+        return view, 201 if created else 200
+
+    @staticmethod
+    def _device_batch_update_error(error: DeviceUpdateError,
+                                   device_id: str) -> ServiceError:
+        """Translate a batch pre-key storage failure to a ServiceError.
+
+        Element-level failures carry the 0-based request-array index and are
+        reported under that element's field path; device-level failures map
+        exactly as in the single-item entry.
+        """
+        prefix = (f"signed_prekeys[{error.index}]"
+                  if error.index is not None else "")
+        if error.reason == PREKEY_SIGNATURE_INVALID:
+            return ServiceError(
+                "signed pre-key proof failed verification: "
+                f"{prefix}.signature", f"{prefix}.signature")
+        if error.reason == PREKEY_CONFLICT:
+            return ServiceError(
+                "key_id already exists with a different key or is revoked",
+                f"{prefix}.key_id", status_code=409)
+        return DeviceService._device_update_error(error, device_id)
+
     @staticmethod
     def _device_update_error(error: DeviceUpdateError,
                              device_id: str) -> ServiceError:

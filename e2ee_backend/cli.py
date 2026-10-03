@@ -287,6 +287,17 @@ def build_parser() -> argparse.ArgumentParser:
              "proof, or @path to read it from a file")
     p_add_prekey_verified.set_defaults(handler=cmd_add_prekey_verified)
 
+    p_add_prekeys_verified = sub.add_parser(
+        "add-prekeys-verified",
+        help="append a batch of identity-authorized signed pre-keys")
+    p_add_prekeys_verified.add_argument("--device-id", required=True)
+    p_add_prekeys_verified.add_argument(
+        "--prekey", action="append", default=[],
+        metavar="KEY_ID:PUBLIC_KEY:SIGNATURE",
+        help="signed pre-key with its Ed25519 proof; repeatable. Use @path "
+             "for a JSON object file with key_id/public_key/signature.")
+    p_add_prekeys_verified.set_defaults(handler=cmd_add_prekeys_verified)
+
     p_claim_prekey = sub.add_parser(
         "claim-prekey", help="claim one of a device's one-time pre-keys")
     p_claim_prekey.add_argument("--recipient-device-id", required=True)
@@ -848,6 +859,36 @@ def cmd_add_prekey_verified(args: argparse.Namespace) -> int:
     payload = {"key_id": args.key_id,
                "public_key": _read_key_argument(args.public_key),
                "signature": _read_key_argument(args.signature)}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_add_prekeys_verified(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/{id}/prekeys/verified-batch; 201 or 200 replay.
+
+    Each ``--prekey`` is ``KEY_ID:PUBLIC_KEY:SIGNATURE`` (or ``@path`` to a
+    JSON object file), exactly as for ``register-verified``; the batch is
+    published all-or-nothing. A 2xx response prints the single-line JSON on
+    stdout and exits 0; any failure prints the server's single-line JSON
+    with its ``field`` on stderr and exits non-zero. An unparseable
+    ``--prekey`` is a local error (exit 2, field ``signed_prekeys``).
+    """
+    from urllib.parse import quote
+
+    try:
+        prekeys: List[Dict[str, str]] = [
+            _parse_verified_prekey(spec) for spec in args.prekey]
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(json.dumps({"message": str(error), "field": "signed_prekeys"}),
+              file=sys.stderr)
+        return 2
+
+    url = (f"{args.base_url}/v1/devices/"
+           f"{quote(args.device_id, safe='')}/prekeys/verified-batch")
+    payload = {"signed_prekeys": prekeys}
     try:
         status, response = _request_json("POST", url, body=payload)
     except ServerUnavailable:

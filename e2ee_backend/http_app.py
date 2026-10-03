@@ -239,6 +239,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 and "/inbox/leases/" in path and path.endswith("/ack"):
             self._route_device_inbox_lease_ack(path)
         elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/prekeys/verified-batch"):
+            self._route_add_prekeys_verified_batch(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
                 and path.endswith("/prekeys/verified"):
             self._route_add_prekey_verified(path)
         elif path.startswith(_DEVICES_PATH + "/"):
@@ -600,6 +603,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         parts = suffix.split("/")
         if len(parts) == 1 and parts[0]:
             self._handle_add_prekey_verified(unquote(parts[0]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_add_prekeys_verified_batch(self, path: str) -> None:
+        # {device_id}/prekeys/verified-batch — same segment rules as the
+        # single-item verified route above.
+        suffix = path[len(_DEVICES_PATH) + 1:-len("/prekeys/verified-batch")]
+        parts = suffix.split("/")
+        if len(parts) == 1 and parts[0]:
+            self._handle_add_prekeys_verified_batch(unquote(parts[0]))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -1295,6 +1309,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.add_prekey_verified(
+                device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_add_prekeys_verified_batch(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.add_prekeys_verified_batch(
                 device_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
