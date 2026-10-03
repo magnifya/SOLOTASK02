@@ -607,6 +607,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_derive_verified.add_argument(
         "--expected-fingerprint",
         help="64 lowercase hex characters of the trusted identity fingerprint")
+    p_derive_verified.add_argument(
+        "--role",
+        help='optional role: "initiator" (the default; --private-key is the '
+             'initiator\'s ephemeral private key) or "recipient" '
+             '(--private-key is the recipient\'s pre-key private key); any '
+             'other value fails with field "role"')
     p_derive_verified.set_defaults(handler=cmd_derive_verified_session_key)
 
     p_integrity_history_page = sub.add_parser(
@@ -1479,7 +1485,8 @@ def cmd_derive_verified_session_key(args: argparse.Namespace) -> int:
 
     Purely local: no server is contacted and no backend state is read or
     written. The snapshot and proof are JSON object text or ``@path`` UTF-8
-    files. Success prints a single-line JSON with only ``session_id`` and
+    files; ``--role`` selects the initiator (default) or recipient private
+    key. Success prints a single-line JSON with only ``session_id`` and
     ``key`` on stdout and exits 0; any failure — including a missing option —
     prints a single-line JSON with only ``message`` and ``field`` on stderr,
     leaves stdout empty and exits 2.
@@ -1487,9 +1494,17 @@ def cmd_derive_verified_session_key(args: argparse.Namespace) -> int:
     try:
         session = _read_object_argument(args.session, "session")
         proof = _read_object_argument(args.proof, "proof")
-        result = derive_verified_session_key(
-            session, proof, args.private_key, args.user_id,
-            args.expected_fingerprint)
+        # An omitted --role stays omitted (the initiator default); an
+        # explicitly given value — including an empty string — is validated
+        # by the crypto entry point and reported as field "role".
+        if args.role is None:
+            result = derive_verified_session_key(
+                session, proof, args.private_key, args.user_id,
+                args.expected_fingerprint)
+        else:
+            result = derive_verified_session_key(
+                session, proof, args.private_key, args.user_id,
+                args.expected_fingerprint, role=args.role)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))

@@ -325,6 +325,198 @@ class DeriveVerifiedSessionKeyCryptoTest(unittest.TestCase):
                            proof=self._proof(low_order))
 
 
+class DeriveVerifiedSessionKeyRecipientTest(unittest.TestCase):
+    """The ``role`` parameter: recipient-side verified derivation.
+
+    The recipient runs the same offline checks against the same frozen
+    snapshot and proof, but proves possession of the pre-key private key
+    (matching the snapshot's ``public_key``) and exchanges with the
+    snapshot's ``ephemeral_key``. The derived key is byte-identical to the
+    initiator's and to ``derive_session_key``.
+    """
+    USER_ID = " 用户/bob "
+    DEVICE_ID = "dev / 2"
+    KEY_ID = "键\tk"
+    SESSION_ID = " 会话-2 "
+
+    def setUp(self) -> None:
+        self.identity_private = ed25519.Ed25519PrivateKey.generate()
+        self.identity = _raw_b64(self.identity_private.public_key())
+        self.fingerprint = identity_fingerprint(self.identity)
+
+        self.prekey_private = x25519.X25519PrivateKey.generate()
+        self.prekey_public = _raw_b64(self.prekey_private.public_key())
+        self.prekey_private_b64 = _x25519_private_b64(self.prekey_private)
+
+        self.ephemeral_private = x25519.X25519PrivateKey.generate()
+        self.ephemeral_public = _raw_b64(self.ephemeral_private.public_key())
+        self.ephemeral_private_b64 = _x25519_private_b64(
+            self.ephemeral_private)
+
+        self.proof = self._proof(self.prekey_public)
+        self.session = self._session(
+            self.ephemeral_public, self.prekey_public, self.identity)
+
+    def _proof(self, public_key: str, *, identity: str = None,
+               signer=None) -> dict:
+        signer = signer or self.identity_private
+        identity = self.identity if identity is None else identity
+        signature = _b64(signer.sign(signed_prekey_proof_message(
+            self.USER_ID, self.DEVICE_ID, self.KEY_ID, public_key)))
+        return {
+            "user_id": self.USER_ID, "device_id": self.DEVICE_ID,
+            "key_id": self.KEY_ID, "public_key": public_key,
+            "identity_key": identity, "signature": signature,
+        }
+
+    def _session(self, ephemeral_key: str, public_key: str,
+                 identity_key: str) -> dict:
+        return {
+            "session_id": self.SESSION_ID,
+            "initiator_device_id": "initiator-device",
+            "recipient_device_id": self.DEVICE_ID,
+            "prekey_id": self.KEY_ID,
+            "ephemeral_key": ephemeral_key,
+            "identity_key": identity_key,
+            "public_key": public_key,
+            "created_at": "2026-01-02T03:04:05Z",
+        }
+
+    _UNSET = object()
+
+    def _derive(self, session=_UNSET, proof=_UNSET, private_key=_UNSET,
+                user_id=_UNSET, fingerprint=_UNSET, role="recipient"):
+        return derive_verified_session_key(
+            self.session if session is self._UNSET else session,
+            self.proof if proof is self._UNSET else proof,
+            self.prekey_private_b64
+            if private_key is self._UNSET else private_key,
+            self.USER_ID if user_id is self._UNSET else user_id,
+            self.fingerprint if fingerprint is self._UNSET else fingerprint,
+            role=role)
+
+    def _initiator_key(self) -> dict:
+        return derive_session_key(self.SESSION_ID, self.ephemeral_private_b64,
+                                  self.prekey_public)
+
+    def _assert_field(self, field: str, **kwargs) -> None:
+        with self.assertRaises(CryptoError) as ctx:
+            self._derive(**kwargs)
+        self.assertEqual(ctx.exception.field, field)
+
+    def test_recipient_matches_initiator_and_plain_derivation(self) -> None:
+        expected = self._initiator_key()
+        result = self._derive()
+        self.assertEqual(set(result), {"session_id", "key"})
+        self.assertEqual(result, expected)
+        # The initiator role over the same materials agrees byte-for-byte.
+        initiator = derive_verified_session_key(
+            self.session, self.proof, self.ephemeral_private_b64,
+            self.USER_ID, self.fingerprint, role="initiator")
+        self.assertEqual(result, initiator)
+        self.assertEqual(len(base64.b64decode(result["key"])), 32)
+
+    def test_omitted_and_explicit_initiator_keep_original_behavior(self) -> None:
+        expected = self._initiator_key()
+        omitted = derive_verified_session_key(
+            self.session, self.proof, self.ephemeral_private_b64,
+            self.USER_ID, self.fingerprint)
+        explicit = derive_verified_session_key(
+            self.session, self.proof, self.ephemeral_private_b64,
+            self.USER_ID, self.fingerprint, role="initiator")
+        self.assertEqual(omitted, explicit)
+        self.assertEqual(omitted, expected)
+        # A runtime-constructed (non-interned) role string works too.
+        constructed = derive_verified_session_key(
+            self.session, self.proof, self.ephemeral_private_b64,
+            self.USER_ID, self.fingerprint, role="".join(["init", "iator"]))
+        self.assertEqual(constructed, expected)
+
+    def test_invalid_roles_are_role(self) -> None:
+        for bad in (None, "", "Initiator", "RECIPIENT", " initiator",
+                    "initiator ", "both", 0, 1, True, False, [], {},
+                    b"initiator", b"recipient"):
+            self._assert_field("role", role=bad,
+                               private_key=self.ephemeral_private_b64)
+
+    def test_recipient_key_interoperates_with_message_crypto(self) -> None:
+        key = self._derive()["key"]
+        enc = encrypt_message(self.SESSION_ID, key, "hello 世界",
+                              sender_device_id="initiator-device",
+                              message_id="m1", sequence=1)
+        dec = decrypt_message(self.SESSION_ID, self._initiator_key()["key"],
+                              enc["nonce"], enc["ciphertext"],
+                              sender_device_id="initiator-device",
+                              message_id="m1", sequence=1)
+        self.assertEqual(dec["plaintext"], "hello 世界")
+
+    def test_recipient_private_key_errors_are_private_key(self) -> None:
+        for bad in (None, "", 1, "not base64!!!", _b64(b"short"),
+                    _b64(b"x" * 33)):
+            self._assert_field("private_key", private_key=bad)
+
+    def test_recipient_private_key_mismatching_prekey_is_public_key(self) -> None:
+        other = _x25519_private_b64(x25519.X25519PrivateKey.generate())
+        self._assert_field("public_key", private_key=other)
+        # The ephemeral private key does not match the pre-key either.
+        self._assert_field("public_key",
+                           private_key=self.ephemeral_private_b64)
+
+    def test_recipient_prekey_must_be_x25519(self) -> None:
+        ed_der = _der_b64(ed25519.Ed25519PrivateKey.generate().public_key())
+        session = self._session(self.ephemeral_public, ed_der, self.identity)
+        self._assert_field("public_key", session=session,
+                           proof=self._proof(ed_der))
+
+    def test_recipient_ephemeral_must_be_x25519(self) -> None:
+        ed_der = _der_b64(ed25519.Ed25519PrivateKey.generate().public_key())
+        self._assert_field(
+            "ephemeral_key",
+            session=self._session(ed_der, self.prekey_public, self.identity))
+        self._assert_field(
+            "ephemeral_key",
+            session=self._session("not-a-key", self.prekey_public,
+                                  self.identity))
+
+    def test_recipient_low_order_ephemeral_is_ephemeral_key(self) -> None:
+        low_order = _b64(b"\x00" * 32)
+        self._assert_field(
+            "ephemeral_key",
+            session=self._session(low_order, self.prekey_public,
+                                  self.identity))
+
+    def test_recipient_equivalent_public_key_encodings_match(self) -> None:
+        # The snapshot's public_key as DER (re-signed, since the signature
+        # covers the literal string) still matches the same private key.
+        prekey_der = _der_b64(self.prekey_private.public_key())
+        result = self._derive(
+            session=self._session(self.ephemeral_public, prekey_der,
+                                  self.identity),
+            proof=self._proof(prekey_der))
+        self.assertEqual(result, self._initiator_key())
+
+    def test_recipient_snapshot_and_proof_contract_unchanged(self) -> None:
+        # Snapshot shape, proof ownership and fingerprint rules are shared.
+        self._assert_field("session", session=None)
+        snapshot = dict(self.session)
+        del snapshot["created_at"]
+        self._assert_field("created_at", session=snapshot)
+        self._assert_field("proof", proof=[])
+        self._assert_field("user_id", user_id="someone-else")
+        self._assert_field("expected_fingerprint",
+                           fingerprint=self.fingerprint.upper())
+        other_prekey = _raw_b64(x25519.X25519PrivateKey.generate().public_key())
+        self._assert_field("public_key", proof=self._proof(other_prekey))
+
+    def test_recipient_historical_materials_derive_with_old_fingerprint(
+            self) -> None:
+        self.assertEqual(self._derive(), self._initiator_key())
+        new_identity = ed25519.Ed25519PrivateKey.generate().public_key()
+        self._assert_field(
+            "expected_fingerprint",
+            fingerprint=identity_fingerprint(_raw_b64(new_identity)))
+
+
 class DeriveVerifiedSessionKeyCLITest(unittest.TestCase):
     def setUp(self) -> None:
         self.identity_private = ed25519.Ed25519PrivateKey.generate()
@@ -463,6 +655,41 @@ class DeriveVerifiedSessionKeyCLITest(unittest.TestCase):
         args = self._args()
         args[args.index("--user-id") + 1] = "u2"
         self._assert_error(self._run(*args), "user_id")
+
+    def test_cli_recipient_role_matches_initiator(self) -> None:
+        initiator = self._run(*self._args())
+        self.assertEqual(initiator.returncode, 0, initiator.stderr)
+        args = self._args()
+        args[args.index("--private-key") + 1] = self.prekey_private_b64
+        recipient = self._run(*args, "--role", "recipient")
+        self.assertEqual(recipient.returncode, 0, recipient.stderr)
+        self.assertEqual(recipient.stderr, "")
+        self.assertEqual(json.loads(recipient.stdout),
+                         json.loads(initiator.stdout))
+        # An explicit initiator role keeps the original behavior.
+        explicit = self._run(*self._args(), "--role", "initiator")
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertEqual(json.loads(explicit.stdout),
+                         json.loads(initiator.stdout))
+
+    def test_cli_invalid_role_is_role_field(self) -> None:
+        for bad in ("", "Initiator", "RECIPIENT", "both"):
+            self._assert_error(self._run(*self._args(), "--role", bad),
+                               "role")
+
+    def test_cli_recipient_role_field_contract(self) -> None:
+        # A private key that does not match the snapshot's public_key.
+        other_private = _x25519_private_b64(x25519.X25519PrivateKey.generate())
+        args = self._args()
+        args[args.index("--private-key") + 1] = other_private
+        self._assert_error(self._run(*args, "--role", "recipient"),
+                           "public_key")
+        # A low-order ephemeral key fails the exchange as ephemeral_key.
+        args = self._args(
+            json.dumps(dict(self.session, ephemeral_key=_b64(b"\x00" * 32))))
+        args[args.index("--private-key") + 1] = self.prekey_private_b64
+        self._assert_error(self._run(*args, "--role", "recipient"),
+                           "ephemeral_key")
 
 
 if __name__ == "__main__":
