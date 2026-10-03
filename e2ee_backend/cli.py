@@ -599,14 +599,21 @@ def build_parser() -> argparse.ArgumentParser:
              "from a UTF-8 file")
     p_derive_verified.add_argument(
         "--private-key",
-        help="canonical standard-base64 raw 32-byte X25519 ephemeral private "
-             "key whose public key matches the snapshot's ephemeral_key")
+        help="canonical standard-base64 raw 32-byte X25519 private key; "
+             "with the default initiator role its public key matches the "
+             "snapshot's ephemeral_key, with --role recipient it matches "
+             "the snapshot's public_key")
     p_derive_verified.add_argument(
         "--user-id", help="expected recipient user id, compared with the "
                           "proof as-is")
     p_derive_verified.add_argument(
         "--expected-fingerprint",
         help="64 lowercase hex characters of the trusted identity fingerprint")
+    p_derive_verified.add_argument(
+        "--role",
+        help='"initiator" (the default when omitted) or "recipient"; the '
+             "recipient derives with the pre-key private key against the "
+             "snapshot's ephemeral_key")
     p_derive_verified.set_defaults(handler=cmd_derive_verified_session_key)
 
     p_integrity_history_page = sub.add_parser(
@@ -1479,17 +1486,27 @@ def cmd_derive_verified_session_key(args: argparse.Namespace) -> int:
 
     Purely local: no server is contacted and no backend state is read or
     written. The snapshot and proof are JSON object text or ``@path`` UTF-8
-    files. Success prints a single-line JSON with only ``session_id`` and
-    ``key`` on stdout and exits 0; any failure — including a missing option —
-    prints a single-line JSON with only ``message`` and ``field`` on stderr,
-    leaves stdout empty and exits 2.
+    files. ``--role recipient`` derives with the recipient's pre-key private
+    key instead of the initiator's ephemeral private key; omitting it keeps
+    the initiator behavior. Success prints a single-line JSON with only
+    ``session_id`` and ``key`` on stdout and exits 0; any failure — including
+    a missing option or an invalid role — prints a single-line JSON with only
+    ``message`` and ``field`` on stderr, leaves stdout empty and exits 2.
     """
     try:
         session = _read_object_argument(args.session, "session")
         proof = _read_object_argument(args.proof, "proof")
-        result = derive_verified_session_key(
-            session, proof, args.private_key, args.user_id,
-            args.expected_fingerprint)
+        # An omitted --role (None) stays omitted so the Python entry point
+        # applies its initiator default; any explicitly given value —
+        # including an empty string — is validated there as field=role.
+        if args.role is None:
+            result = derive_verified_session_key(
+                session, proof, args.private_key, args.user_id,
+                args.expected_fingerprint)
+        else:
+            result = derive_verified_session_key(
+                session, proof, args.private_key, args.user_id,
+                args.expected_fingerprint, role=args.role)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))

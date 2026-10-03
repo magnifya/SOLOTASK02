@@ -52,6 +52,23 @@ IDENTITY_FINGERPRINT_HEX_LEN = 64
 #: Length of an Ed25519 signature in bytes.
 ED25519_SIGNATURE_BYTES = 64
 
+#: ``derive_verified_session_key`` role naming the initiator (the default).
+SESSION_ROLE_INITIATOR = "initiator"
+#: ``derive_verified_session_key`` role naming the recipient.
+SESSION_ROLE_RECIPIENT = "recipient"
+
+
+class _RoleOmitted:
+    """Sentinel for an omitted *role*: distinct from any explicit value."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<role omitted>"
+
+
+#: Default for *role*: an omitted role derives as the initiator, while any
+#: explicit value other than the two role strings is rejected.
+_ROLE_OMITTED = _RoleOmitted()
+
 
 class CryptoError(Exception):
     """A local encryption/decryption failure naming the offending field."""
@@ -693,17 +710,25 @@ _SESSION_SNAPSHOT_FIELDS = (
 
 def derive_verified_session_key(session: object, proof: object,
                                 private_key: object, user_id: object,
-                                expected_fingerprint: object) -> dict:
+                                expected_fingerprint: object,
+                                role: object = _ROLE_OMITTED) -> dict:
     """Derive a one-to-one session key from a verified pre-key proof.
 
-    This is the initiator-side, purely local counterpart to
-    :func:`derive_session_key`: it cross-checks a frozen public session
-    snapshot (the eight fields returned by the public session query) against
-    a frozen signed pre-key proof and a trusted identity fingerprint before
-    deriving the same X25519+HKDF key a recipient obtains from
-    :func:`derive_session_key` with the matching pre-key private key. No
-    server is contacted, no backend state is read or written, and neither
-    input mapping is modified.
+    This is the purely local counterpart to :func:`derive_session_key`: it
+    cross-checks a frozen public session snapshot (the eight fields returned
+    by the public session query) against a frozen signed pre-key proof and a
+    trusted identity fingerprint before deriving the same X25519+HKDF key the
+    other party obtains from :func:`derive_session_key` with the matching
+    private key. No server is contacted, no backend state is read or written,
+    and neither input mapping is modified.
+
+    *role* selects which side derives the key. Omitted or ``"initiator"``
+    (the default), *private_key* is the initiator's ephemeral private key and
+    the peer is the snapshot's pre-key ``public_key``; with ``"recipient"``,
+    *private_key* is the recipient's pre-key private key and the peer is the
+    snapshot's ``ephemeral_key``. Both roles yield the byte-identical key.
+    Any other explicit value — a non-string, an empty string, ``None`` or an
+    unknown string — raises :class:`CryptoError` with ``field=role``.
 
     *session* must be a JSON object whose eight snapshot fields
     (``session_id``, ``initiator_device_id``, ``recipient_device_id``,
@@ -720,29 +745,44 @@ def derive_verified_session_key(session: object, proof: object,
     *expected_fingerprint* and signature — is verified with exactly the rules
     of :func:`verify_prekey_proof`; hence an old proof with a matching old
     snapshot still derives under the old trusted fingerprint after an identity
-    rotation, pre-key consumption or revocation.
+    rotation, pre-key consumption or revocation. Both roles verify the
+    recipient's proof: *user_id* and *expected_fingerprint* always name the
+    recipient side.
 
-    *private_key* is the initiator's ephemeral private key using the same
-    canonical standard-base64 raw 32-byte encoding as
-    :func:`derive_session_key`; its public point must equal the snapshot's
-    ``ephemeral_key``. Both the ephemeral key and the pre-key ``public_key``
-    must be X25519 (a raw 32-byte point is interpreted as X25519 under the
-    existing rules; an algorithm-identified Ed25519 key is rejected).
+    *private_key* uses the same canonical standard-base64 raw 32-byte
+    encoding as :func:`derive_session_key`. For the initiator its public
+    point must equal the snapshot's ``ephemeral_key``; for the recipient it
+    must name the same actual X25519 public key as the snapshot's
+    ``public_key`` (equivalent encodings of that key are accepted). Both the
+    ephemeral key and the pre-key ``public_key`` must be X25519 (a raw
+    32-byte point is interpreted as X25519 under the existing rules; an
+    algorithm-identified Ed25519 key is rejected).
 
-    Returns a new dict with only ``session_id`` and ``key`` (the same values
-    :func:`derive_session_key` returns for the snapshot's ``session_id``,
-    *private_key* and the snapshot's ``public_key``). Every failure raises
-    :class:`CryptoError`: a non-object snapshot is ``field=session`` and a
-    missing/wrong-type/empty snapshot field names that field; proof
+    Returns a new dict with only ``session_id`` and ``key`` (standard base64
+    of the 32-byte key, ready for :func:`encrypt_message`/
+    :func:`decrypt_message`). Every failure raises :class:`CryptoError`: an
+    invalid *role* is ``role``; a non-object snapshot is ``field=session``
+    and a missing/wrong-type/empty snapshot field names that field; proof
     verification errors keep the field names used by
     :func:`verify_prekey_proof` (mismatches with the snapshot's device,
     pre-key id and pre-key public key are reported as ``device_id``,
     ``key_id`` and ``public_key``); an identity-key parse failure or an
     identity key that does not name the same actual key is ``identity_key``;
-    private-key encoding errors are ``private_key``; an illegal or
-    mismatching ephemeral public key is ``ephemeral_key``; a non-X25519
-    pre-key or a failed X25519 exchange is ``public_key``.
+    private-key encoding errors are ``private_key``. For the initiator an
+    illegal or mismatching ephemeral public key is ``ephemeral_key`` and a
+    non-X25519 pre-key or a failed X25519 exchange is ``public_key``; for the
+    recipient a non-X25519 or mismatching pre-key is ``public_key`` and an
+    illegal ephemeral key, a failed exchange or an all-zero shared secret is
+    ``ephemeral_key``.
     """
+    if role is _ROLE_OMITTED or role == SESSION_ROLE_INITIATOR:
+        is_recipient = False
+    elif role == SESSION_ROLE_RECIPIENT:
+        is_recipient = True
+    else:
+        raise CryptoError(
+            'role must be "initiator" or "recipient"', "role")
+
     # 1) Snapshot shape: object first, then each required non-empty string.
     if not isinstance(session, dict):
         raise CryptoError("session must be a JSON object", "session")
@@ -778,28 +818,33 @@ def derive_verified_session_key(session: object, proof: object,
             "identity_key does not match the session snapshot",
             "identity_key")
 
-    # 4) The ephemeral private key must be valid, and its public point must
-    #    match the snapshot's ephemeral key (X25519 only, raw points follow
-    #    the existing interpretation rules).
+    # 4) The private key must be valid, and its public point must match the
+    #    snapshot public key of the caller's own side: the ephemeral key for
+    #    the initiator, the pre-key public_key for the recipient (X25519
+    #    only, raw points follow the existing interpretation rules, and
+    #    equivalent encodings of the same key compare equal).
     private_bytes = _decode_private_key_bytes(private_key)
-    ephemeral = _load_x25519_peer_public_key_for(
-        session["ephemeral_key"], "ephemeral_key")
     private = x25519.X25519PrivateKey.from_private_bytes(private_bytes)
+    if is_recipient:
+        own_field, peer_field = "public_key", "ephemeral_key"
+    else:
+        own_field, peer_field = "ephemeral_key", "public_key"
+    own = _load_x25519_peer_public_key_for(session[own_field], own_field)
     if private.public_key().public_bytes(
             serialization.Encoding.Raw,
-            serialization.PublicFormat.Raw) != ephemeral.public_bytes(
+            serialization.PublicFormat.Raw) != own.public_bytes(
                 serialization.Encoding.Raw, serialization.PublicFormat.Raw):
         raise CryptoError(
-            "private_key does not match the session's ephemeral_key",
-            "ephemeral_key")
+            f"private_key does not match the session's {own_field}",
+            own_field)
 
-    # 5) The pre-key must be X25519; then run the existing X25519+HKDF
-    #    construction with the snapshot's literal session id and public_key
-    #    strings so the key is byte-identical to the recipient's
-    #    derive_session_key result. A failed exchange (e.g. a low-order
-    #    pre-key point) is reported as public_key.
-    prekey = _load_x25519_peer_public_key_for(
-        session["public_key"], "public_key")
+    # 5) The peer public key must be X25519; then run the existing
+    #    X25519+HKDF construction with the snapshot's literal session id
+    #    string so the key is byte-identical to the other party's
+    #    derive_session_key result. A failed exchange (e.g. a low-order peer
+    #    point, which also covers an all-zero shared secret) is reported as
+    #    the peer key's field.
+    peer = _load_x25519_peer_public_key_for(session[peer_field], peer_field)
     try:
         info = (SESSION_KEY_INFO_PREFIX + "\n"
                 + session["session_id"]).encode("utf-8")
@@ -807,11 +852,11 @@ def derive_verified_session_key(session: object, proof: object,
         raise CryptoError("session_id must be encodable as UTF-8",
                           "session_id") from None
     try:
-        shared = private.exchange(prekey)
+        shared = private.exchange(peer)
     except ValueError:
         raise CryptoError(
-            "public_key does not yield a usable shared secret",
-            "public_key") from None
+            f"{peer_field} does not yield a usable shared secret",
+            peer_field) from None
     key = HKDF(algorithm=hashes.SHA256(), length=SESSION_KEY_BYTES,
                salt=SESSION_KEY_SALT, info=info).derive(shared)
     return {
