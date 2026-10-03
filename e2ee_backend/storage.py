@@ -564,6 +564,23 @@ class DeviceUpdateError(Exception):
         self.reason = reason
 
 
+class PreKeyVerifiedBatchError(Exception):
+    """An atomic batch of signed pre-key adds failed; nothing changed.
+
+    Device-level failures (``device_unknown`` / ``device_revoked`` /
+    ``identity_not_ed25519``) carry ``index`` None; per-item failures
+    (``prekey_signature_invalid`` / ``prekey_conflict``) carry the zero-based
+    *index* of the first offending item. Items are checked in array order and
+    the proof is verified before that item's idempotency/conflict decision,
+    mirroring the single-item endpoint's fixed precedence.
+    """
+
+    def __init__(self, reason: str, index: Optional[int] = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.index = index
+
+
 class IdentityVerificationError(Exception):
     """A conflicting explicit identity-verification commit; nothing changed.
 
@@ -1754,6 +1771,109 @@ class DeviceStore:
             return ({"device_id": device.device_id,
                      "key_id": prekey.key_id,
                      "public_key": prekey.public_key}, True)
+
+    def add_prekeys_verified_batch(self, device_id: str,
+                                   entries: List[Tuple[str, str, bytes, str]]
+                                   ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Atomically append many identity-authorized (signed) pre-keys.
+
+        *entries* are ``(key_id, public_key, signature, signature_text)``
+        tuples, already validated for shape, non-empty strings, public-key
+        and signature encodings, and absence of duplicate ``key_id`` values
+        within the request, by the caller.
+
+        The whole batch is one linearizable transaction under the store lock
+        — the same lock identity rotation, revocation and claims take — so it
+        can only wholly commit or wholly fail, even interleaved with a
+        rotation, a device/key revocation or a claim. Items are resolved in
+        array order: the device must exist (``device_unknown`` -> 404) and
+        not be revoked (``device_revoked`` -> 409) and its current identity
+        key must be Ed25519 (``identity_not_ed25519`` ->
+        400/identity_key); per item, the proof is always verified against the
+        *current* identity key before the idempotency/conflict decision, so a
+        bad proof (``prekey_signature_invalid`` at the item's index) precedes
+        an existing-id conflict (``prekey_conflict`` at that index).
+
+        An existing, non-revoked key with the same ``public_key`` and a valid
+        proof is idempotent: it is neither rewritten nor re-proven, keeps its
+        consumed state, appends no event and consumes no generation. A new id
+        with a valid proof is staged for append; only after every item has
+        passed are the new keys appended in request order, each appending one
+        ``prekey_added`` key-audit event with the public proof frozen against
+        the current identity key, and the whole batch shares a single change
+        notification — one durable generation at most. A batch containing
+        only idempotent items notifies nothing and answers 200; any new item
+        makes the batch answer 201. On any failure nothing is staged, no event
+        is appended and the durable generation is untouched. Returns
+        ``(views, any_new)`` with one view per request entry, in request
+        order; each view carries ``device_id``, ``key_id`` and
+        ``public_key``.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                raise PreKeyVerifiedBatchError(DEVICE_UNKNOWN)
+            if device.revoked:
+                raise PreKeyVerifiedBatchError(DEVICE_REVOKED)
+            identity = load_ed25519_public_key(device.identity_key)
+            if identity is None:
+                raise PreKeyVerifiedBatchError(PREKEY_IDENTITY_NOT_ED25519)
+
+            staged: List[Tuple[str, str, str]] = []
+            views: List[Dict[str, str]] = []
+            for index, (prekey_id, public_key, signature,
+                        signature_text) in enumerate(entries):
+                # Verify the proof against the current identity key before
+                # the idempotency/conflict lookup, so the fixed
+                # signature-before-conflict precedence holds per item.
+                if not verify_signed_prekey(
+                        identity, signature, device.user_id,
+                        device.device_id, prekey_id, public_key):
+                    raise PreKeyVerifiedBatchError(
+                        PREKEY_SIGNATURE_INVALID, index)
+                existing = next((pk for pk in device.prekeys
+                                 if pk.key_id == prekey_id), None)
+                if existing is not None:
+                    if not existing.revoked and \
+                            existing.public_key == public_key:
+                        # Identical, non-revoked key with a valid proof: a
+                        # state-free idempotent replay — never rewritten,
+                        # re-proven or un-consumed; no event below.
+                        views.append({"key_id": existing.key_id,
+                                      "public_key": existing.public_key})
+                        continue
+                    # Same id with a changed key, or an id whose key was
+                    # revoked. Nothing has been mutated yet, so the batch
+                    # fails with every item untouched.
+                    raise PreKeyVerifiedBatchError(PREKEY_CONFLICT, index)
+                staged.append((prekey_id, public_key, signature_text))
+                views.append({"key_id": prekey_id,
+                              "public_key": public_key})
+
+            if staged:
+                self._migrate_pending_anchors()
+                for prekey_id, public_key, signature_text in staged:
+                    # First creation through a verified entry: freeze the
+                    # public proof and the identity public key it verified
+                    # against at this instant; both persist atomically with
+                    # the append. An idempotent replay never reaches here and
+                    # therefore never writes or replaces a proof.
+                    device.prekeys.append(SignedPreKey(
+                        key_id=prekey_id, public_key=public_key,
+                        signature=signature_text,
+                        proof_identity_key=device.identity_key))
+                    self._append_key_event(
+                        device_id, KEY_EVENT_PREKEY_ADDED,
+                        {"key_id": prekey_id, "public_key": public_key})
+                # One notification for the whole batch: the new keys and
+                # their events commit (or roll back) together and the
+                # durable generation advances at most once.
+                self._notify_change()
+            return ([{"device_id": device.device_id,
+                      "key_id": view["key_id"],
+                      "public_key": view["public_key"]} for view in views],
+                    bool(staged))
 
     def public_view(self, device_id: str) -> Optional[Dict[str, Any]]:
         """Atomically build the public snapshot of a device.
