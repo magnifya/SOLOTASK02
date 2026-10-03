@@ -20,9 +20,10 @@ from cryptography.exceptions import (
     InvalidTag,
     UnsupportedAlgorithm,
 )
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from typing import Optional
 
 #: AES-GCM nonce size in bytes (96-bit nonces, as recommended for GCM).
@@ -40,6 +41,12 @@ IDENTITY_ROTATION_PREFIX = "E2EE-IDENTITY-ROTATION-V1"
 IDENTITY_FINGERPRINT_PREFIX = "E2EE-IDENTITY-FINGERPRINT-V1"
 #: Domain-separation prefix for the message-envelope AAD document.
 MESSAGE_ENVELOPE_PREFIX = "E2EE-MESSAGE-ENVELOPE-V1"
+#: Domain-separation prefix for the one-to-one session-key HKDF info.
+SESSION_KEY_INFO_PREFIX = "E2EE-SESSION-KEY-V1"
+#: Length of a derived one-to-one session key in bytes.
+SESSION_KEY_BYTES = 32
+#: Fixed HKDF salt for session-key derivation: 32 zero bytes.
+SESSION_KEY_SALT = b"\x00" * SESSION_KEY_BYTES
 #: Length of a fingerprint: SHA-256 rendered as lowercase hexadecimal.
 IDENTITY_FINGERPRINT_HEX_LEN = 64
 #: Length of an Ed25519 signature in bytes.
@@ -210,6 +217,98 @@ def decrypt_message(session_id: str, key_b64: str, nonce_b64: str,
         raise CryptoError("plaintext is not valid UTF-8", "plaintext") \
             from None
     return {"session_id": session_id, "plaintext": text}
+
+
+def _decode_private_key_bytes(value: object) -> bytes:
+    """Decode a canonical standard-base64 raw 32-byte private key.
+
+    Raises :class:`CryptoError` with ``field=private_key`` unless *value* is
+    a non-empty string of canonical standard base64 (correct alphabet and
+    padding, re-encoding reproduces the input) that decodes to exactly 32
+    bytes.
+    """
+    if not is_nonempty_string(value):
+        raise CryptoError("field must be a non-empty string: private_key",
+                          "private_key")
+    raw = _decode_strict_base64(value, "private_key")
+    if len(raw) != 32:
+        raise CryptoError(
+            f"private_key must decode to 32 bytes (got {len(raw)})",
+            "private_key")
+    if base64.b64encode(raw).decode("ascii") != value:
+        raise CryptoError("private_key must be canonical standard base64",
+                          "private_key")
+    return raw
+
+
+def _load_x25519_peer_public_key(value: object) -> x25519.X25519PublicKey:
+    """Parse the peer public key strictly as an X25519 public key.
+
+    Accepts the same encodings as :func:`load_public_key` (PEM text,
+    base64/hex DER SubjectPublicKeyInfo, or base64/hex raw 32-byte point),
+    but only an X25519 key is accepted: a raw 32-byte point is interpreted
+    as X25519, while a key carrying an Ed25519 or any other algorithm
+    identifier is rejected with ``field=peer_public_key``.
+    """
+    if not is_nonempty_string(value):
+        raise CryptoError("field must be a non-empty string: peer_public_key",
+                          "peer_public_key")
+    key = load_public_key(value)
+    if not isinstance(key, x25519.X25519PublicKey):
+        raise CryptoError(
+            "peer_public_key must be an X25519 public key",
+            "peer_public_key")
+    return key
+
+
+def derive_session_key(session_id: str, private_key: str,
+                       peer_public_key: str) -> dict:
+    """Derive the shared one-to-one session key purely locally.
+
+    Both parties run the same protocol: the X25519 shared secret between
+    *private_key* (canonical standard-base64 raw 32-byte private key) and
+    *peer_public_key* (any encoding accepted by :func:`load_public_key`,
+    X25519 only) feeds HKDF-SHA256 with a 32-zero-byte salt and an info of
+    the ``E2EE-SESSION-KEY-V1`` prefix, one newline and *session_id*'s
+    UTF-8 bytes, producing 32 bytes. The initiator passes its ephemeral
+    private key and the snapshot's ``public_key``; the recipient passes the
+    corresponding pre-key private key and the snapshot's ``ephemeral_key``,
+    and both obtain the same key.
+
+    Returns a dict with ``session_id`` and ``key`` (standard base64 of the
+    32-byte key, ready for :func:`encrypt_message`/:func:`decrypt_message`).
+    Nothing is persisted and no server is contacted. Invalid inputs raise
+    :class:`CryptoError` naming the first offending field in the order
+    ``session_id``, ``private_key``, ``peer_public_key``; a failed exchange
+    or an all-zero shared secret is reported as ``peer_public_key``.
+    """
+    if not is_nonempty_string(session_id):
+        raise CryptoError("field must be a non-empty string: session_id",
+                          "session_id")
+    try:
+        info = (SESSION_KEY_INFO_PREFIX + "\n" + session_id).encode("utf-8")
+    except UnicodeEncodeError:
+        raise CryptoError("session_id must be encodable as UTF-8",
+                          "session_id") from None
+
+    private_bytes = _decode_private_key_bytes(private_key)
+    peer_key = _load_x25519_peer_public_key(peer_public_key)
+
+    private = x25519.X25519PrivateKey.from_private_bytes(private_bytes)
+    try:
+        shared = private.exchange(peer_key)
+    except ValueError:
+        # X25519 rejects an all-zero shared secret (low-order peer point).
+        raise CryptoError(
+            "peer_public_key does not yield a usable shared secret",
+            "peer_public_key") from None
+
+    key = HKDF(algorithm=hashes.SHA256(), length=SESSION_KEY_BYTES,
+               salt=SESSION_KEY_SALT, info=info).derive(shared)
+    return {
+        "session_id": session_id,
+        "key": base64.b64encode(key).decode("ascii"),
+    }
 
 
 def is_nonempty_string(value: object) -> bool:

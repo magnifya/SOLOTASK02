@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from .crypto import CryptoError, decrypt_message, encrypt_message
+from .crypto import (CryptoError, decrypt_message, derive_session_key,
+                     encrypt_message)
 from .http_app import create_server
 from .locking import StateFileLocked, acquire_state_file_lock
 from .persistence import StateFileError, attach_persistence
@@ -529,6 +530,23 @@ def build_parser() -> argparse.ArgumentParser:
                            help="base64-encoded ciphertext with appended GCM tag")
     _add_envelope_arguments(p_decrypt)
     p_decrypt.set_defaults(handler=cmd_decrypt_message)
+
+    # The options are deliberately not marked required=True: a missing option
+    # must surface through the same single-line JSON error contract (exit 2)
+    # as the other derivation failures, not as an argparse usage error.
+    p_derive = sub.add_parser(
+        "derive-session-key",
+        help="derive a one-to-one session key locally via X25519+HKDF "
+             "(no server needed)")
+    p_derive.add_argument("--session-id",
+                          help="session id bound into the derived key")
+    p_derive.add_argument(
+        "--private-key",
+        help="canonical standard-base64 raw 32-byte X25519 private key")
+    p_derive.add_argument(
+        "--peer-public-key",
+        help="peer X25519 public key (any accepted public-key encoding)")
+    p_derive.set_defaults(handler=cmd_derive_session_key)
 
     p_integrity_history_page = sub.add_parser(
         "integrity-history-page",
@@ -1295,6 +1313,17 @@ def cmd_decrypt_message(args: argparse.Namespace) -> int:
                                      args.sequence))
     except OSError as error:
         return _emit_crypto_error(CryptoError(str(error), "key"))
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def cmd_derive_session_key(args: argparse.Namespace) -> int:
+    """Derive the session key locally and print ``session_id``/``key``."""
+    try:
+        result = derive_session_key(args.session_id, args.private_key,
+                                    args.peer_public_key)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
