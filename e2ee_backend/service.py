@@ -72,6 +72,9 @@ from .storage import (
     IDENTITY_ROTATION_NOT_ED25519,
     IDENTITY_ROTATION_SIGNATURE_INVALID,
     IDENTITY_ROTATION_VERSION_MISMATCH,
+    DEVICE_REVOCATION_NOT_ED25519,
+    DEVICE_REVOCATION_SIGNATURE_INVALID,
+    DEVICE_REVOCATION_VERSION_MISMATCH,
     LEASE_EVENT_CURSOR_EXPECTED_CONFLICT,
     LEASE_SUBSCRIPTION_AFTER_CONFLICT,
     LEASE_SUBSCRIPTION_EXPECTED_CONFLICT,
@@ -493,6 +496,93 @@ class DeviceService:
             raise ServiceError(f"device not found: {device_id}",
                                "device_id", status_code=404)
         return {"device_id": device.device_id, "revoked": True}
+
+    def revoke_device_verified(self, device_id: str,
+                               payload: object) -> Dict[str, Any]:
+        """Validate and apply a signature-authorized device revocation.
+
+        The body is a JSON object with ``expected_version`` and
+        ``signature``. ``expected_version`` is the device's current
+        ``identity_key_version``: a positive integer (booleans are refused)
+        that must equal the stored version. ``signature`` is standard base64
+        decoding to exactly 64 bytes — an Ed25519 signature verified against
+        the device's current identity key over the domain-separated canonical
+        revocation message (``E2EE-DEVICE-REVOCATION-V1``) for the stored
+        ``user_id`` and the request's path-decoded *device_id* /
+        ``expected_version``. User id is taken from the registration record
+        and device id from the decoded path; neither string is trimmed or
+        normalized and the version is signed and compared as an integer.
+
+        A body that is not an object is 400/field=request_body; a missing or
+        wrongly-typed/empty field, a non-positive or boolean version or a bad
+        signature encoding is 400 naming ``expected_version`` or
+        ``signature``; extra fields are ignored. The device/identity/version/
+        signature checks then run atomically in the store: unknown device is
+        404/field=device_id, a current key that is not Ed25519
+        400/field=identity_key, a version mismatch
+        409/field=expected_version and a failed verification
+        400/field=signature. Success returns the ordinary revocation body
+        (200): the first valid call revokes the device and all of its
+        pre-keys and appends the single ``device_revoked`` audit event; a
+        valid replay against an already-revoked device keeps its
+        authorization requirement but changes no state, audit chain or
+        commit generation. On failure nothing is written.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        # Body-level field order follows the contract: the version is
+        # validated completely (presence, type, range — booleans refused)
+        # before the signature (presence, emptiness, type, encoding and
+        # length); extra fields are ignored.
+        if "expected_version" not in payload:
+            raise ServiceError(
+                "missing required field: expected_version",
+                "expected_version")
+        expected_version = payload["expected_version"]
+        if not isinstance(expected_version, int) \
+                or isinstance(expected_version, bool) \
+                or expected_version < 1:
+            raise ServiceError(
+                "field must be a positive integer: expected_version",
+                "expected_version")
+        if "signature" not in payload:
+            raise ServiceError("missing required field: signature",
+                               "signature")
+        signature = decode_ed25519_signature(payload["signature"])
+        if signature is None:
+            raise ServiceError(
+                "field must be a standard base64 64-byte Ed25519 "
+                "signature: signature", "signature")
+
+        try:
+            device, _changed = self.store.revoke_device_verified(
+                device_id, expected_version, signature)
+        except DeviceUpdateError as error:
+            raise self._revocation_verified_error(error, device_id)
+        return {"device_id": device.device_id, "revoked": True}
+
+    @staticmethod
+    def _revocation_verified_error(error: DeviceUpdateError,
+                                   device_id: str) -> ServiceError:
+        """Translate a verified-revocation storage failure to a ServiceError."""
+        if error.reason == DEVICE_UNKNOWN:
+            return ServiceError(f"device not found: {device_id}",
+                                "device_id", status_code=404)
+        if error.reason == DEVICE_REVOCATION_NOT_ED25519:
+            return ServiceError(
+                "stored identity key is not an Ed25519 public key: "
+                "identity_key", "identity_key")
+        if error.reason == DEVICE_REVOCATION_VERSION_MISMATCH:
+            return ServiceError(
+                "expected_version does not match the device's current "
+                "identity_key_version",
+                "expected_version", status_code=409)
+        if error.reason == DEVICE_REVOCATION_SIGNATURE_INVALID:
+            return ServiceError(
+                "device revocation proof failed verification: signature",
+                "signature")
+        raise  # pragma: no cover - defensive
 
     def revoke_prekey(self, device_id: str, key_id: str) -> Dict[str, Any]:
         """Revoke one pre-key; idempotent, 404 on unknown device/key."""
