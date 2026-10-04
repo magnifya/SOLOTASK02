@@ -535,6 +535,87 @@ def verify_signed_prekey(identity_key: ed25519.Ed25519PublicKey,
     return True
 
 
+#: Required inputs of :func:`sign_prekey_proof`, in the order their
+#: validation errors are reported.
+_SIGN_PREKEY_PROOF_FIELDS = ("user_id", "device_id", "key_id", "public_key",
+                             "private_key")
+
+
+def sign_prekey_proof(user_id: object, device_id: object, key_id: object,
+                      public_key: object, private_key: object) -> dict:
+    """Build a signed pre-key proof locally with an Ed25519 identity key.
+
+    This is the purely local counterpart of the server-side proof query: no
+    server is contacted, no backend state is read or written, and neither
+    the private seed nor the result is ever persisted. It produces public
+    material that can be submitted directly to the verified registration and
+    pre-key publishing entry points and verified later with
+    :func:`verify_prekey_proof`.
+
+    *user_id*, *device_id* and *key_id* are non-empty strings used verbatim
+    — never trimmed or normalized, so leading/trailing spaces, Chinese
+    characters and slashes are signed exactly as given. *public_key* uses the
+    same accepted encodings as :func:`load_public_key` (PEM text,
+    base64/hex DER SubjectPublicKeyInfo, or base64/hex raw 32-byte point) and
+    is likewise embedded verbatim: the signature binds the literal string.
+    *private_key* must be canonical standard base64 (correct alphabet and
+    padding, re-encoding reproduces the input — no whitespace or URL-safe
+    alphabet) of the raw 32-byte Ed25519 private key seed; no other private
+    key format is accepted.
+
+    The signature follows :func:`signed_prekey_proof_message`
+    (``E2EE-SIGNED-PREKEY-V1``) and Ed25519 signing is deterministic, so
+    identical inputs always return identical output. The returned object has
+    exactly the six fields of the proof query — the three identifiers and
+    ``public_key`` as given, ``identity_key`` as canonical standard base64 of
+    the seed's raw 32-byte Ed25519 public point, and ``signature`` as
+    canonical standard base64 of the 64-byte signature. The private key is
+    never part of the result and is never echoed in an error message.
+
+    Any failure raises :class:`CryptoError` naming the offending field; with
+    several bad inputs the first one in the order ``user_id``, ``device_id``,
+    ``key_id``, ``public_key``, ``private_key`` is reported. An empty/wrong
+    type value, a string that cannot be encoded as UTF-8, an unparsable
+    public key, or a non-canonical/wrong-length private key each name their
+    own field; underlying exceptions are never exposed.
+    """
+    values = {"user_id": user_id, "device_id": device_id, "key_id": key_id,
+              "public_key": public_key, "private_key": private_key}
+    for name in _SIGN_PREKEY_PROOF_FIELDS:
+        if not is_nonempty_string(values[name]):
+            raise CryptoError(
+                f"field must be a non-empty string: {name}", name)
+        # The proof message is UTF-8 JSON of the literal strings; a value
+        # carrying lone surrogates could never be signed or published, so it
+        # is rejected here under its own field, in input order.
+        _encode_utf8_strict(values[name], name)
+
+    if load_public_key(public_key) is None:
+        raise CryptoError("public_key must be a public key", "public_key")
+
+    seed = _decode_private_key_bytes(private_key)
+    try:
+        identity_private = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+    except ValueError:
+        raise CryptoError(
+            "private_key must be a raw 32-byte Ed25519 private key seed",
+            "private_key") from None
+
+    message = signed_prekey_proof_message(
+        user_id, device_id, key_id, public_key)
+    signature = identity_private.sign(message)
+    identity_raw = identity_private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return {
+        "user_id": user_id,
+        "device_id": device_id,
+        "key_id": key_id,
+        "public_key": public_key,
+        "identity_key": base64.b64encode(identity_raw).decode("ascii"),
+        "signature": base64.b64encode(signature).decode("ascii"),
+    }
+
+
 def identity_rotation_proof_message(user_id: str, device_id: str,
                                     identity_key: str,
                                     expected_version: int) -> bytes:
