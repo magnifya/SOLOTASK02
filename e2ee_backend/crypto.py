@@ -535,6 +535,75 @@ def verify_signed_prekey(identity_key: ed25519.Ed25519PublicKey,
     return True
 
 
+def sign_prekey_proof(user_id: object, device_id: object, key_id: object,
+                      public_key: object, private_key: object) -> dict:
+    """Create a signed pre-key proof purely locally from an identity key.
+
+    The local counterpart of :func:`verify_prekey_proof`: the Ed25519
+    identity key in *private_key* signs the public
+    ``E2EE-SIGNED-PREKEY-V1`` message (see
+    :func:`signed_prekey_proof_message`) over the four literal field values
+    *user_id*, *device_id*, *key_id* and *public_key*, so the result is the
+    same six-string shape a proof query returns
+    (``user_id``/``device_id``/``key_id``/``public_key``/``identity_key``/
+    ``signature``) and is accepted by :func:`verify_prekey_proof` and by the
+    verified registration / verified pre-key replenishment entries.
+
+    The identifiers and *public_key* are copied through exactly as given —
+    no trimming or normalization, so Chinese characters, slashes and leading
+    or trailing spaces are preserved byte-for-byte. *public_key* must parse
+    under :func:`load_public_key` (the same range the publication entries
+    accept). *private_key* must be canonical standard base64 (correct
+    alphabet and padding, re-encoding reproduces the input — no whitespace
+    or URL-safe alphabet) of exactly the raw 32-byte Ed25519 private key
+    seed; PEM/DER/PKCS8 or any other spelling is rejected. The seed never
+    appears in the result: ``identity_key`` is the canonical standard base64
+    of the corresponding raw 32-byte Ed25519 public point and ``signature``
+    is canonical standard base64 of the deterministic 64-byte signature, so
+    identical inputs always return an identical object.
+
+    No server is contacted, no backend state is read or written, and
+    nothing is persisted. Every failure raises :class:`CryptoError`
+    reporting the first offending input in the order *user_id*,
+    *device_id*, *key_id*, *public_key*, *private_key* — an empty/wrong-type
+    value or a text value that cannot be encoded as UTF-8 names that
+    identifier, an unparsable public key names ``public_key`` and a
+    non-canonical or wrong-length private key names ``private_key``; no
+    underlying exception or the private value is exposed.
+    """
+    for name, value in (("user_id", user_id), ("device_id", device_id),
+                        ("key_id", key_id), ("public_key", public_key)):
+        if not is_nonempty_string(value):
+            raise CryptoError(f"field must be a non-empty string: {name}",
+                              name)
+        # A string carrying lone surrogates cannot sign: the proof message is
+        # UTF-8 JSON of the literal values. The failure keeps the field name.
+        _encode_utf8_strict(value, name)
+    if load_public_key(public_key) is None:
+        raise CryptoError("public_key must be a public key", "public_key")
+    private_bytes = _decode_private_key_bytes(private_key)
+    try:
+        identity = ed25519.Ed25519PrivateKey.from_private_bytes(private_bytes)
+        message = signed_prekey_proof_message(
+            user_id, device_id, key_id, public_key)
+        signature = identity.sign(message)
+        identity_raw = identity.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    except (ValueError, UnsupportedAlgorithm, TypeError):
+        # Defensive: the seed already decoded to exactly 32 bytes, which the
+        # Ed25519 loader accepts; keep any platform quirk inside the contract.
+        raise CryptoError("private_key is not a usable Ed25519 private key",
+                          "private_key") from None
+    return {
+        "user_id": user_id,
+        "device_id": device_id,
+        "key_id": key_id,
+        "public_key": public_key,
+        "identity_key": base64.b64encode(identity_raw).decode("ascii"),
+        "signature": base64.b64encode(signature).decode("ascii"),
+    }
+
+
 def identity_rotation_proof_message(user_id: str, device_id: str,
                                     identity_key: str,
                                     expected_version: int) -> bytes:

@@ -16,7 +16,7 @@ from urllib import request as urllib_request
 from .crypto import (CryptoError, decrypt_message,
                      derive_session_key, derive_verified_session_key,
                      encrypt_message, is_nonempty_string,
-                     verify_prekey_proof)
+                     sign_prekey_proof, verify_prekey_proof)
 from .http_app import create_server
 from .locking import StateFileLocked, acquire_state_file_lock
 from .persistence import StateFileError, attach_persistence
@@ -581,6 +581,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-fingerprint",
         help="64 lowercase hex characters of the trusted identity fingerprint")
     p_verify_prekey_proof.set_defaults(handler=cmd_verify_prekey_proof)
+
+    # The options are deliberately not marked required=True: a missing option
+    # must surface through the same single-line JSON error contract (exit 2)
+    # as the other signing failures, not as an argparse usage error. Every
+    # option is a direct text value only (no @path indirection, no trimming),
+    # so the private key never leaves the process through a file read.
+    p_sign_prekey_proof = sub.add_parser(
+        "sign-prekey-proof",
+        help="create a signed pre-key proof locally from an Ed25519 identity "
+             "private key (no server needed)")
+    p_sign_prekey_proof.add_argument(
+        "--user-id", help="user id, signed and echoed exactly as given")
+    p_sign_prekey_proof.add_argument(
+        "--device-id", help="device id, signed and echoed exactly as given")
+    p_sign_prekey_proof.add_argument(
+        "--key-id", help="pre-key id, signed and echoed exactly as given")
+    p_sign_prekey_proof.add_argument(
+        "--public-key",
+        help="pre-key public key in any accepted public-key encoding; signed "
+             "and echoed exactly as given")
+    p_sign_prekey_proof.add_argument(
+        "--private-key",
+        help="canonical standard-base64 raw 32-byte Ed25519 identity private "
+             "key seed (direct text only)")
+    p_sign_prekey_proof.set_defaults(handler=cmd_sign_prekey_proof)
 
     # The options are deliberately not marked required=True: a missing option
     # must surface through the same single-line JSON error contract (exit 2)
@@ -1501,6 +1526,28 @@ def cmd_verify_prekey_proof(args: argparse.Namespace) -> int:
         proof = _read_proof_argument(args.proof)
         result = verify_prekey_proof(proof, args.user_id, args.device_id,
                                      args.key_id, args.expected_fingerprint)
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def cmd_sign_prekey_proof(args: argparse.Namespace) -> int:
+    """Create a signed pre-key proof locally and print its six fields.
+
+    Purely local: no server is contacted, no backend state is read or
+    written, the private key is a direct text value (never read from a
+    path), and neither it nor the result is persisted. Success prints the
+    six-field proof as single-line JSON on stdout (``ensure_ascii=False``,
+    so Chinese characters and other non-ASCII text pass through) and exits
+    0 with empty stderr; any failure — including a missing option — prints a
+    single-line JSON with only ``message`` and ``field`` on stderr, leaves
+    stdout empty and exits 2 without a traceback. The error message never
+    echoes the private key.
+    """
+    try:
+        result = sign_prekey_proof(args.user_id, args.device_id, args.key_id,
+                                   args.public_key, args.private_key)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
