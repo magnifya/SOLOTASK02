@@ -41,6 +41,8 @@ IDENTITY_ROTATION_PREFIX = "E2EE-IDENTITY-ROTATION-V1"
 IDENTITY_FINGERPRINT_PREFIX = "E2EE-IDENTITY-FINGERPRINT-V1"
 #: Domain-separation prefix for the message-envelope AAD document.
 MESSAGE_ENVELOPE_PREFIX = "E2EE-MESSAGE-ENVELOPE-V1"
+#: Domain-separation prefix for the offline signed ciphertext envelope.
+SIGNED_MESSAGE_PREFIX = "E2EE-SIGNED-MESSAGE-V1"
 #: Domain-separation prefix for the one-to-one session-key HKDF info.
 SESSION_KEY_INFO_PREFIX = "E2EE-SESSION-KEY-V1"
 #: Length of a derived one-to-one session key in bytes.
@@ -781,6 +783,250 @@ def verify_prekey_proof(proof: object, user_id: object, device_id: object,
         "signature": proof["signature"],
         "fingerprint": fingerprint,
     }
+
+
+#: Required fields of a committed ciphertext envelope, in the order their
+#: validation errors are reported: the same six fields message submission
+#: freezes (``session_id``, ``sender_device_id``, ``message_id``,
+#: ``sequence``, ``nonce``, ``ciphertext``).
+_SIGNED_MESSAGE_ENVELOPE_FIELDS = (
+    "session_id", "sender_device_id", "message_id", "sequence", "nonce",
+    "ciphertext")
+
+
+def _decode_canonical_base64_bytes(value: object, field: str, *,
+                                   exact: Optional[int] = None,
+                                   minimum: Optional[int] = None) -> bytes:
+    """Decode canonical standard base64 with an exact or minimum length.
+
+    Raises :class:`CryptoError` under *field* unless *value* is a non-empty
+    string of canonical standard base64 (correct alphabet and padding;
+    re-encoding the decoded bytes reproduces the input verbatim — no
+    whitespace, URL-safe alphabet or non-canonical trailing bits) whose
+    decoded length equals *exact* bytes or is at least *minimum* bytes.
+    """
+    if not is_nonempty_string(value):
+        raise CryptoError(f"field must be a non-empty string: {field}", field)
+    raw = _decode_strict_base64(value, field)
+    if exact is not None and len(raw) != exact:
+        raise CryptoError(
+            f"{field} must decode to {exact} bytes (got {len(raw)})", field)
+    if minimum is not None and len(raw) < minimum:
+        raise CryptoError(
+            f"{field} must decode to at least {minimum} bytes "
+            f"(got {len(raw)})", field)
+    if base64.b64encode(raw).decode("ascii") != value:
+        raise CryptoError(f"{field} must be canonical standard base64", field)
+    return raw
+
+
+def _signed_message_bytes(fields: dict) -> bytes:
+    """Build the exact bytes signed for one six-field ciphertext envelope.
+
+    The document is the domain prefix ``E2EE-SIGNED-MESSAGE-V1``, one
+    newline, then compact JSON of the six envelope fields with keys sorted
+    (``ciphertext``, ``message_id``, ``nonce``, ``sender_device_id``,
+    ``sequence``, ``session_id``) and Unicode written as-is; ``sequence`` is
+    serialized as a JSON integer. The string values are the envelope's
+    literal values — no trimming or normalization.
+    """
+    document = json.dumps(
+        {name: fields[name] for name in _SIGNED_MESSAGE_ENVELOPE_FIELDS},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (SIGNED_MESSAGE_PREFIX + "\n" + document).encode("utf-8")
+
+
+def _validate_signed_envelope_fields(envelope: dict) -> dict:
+    """Validate and copy the six signed envelope fields.
+
+    Reports the first missing or invalid field in the fixed order
+    ``session_id``, ``sender_device_id``, ``message_id``, ``sequence``,
+    ``nonce``, ``ciphertext``: the three identifiers are non-empty strings
+    encodable as strict UTF-8 (spaces, Chinese characters and slashes kept
+    verbatim), ``sequence`` is a positive integer that is not a boolean,
+    ``nonce`` is canonical standard base64 of exactly 12 bytes and
+    ``ciphertext`` is canonical standard base64 of at least 16 bytes.
+    Returns a fresh dict holding the six original values; the input mapping
+    is never read-modified.
+    """
+    for name in ("session_id", "sender_device_id", "message_id"):
+        value = envelope.get(name)
+        if not is_nonempty_string(value):
+            raise CryptoError(
+                f"field must be a non-empty string: {name}", name)
+        _encode_utf8_strict(value, name)
+    sequence = envelope.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) \
+            or sequence < 1:
+        raise CryptoError("field must be a positive integer: sequence",
+                          "sequence")
+    nonce = envelope.get("nonce")
+    _decode_canonical_base64_bytes(
+        nonce, "nonce", exact=GCM_NONCE_BYTES)
+    ciphertext = envelope.get("ciphertext")
+    _decode_canonical_base64_bytes(
+        ciphertext, "ciphertext", minimum=GCM_TAG_BYTES)
+    return {
+        "session_id": envelope["session_id"],
+        "sender_device_id": envelope["sender_device_id"],
+        "message_id": envelope["message_id"],
+        "sequence": sequence,
+        "nonce": nonce,
+        "ciphertext": ciphertext,
+    }
+
+
+def sign_message(envelope: object, private_key: object) -> dict:
+    """Sign one committed ciphertext envelope purely offline with an Ed25519 key.
+
+    *envelope* is the same six-field object a message submission freezes:
+    ``session_id``, ``sender_device_id``, ``message_id``, ``sequence``,
+    ``nonce`` and ``ciphertext``; extra fields are ignored and the input
+    mapping is never modified. *private_key* is the canonical
+    standard-base64 raw 32-byte Ed25519 private key seed (same encoding as
+    :func:`sign_prekey_proof`); PEM/DER/PKCS#8 spellings are rejected and
+    the seed never appears in the result.
+
+    The signature is the deterministic Ed25519 signature over the public
+    ``E2EE-SIGNED-MESSAGE-V1`` message: the domain prefix, one newline, then
+    compact JSON of the six fields with keys sorted and Unicode written as-is
+    (``sequence`` serialized as a JSON integer). Identifier strings are used
+    exactly as given — spaces, Chinese characters and slashes are preserved
+    byte-for-byte; ``sequence`` must be a positive integer (booleans are
+    rejected), ``nonce`` canonical standard base64 of exactly 12 bytes and
+    ``ciphertext`` canonical standard base64 of at least 16 bytes.
+
+    Returns a new dict with the six envelope values verbatim plus
+    ``identity_key`` (canonical standard base64 of the raw 32-byte Ed25519
+    public point derived from the seed) and ``signature`` (canonical
+    standard base64 of the 64-byte signature); identical inputs always
+    return an identical object, directly accepted by
+    :func:`verify_message`. No server is contacted, no backend state is read
+    or written, and nothing is persisted. Every failure raises
+    :class:`CryptoError`: a non-object envelope is ``field=envelope``; a
+    missing/wrong-type/empty field, a bad ``sequence`` or non-canonical
+    base64 names that field; private-key errors are ``field=private_key``.
+    """
+    if not isinstance(envelope, dict):
+        raise CryptoError("envelope must be a JSON object", "envelope")
+    fields = _validate_signed_envelope_fields(envelope)
+    private_bytes = _decode_private_key_bytes(private_key)
+    message = _signed_message_bytes(fields)
+    try:
+        identity = ed25519.Ed25519PrivateKey.from_private_bytes(private_bytes)
+        signature = identity.sign(message)
+        identity_raw = identity.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    except (ValueError, UnsupportedAlgorithm, TypeError):
+        # Defensive: the seed already decoded to exactly 32 bytes, which the
+        # Ed25519 loader accepts; keep any platform quirk inside the contract.
+        raise CryptoError("private_key is not a usable Ed25519 private key",
+                          "private_key") from None
+    result = {name: fields[name] for name in _SIGNED_MESSAGE_ENVELOPE_FIELDS}
+    result["identity_key"] = base64.b64encode(identity_raw).decode("ascii")
+    result["signature"] = base64.b64encode(signature).decode("ascii")
+    return result
+
+
+def verify_message(envelope: object, expected_session_id: object,
+                   expected_sender_device_id: object,
+                   expected_fingerprint: object) -> dict:
+    """Verify one signed ciphertext envelope fully offline.
+
+    *envelope* is the frozen eight-field object returned by
+    :func:`sign_message`: the six committed envelope fields
+    (``session_id``, ``sender_device_id``, ``message_id``, ``sequence``,
+    ``nonce``, ``ciphertext``) plus ``identity_key`` and ``signature``;
+    extra fields are ignored and the input mapping is never modified.
+    *expected_session_id* and *expected_sender_device_id* are compared
+    against the envelope's own strings exactly as given — no trimming of
+    spaces and no normalization of Chinese characters or slashes.
+    *expected_fingerprint* is the trusted 64-lowercase-hex fingerprint of
+    the sender identity key, computed with :func:`identity_fingerprint`.
+
+    The check is purely local and historical: the envelope is verified
+    against the identity public key frozen inside it, so an old envelope
+    still verifies with the old trusted fingerprint after an identity
+    rotation or revocation, while a new identity's fingerprint simply does
+    not match. The identity key must be an Ed25519 public key in any
+    encoding accepted by :func:`load_ed25519_public_key`; an equivalent
+    re-encoding of the same key still passes because the fingerprint
+    canonicalizes the key and the signature covers only the six envelope
+    fields, not the key spelling. The expected identifiers and the
+    fingerprint must match before the signature is checked; changing any
+    signed field fails verification.
+
+    On success returns a new dict with the eight original field values
+    (each string preserved verbatim, including the ``identity_key``
+    spelling) plus ``fingerprint``. Any failure raises :class:`CryptoError`
+    and no partial result is returned: a non-object envelope is
+    ``field=envelope``; a missing/wrong-type/empty signed field, an invalid
+    ``sequence`` or non-canonical base64 names that field; an invalid or
+    mismatching expected identifier is ``session_id`` or
+    ``sender_device_id``; a fingerprint that is not 64 lowercase hex
+    characters or does not match is ``expected_fingerprint``; an
+    unparsable public key is ``identity_key``; a non-canonical-base64 or
+    non-64-byte signature and a failed verification are ``signature``.
+    """
+    if not isinstance(envelope, dict):
+        raise CryptoError("envelope must be a JSON object", "envelope")
+    if not is_nonempty_string(expected_session_id):
+        raise CryptoError(
+            "field must be a non-empty string: session_id", "session_id")
+    if not is_nonempty_string(expected_sender_device_id):
+        raise CryptoError(
+            "field must be a non-empty string: sender_device_id",
+            "sender_device_id")
+    if not is_nonempty_string(expected_fingerprint):
+        raise CryptoError(
+            "field must be a non-empty string: expected_fingerprint",
+            "expected_fingerprint")
+    if not is_fingerprint_format(expected_fingerprint):
+        raise CryptoError(
+            "expected_fingerprint must be 64 lowercase hexadecimal "
+            "characters", "expected_fingerprint")
+
+    fields = _validate_signed_envelope_fields(envelope)
+    for name in ("identity_key", "signature"):
+        if not is_nonempty_string(envelope.get(name)):
+            raise CryptoError(
+                f"field must be a non-empty string: {name}", name)
+
+    if fields["session_id"] != expected_session_id:
+        raise CryptoError(
+            "envelope does not match the expected session_id", "session_id")
+    if fields["sender_device_id"] != expected_sender_device_id:
+        raise CryptoError(
+            "envelope does not match the expected sender_device_id",
+            "sender_device_id")
+
+    identity_key = load_ed25519_public_key(envelope["identity_key"])
+    if identity_key is None:
+        raise CryptoError("identity_key must be an Ed25519 public key",
+                          "identity_key")
+    fingerprint = identity_fingerprint(envelope["identity_key"])
+    if fingerprint != expected_fingerprint:
+        raise CryptoError(
+            "expected_fingerprint does not match the envelope's identity key",
+            "expected_fingerprint")
+
+    signature = decode_ed25519_signature(envelope["signature"])
+    if signature is None:
+        raise CryptoError(
+            "signature must be canonical standard base64 of a 64-byte "
+            "Ed25519 signature", "signature")
+    try:
+        identity_key.verify(signature, _signed_message_bytes(fields))
+    except InvalidSignature:
+        raise CryptoError(
+            "signed message failed verification: signature",
+            "signature") from None
+
+    result = {name: envelope[name]
+              for name in (*_SIGNED_MESSAGE_ENVELOPE_FIELDS,
+                           "identity_key", "signature")}
+    result["fingerprint"] = fingerprint
+    return result
 
 
 #: Required fields of the public eight-field one-to-one session snapshot, in
