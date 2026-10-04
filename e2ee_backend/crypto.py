@@ -1067,6 +1067,73 @@ def verify_message(envelope: object, expected_session_id: object,
     return result
 
 
+def validate_signed_message_envelope(envelope: object) -> dict:
+    """Validate and copy the eight fields of one signed message envelope.
+
+    This is the structural/encoding half of :func:`verify_message`, factored
+    out so the verified-submission endpoint applies exactly the same rules to
+    the object :func:`sign_message` returns: the six committed envelope
+    fields follow :func:`_validate_signed_envelope_fields` (non-empty
+    strictly-UTF-8 identifier strings preserved verbatim, ``sequence`` a
+    positive non-boolean integer, ``nonce`` canonical standard base64 of
+    exactly 12 bytes, ``ciphertext`` canonical standard base64 of at least
+    16 bytes), ``identity_key`` and ``signature`` are non-empty strings,
+    ``identity_key`` parses as an Ed25519 public key in any encoding
+    accepted by :func:`load_ed25519_public_key`, and ``signature`` is
+    canonical standard base64 of exactly 64 bytes. Extra fields are ignored
+    and the input mapping is never modified.
+
+    Returns a new dict with the eight original values verbatim. Any failure
+    raises :class:`CryptoError` naming the offending field (a non-object
+    envelope is ``field=envelope``); no partial result is returned.
+    """
+    if not isinstance(envelope, dict):
+        raise CryptoError("envelope must be a JSON object", "envelope")
+    fields = _validate_signed_envelope_fields(envelope)
+    for name in ("identity_key", "signature"):
+        if not is_nonempty_string(envelope.get(name)):
+            raise CryptoError(
+                f"field must be a non-empty string: {name}", name)
+    if load_ed25519_public_key(envelope["identity_key"]) is None:
+        raise CryptoError("identity_key must be an Ed25519 public key",
+                          "identity_key")
+    if decode_ed25519_signature(envelope["signature"]) is None:
+        raise CryptoError(
+            "signature must be canonical standard base64 of a 64-byte "
+            "Ed25519 signature", "signature")
+    result = dict(fields)
+    result["identity_key"] = envelope["identity_key"]
+    result["signature"] = envelope["signature"]
+    return result
+
+
+def verify_signed_message(identity_key: ed25519.Ed25519PublicKey,
+                          signature: bytes, session_id: str,
+                          sender_device_id: str, message_id: str,
+                          sequence: int, nonce: str, ciphertext: str) -> bool:
+    """Verify one signed message envelope against the Ed25519 identity key.
+
+    Returns ``True`` iff *signature* is valid over the public
+    ``E2EE-SIGNED-MESSAGE-V1`` message built from the six literal envelope
+    field values (see :func:`_signed_message_bytes`). The caller has already
+    validated the field values and decoded *signature*; the values are used
+    exactly as given, with no trimming or normalization.
+    """
+    fields = {
+        "session_id": session_id,
+        "sender_device_id": sender_device_id,
+        "message_id": message_id,
+        "sequence": sequence,
+        "nonce": nonce,
+        "ciphertext": ciphertext,
+    }
+    try:
+        identity_key.verify(signature, _signed_message_bytes(fields))
+    except InvalidSignature:
+        return False
+    return True
+
+
 #: Required fields of the public eight-field one-to-one session snapshot, in
 #: the order their validation errors are reported.
 _SESSION_SNAPSHOT_FIELDS = (

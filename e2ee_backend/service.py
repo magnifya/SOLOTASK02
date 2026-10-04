@@ -8,12 +8,14 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import (
+    CryptoError,
     decode_ed25519_signature,
     identity_fingerprint,
     is_fingerprint_format,
     is_nonempty_string,
     load_ed25519_public_key,
     load_public_key,
+    validate_signed_message_envelope,
     verify_signed_prekey,
 )
 from .models import Device, SignedPreKey
@@ -84,9 +86,11 @@ from .storage import (
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
     MESSAGE_DUPLICATE_NONCE,
+    MESSAGE_IDENTITY_KEY_MISMATCH,
     MESSAGE_REQUEST_ID_CONFLICT,
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
+    MESSAGE_SIGNATURE_INVALID,
     MESSAGE_SYNC_CURSOR_CONFLICT,
     MESSAGE_SYNC_DEVICE_INACTIVE,
     MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT,
@@ -211,6 +215,8 @@ _MESSAGE_CREATE_ERROR_MAP = {
     MESSAGE_BAD_SEQUENCE: (409, "sequence"),
     MESSAGE_DUPLICATE_NONCE: (409, "nonce"),
     MESSAGE_REQUEST_ID_CONFLICT: (409, "request_id"),
+    MESSAGE_IDENTITY_KEY_MISMATCH: (409, "identity_key"),
+    MESSAGE_SIGNATURE_INVALID: (400, "signature"),
     SESSION_ROTATED: (409, "session_id"),
 }
 
@@ -5989,6 +5995,11 @@ class DeviceService:
         elif error.reason == MESSAGE_REQUEST_ID_CONFLICT:
             message_text = (f"request_id was already used with different "
                             f"fields: {payload['request_id']}")
+        elif error.reason == MESSAGE_IDENTITY_KEY_MISMATCH:
+            message_text = ("identity_key is not the sender device's "
+                            "current Ed25519 identity key")
+        elif error.reason == MESSAGE_SIGNATURE_INVALID:
+            message_text = "signed message failed verification: signature"
         elif error.reason == SESSION_ROTATED:
             message_text = (
                 "session has been rotated; send new messages to its "
@@ -6043,6 +6054,69 @@ class DeviceService:
                 sequence,
                 payload["nonce"],
                 payload["ciphertext"])
+        except MessageCreateError as error:
+            raise self._message_create_error(error, payload)
+        return view, 201 if created else 200
+
+    def submit_message_verified(self, payload: object
+                                ) -> Tuple[Dict[str, Any], int]:
+        """Validate and atomically commit one verified message submission.
+
+        The body is the eight-field object ``crypto.sign_message`` returns
+        (``session_id``, ``sender_device_id``, ``message_id``, ``sequence``,
+        ``nonce``, ``ciphertext``, ``identity_key``, ``signature``) plus a
+        non-empty string ``request_id``; extra fields are ignored and every
+        string is used verbatim. A body that is not an object is
+        400/field=request_body; an invalid ``request_id`` is
+        400/field=request_id; the eight fields follow the structure, UTF-8
+        and encoding rules of ``crypto.verify_message`` — a missing,
+        wrong-type, badly-encoded or unparsable field is 400 naming that
+        field.
+
+        Once the structure is valid, a committed ``request_id`` answers
+        first: the same id with all eight fields identical replays the
+        first response with 200 (even if the device was revoked or its
+        identity or the session rotated since); the same id with any field
+        changed is 409/field=request_id. The id namespace is independent of
+        the plain submit entry. A fresh id then runs, in order, the usual
+        session-existence, rotation-closure and sender-eligibility errors,
+        the identity check (the submitted key must be the sender device's
+        current Ed25519 identity key, else 409/field=identity_key) and the
+        signature check (400/field=signature), all atomically linearized
+        with identity rotations and revocations, and finally the message-id,
+        sequence and nonce conflict checks. A first success commits the
+        message into the ordinary session stream and returns the plain
+        submit response plus ``identity_key`` and ``signature`` with 201. A
+        failure consumes neither the id, a sequence number nor a nonce.
+        Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+
+        if "request_id" not in payload:
+            raise ServiceError("missing required field: request_id",
+                               "request_id")
+        if not is_nonempty_string(payload["request_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: request_id", "request_id")
+
+        try:
+            fields = validate_signed_message_envelope(payload)
+        except CryptoError as error:
+            raise ServiceError(error.message, error.field) from None
+
+        try:
+            view, created = self.store.submit_message_verified(
+                payload["request_id"],
+                fields["session_id"],
+                fields["sender_device_id"],
+                fields["message_id"],
+                fields["sequence"],
+                fields["nonce"],
+                fields["ciphertext"],
+                fields["identity_key"],
+                fields["signature"])
         except MessageCreateError as error:
             raise self._message_create_error(error, payload)
         return view, 201 if created else 200

@@ -261,6 +261,33 @@ class MessageSubmission:
 
 
 @dataclass
+class VerifiedMessageSubmission:
+    """The durable idempotency record of one committed verified submission.
+
+    Written together with the message it accepted (same locked transaction),
+    keyed by the client-chosen ``request_id`` (globally unique, in a
+    namespace independent of :class:`MessageSubmission`). The record freezes
+    the eight signed fields — the six envelope fields plus the submitted
+    ``identity_key`` and ``signature`` strings, both preserved verbatim —
+    plus the message's ``created_at``, so a replayed submission returns the
+    first response byte-identically (even after the sender device is revoked
+    or its identity rotated) and recovery re-verifies the signature against
+    the frozen public key. Only public signature material is stored.
+    """
+
+    request_id: str
+    session_id: str
+    sender_device_id: str
+    message_id: str
+    sequence: int
+    nonce: str
+    ciphertext: str
+    identity_key: str
+    signature: str
+    created_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class MessageLeaseRenewal:
     """One committed renewal of an inbox redelivery lease (1:1 or group).
 

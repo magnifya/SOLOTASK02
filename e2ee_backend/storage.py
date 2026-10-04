@@ -50,14 +50,17 @@ from .models import (
     Session,
     SessionRotation,
     SignedPreKey,
+    VerifiedMessageSubmission,
     utc_now_iso,
 )
 
 from .crypto import (
+    canonical_public_key_bytes,
     decode_ed25519_signature,
     load_ed25519_public_key,
     verify_device_revocation,
     verify_identity_rotation,
+    verify_signed_message,
     verify_signed_prekey,
 )
 
@@ -114,6 +117,13 @@ MESSAGE_BAD_SEQUENCE = "bad_sequence"
 MESSAGE_DUPLICATE_NONCE = "duplicate_nonce"
 #: A request_id already committed with different envelope fields.
 MESSAGE_REQUEST_ID_CONFLICT = "request_id_conflict"
+#: A verified submission whose submitted identity key is not the same Ed25519
+#: key as the sender device's current identity key (or the device's current
+#: key is not an Ed25519 key at all).
+MESSAGE_IDENTITY_KEY_MISMATCH = "identity_key_mismatch"
+#: A verified submission whose signature does not verify against the sender
+#: device's current identity key over the six envelope fields.
+MESSAGE_SIGNATURE_INVALID = "signature_invalid"
 
 #: Outcome code for a failed message listing.
 MESSAGE_DEVICE_INACTIVE = "device_inactive"
@@ -925,6 +935,7 @@ INTEGRITY_SECTION_KEYS = (
     "group_sync_cursors",
     "message_sync_cursors",
     "message_submissions",
+    "verified_message_submissions",
     "key_events",
     "redelivery_jobs",
     "redelivery_job_events",
@@ -948,7 +959,7 @@ _INTEGRITY_SECTION_DEFAULTS: Dict[str, Any] = {
 
 
 def canonical_integrity_snapshot(snapshot: Dict[str, Any]) -> "Dict[str, Any]":
-    """Project a store snapshot/document payload onto the 29 canonical
+    """Project a store snapshot/document payload onto the 30 canonical
     sections in :data:`INTEGRITY_SECTION_KEYS`, filling missing sections with
     their empty defaults. Unknown envelope keys (``version``,
     ``commit_seq``) are dropped and key order is normalised, so two
@@ -1048,6 +1059,13 @@ class DeviceStore:
         # request_id (globally unique). Each record freezes the envelope it
         # accepted so a replay returns the original response.
         self._message_submissions: Dict[str, MessageSubmission] = {}
+        # Committed verified message submissions, keyed by the client-chosen
+        # request_id in a namespace independent of _message_submissions (the
+        # two entries never see each other's ids). Each record freezes the
+        # eight signed fields it accepted so a replay returns the original
+        # response and recovery re-verifies with the frozen public key.
+        self._verified_message_submissions: \
+            Dict[str, VerifiedMessageSubmission] = {}
         # Delivery state keyed by (session_id, message_id).
         self._delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         # 1:1-inbox redelivery jobs, keyed by the client-chosen job_id
@@ -8328,15 +8346,16 @@ class DeviceStore:
             self._notify_change()
             return message
 
-    def _append_message_locked(self, session_id: str, sender_device_id: str,
-                               message_id: str, sequence: int, nonce: str,
-                               ciphertext: str) -> Message:
-        """Validate and append one message; the caller holds the store lock.
+    def _message_target_sender_locked(self, session_id: str,
+                                      sender_device_id: str) -> Device:
+        """Check the session/sender preconditions of a message append.
 
-        Performs the fixed-priority checks documented on
-        :meth:`append_message` and appends the envelope without notifying
-        persistence, so callers can commit extra records in the same locked
-        transaction (see :meth:`submit_message`).
+        Must be called while holding the store lock. Runs the first three
+        checks of the fixed-priority order documented on
+        :meth:`append_message` — unknown session, rotated (closed) session,
+        inactive/non-member sender — and returns the sender's device record
+        on success, so callers can inspect its current identity material
+        before committing (see :meth:`submit_message_verified`).
         """
         group_session = self._group_sessions.get(session_id)
         if session_id not in self._sessions and group_session is None:
@@ -8359,7 +8378,35 @@ class DeviceStore:
         if (group_session is not None
                 and sender_device_id not in group_session.members):
             raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
+        return sender
 
+    def _append_message_locked(self, session_id: str, sender_device_id: str,
+                               message_id: str, sequence: int, nonce: str,
+                               ciphertext: str) -> Message:
+        """Validate and append one message; the caller holds the store lock.
+
+        Performs the fixed-priority checks documented on
+        :meth:`append_message` and appends the envelope without notifying
+        persistence, so callers can commit extra records in the same locked
+        transaction (see :meth:`submit_message`).
+        """
+        self._message_target_sender_locked(session_id, sender_device_id)
+        return self._append_message_stream_locked(
+            session_id, sender_device_id, message_id, sequence, nonce,
+            ciphertext)
+
+    def _append_message_stream_locked(self, session_id: str,
+                                      sender_device_id: str,
+                                      message_id: str, sequence: int,
+                                      nonce: str, ciphertext: str) -> Message:
+        """Run the stream checks and append one message; lock required.
+
+        Performs the last three checks of the fixed-priority order —
+        duplicate message_id, non-continuing sequence, session-scoped
+        duplicate nonce — for a target already vetted by
+        :meth:`_message_target_sender_locked`, and appends the envelope
+        without notifying persistence.
+        """
         stream = self._messages.setdefault(session_id, [])
         if any(m.message_id == message_id for m in stream):
             raise MessageCreateError(MESSAGE_DUPLICATE_ID)
@@ -8443,6 +8490,102 @@ class DeviceStore:
             self._message_submissions[request_id] = record
             self._notify_change()
             return self._submission_view(record), True
+
+    @staticmethod
+    def _verified_submission_view(record: VerifiedMessageSubmission
+                                  ) -> Dict[str, Any]:
+        """Copy one verified-submission record into its public ten-field view."""
+        return {
+            "request_id": record.request_id,
+            "session_id": record.session_id,
+            "sender_device_id": record.sender_device_id,
+            "message_id": record.message_id,
+            "sequence": record.sequence,
+            "nonce": record.nonce,
+            "ciphertext": record.ciphertext,
+            "created_at": record.created_at,
+            "identity_key": record.identity_key,
+            "signature": record.signature,
+        }
+
+    def submit_message_verified(self, request_id: str, session_id: str,
+                                sender_device_id: str, message_id: str,
+                                sequence: int, nonce: str, ciphertext: str,
+                                identity_key: str, signature: str
+                                ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically commit one signature-verified idempotent submission.
+
+        The ``request_id`` lives in a namespace independent of
+        :meth:`submit_message` and is looked up first: a record whose eight
+        signed fields all match the request replays the original response
+        (``created`` False, 200 at the HTTP layer) even if the sender has
+        since been revoked, its identity rotated or the session rotated; a
+        record with any differing field conflicts
+        (:class:`MessageCreateError` ``request_id_conflict``, 409). A fresh
+        id runs the fixed-priority checks — unknown session, rotated
+        session, inactive sender, then the submitted ``identity_key`` must
+        be the same Ed25519 key as the sender device's *current* identity
+        key (``identity_key_mismatch``, 409, also when the current key is
+        not Ed25519), then the ``signature`` must verify against that
+        current key over the six envelope fields (``signature_invalid``,
+        400), then the usual duplicate-id/sequence/nonce checks — and, on
+        success, commits the message, the nonce and the idempotency record
+        in this one locked transaction (a single persistence notification).
+        The whole check-and-write runs under the same store lock identity
+        rotations and revocations take, so the verification is linearized
+        with them: a rotation committing first makes the stale key mismatch
+        here. A failed validation writes nothing and consumes neither the
+        id, a sequence number nor a nonce. Returns ``(view, created)``.
+        """
+        with self._lock:
+            record = self._verified_message_submissions.get(request_id)
+            if record is not None:
+                if (record.session_id == session_id
+                        and record.sender_device_id == sender_device_id
+                        and record.message_id == message_id
+                        and record.sequence == sequence
+                        and record.nonce == nonce
+                        and record.ciphertext == ciphertext
+                        and record.identity_key == identity_key
+                        and record.signature == signature):
+                    return self._verified_submission_view(record), False
+                raise MessageCreateError(MESSAGE_REQUEST_ID_CONFLICT)
+            sender = self._message_target_sender_locked(
+                session_id, sender_device_id)
+            current = load_ed25519_public_key(sender.identity_key)
+            submitted = load_ed25519_public_key(identity_key)
+            # The submitted key is compared as an actual key, so an
+            # equivalent re-encoding of the device's current key matches;
+            # the verbatim string is what gets frozen into the record. Both
+            # sides must be Ed25519: a current key of another algorithm
+            # cannot authorize a new message.
+            if current is None or submitted is None \
+                    or canonical_public_key_bytes(identity_key) != \
+                    canonical_public_key_bytes(sender.identity_key):
+                raise MessageCreateError(MESSAGE_IDENTITY_KEY_MISMATCH)
+            signature_bytes = decode_ed25519_signature(signature)
+            if signature_bytes is None or not verify_signed_message(
+                    current, signature_bytes, session_id, sender_device_id,
+                    message_id, sequence, nonce, ciphertext):
+                raise MessageCreateError(MESSAGE_SIGNATURE_INVALID)
+            message = self._append_message_stream_locked(
+                session_id, sender_device_id, message_id, sequence, nonce,
+                ciphertext)
+            record = VerifiedMessageSubmission(
+                request_id=request_id,
+                session_id=session_id,
+                sender_device_id=sender_device_id,
+                message_id=message_id,
+                sequence=sequence,
+                nonce=nonce,
+                ciphertext=ciphertext,
+                identity_key=identity_key,
+                signature=signature,
+                created_at=message.created_at,
+            )
+            self._verified_message_submissions[request_id] = record
+            self._notify_change()
+            return self._verified_submission_view(record), True
 
     def message_page(self, session_id: str, device_id: str, after: int,
                      limit: int) -> Tuple[List[Dict[str, Any]], int]:
@@ -8820,6 +8963,18 @@ class DeviceStore:
                 "ciphertext": r.ciphertext,
                 "created_at": r.created_at,
             } for r in self._message_submissions.values()]
+            verified_message_submissions = [{
+                "request_id": r.request_id,
+                "session_id": r.session_id,
+                "sender_device_id": r.sender_device_id,
+                "message_id": r.message_id,
+                "sequence": r.sequence,
+                "nonce": r.nonce,
+                "ciphertext": r.ciphertext,
+                "identity_key": r.identity_key,
+                "signature": r.signature,
+                "created_at": r.created_at,
+            } for r in self._verified_message_submissions.values()]
             redelivery_jobs = []
             for job in self._redelivery_jobs.values():
                 # New writes always carry the fixed seven keys; an empty
@@ -8929,6 +9084,8 @@ class DeviceStore:
                         "group_sync_cursors": group_sync_cursors,
                         "message_sync_cursors": message_sync_cursors,
                         "message_submissions": message_submissions,
+                        "verified_message_submissions":
+                            verified_message_submissions,
                         "redelivery_jobs": redelivery_jobs,
                         "redelivery_job_events": redelivery_job_events,
                         "redelivery_job_event_checkpoints":
@@ -9119,6 +9276,8 @@ class DeviceStore:
         raw_group_sync_cursors = state.get("group_sync_cursors", [])
         raw_message_sync_cursors = state.get("message_sync_cursors", [])
         raw_message_submissions = state.get("message_submissions", [])
+        raw_verified_message_submissions = state.get(
+            "verified_message_submissions", [])
         raw_redelivery_jobs = state.get("redelivery_jobs", [])
         raw_redelivery_job_events = state.get("redelivery_job_events", [])
         raw_redelivery_job_event_checkpoints = state.get(
@@ -9149,6 +9308,7 @@ class DeviceStore:
                 and isinstance(raw_group_sync_cursors, list)
                 and isinstance(raw_message_sync_cursors, list)
                 and isinstance(raw_message_submissions, list)
+                and isinstance(raw_verified_message_submissions, list)
                 and isinstance(raw_redelivery_jobs, list)
                 and isinstance(raw_redelivery_job_events, list)
                 and isinstance(raw_redelivery_job_event_checkpoints, list)
@@ -10231,6 +10391,104 @@ class DeviceStore:
                 sender_device_id=s_sender, message_id=s_message_id,
                 sequence=s_sequence, nonce=s_nonce, ciphertext=s_ciphertext,
                 created_at=s_created_at)
+
+        # Verified message submissions. Older version-1 files predate the
+        # section: it is absent and treated as empty. A present section is
+        # fully validated — request_id unique within this independent
+        # namespace, every record referencing a stored session (1:1 or
+        # group) and one of its stored messages, with the six frozen
+        # envelope fields (and the frozen created_at) agreeing exactly with
+        # that message, the frozen identity_key parsing as an Ed25519 public
+        # key and the frozen signature verifying against that frozen key
+        # over the six envelope fields (recovery never trusts the device's
+        # current key, which may have rotated since the commit). Any
+        # contradiction refuses startup rather than silently dropping the
+        # idempotency guarantee.
+        verified_message_submissions: Dict[str, VerifiedMessageSubmission] = {}
+        for index, raw in enumerate(raw_verified_message_submissions):
+            where = f"verified_message_submissions[{index}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{where} must be an object")
+            try:
+                v_request_id = raw["request_id"]
+                v_session = raw["session_id"]
+                v_sender = raw["sender_device_id"]
+                v_message_id = raw["message_id"]
+                v_sequence = raw["sequence"]
+                v_nonce = raw["nonce"]
+                v_ciphertext = raw["ciphertext"]
+                v_identity_key = raw["identity_key"]
+                v_signature = raw["signature"]
+                v_created_at = raw["created_at"]
+            except KeyError as error:
+                raise ValueError(
+                    f"{where} missing field: {error.args[0]}") from None
+            if not all(isinstance(value, str) and value for value in (
+                    v_request_id, v_session, v_sender, v_message_id, v_nonce,
+                    v_ciphertext, v_identity_key, v_signature, v_created_at)):
+                raise ValueError(
+                    f"{where} string fields must be non-empty strings")
+            if not isinstance(v_sequence, int) \
+                    or isinstance(v_sequence, bool) or v_sequence < 1:
+                raise ValueError(
+                    f"{where} sequence must be a positive integer")
+            # The signed document is UTF-8 JSON of the literal values, so a
+            # string that cannot be encoded was never signable.
+            for value in (v_session, v_sender, v_message_id, v_nonce,
+                          v_ciphertext):
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise ValueError(
+                        f"{where} string fields must be encodable as UTF-8"
+                        ) from None
+            if v_request_id in verified_message_submissions:
+                raise ValueError(
+                    f"duplicate verified message submission in state: "
+                    f"{v_request_id}")
+            # The record belongs to a stored session and to one of that
+            # session's stored messages; the frozen envelope must equal the
+            # message it committed (the sender may since have been revoked —
+            # historical submissions stay recoverable).
+            if v_session not in sessions and v_session not in group_sessions:
+                raise ValueError(
+                    f"{where} references an unknown session: {v_session}")
+            target = next((m for m in messages.get(v_session, [])
+                           if m.message_id == v_message_id), None)
+            if target is None:
+                raise ValueError(
+                    f"{where} references an unknown message: "
+                    f"{v_session}/{v_message_id}")
+            if (target.sender_device_id != v_sender
+                    or target.sequence != v_sequence
+                    or target.nonce != v_nonce
+                    or target.ciphertext != v_ciphertext
+                    or target.created_at != v_created_at):
+                raise ValueError(
+                    f"{where} frozen envelope does not match the stored "
+                    f"message")
+            frozen_key = load_ed25519_public_key(v_identity_key)
+            if frozen_key is None:
+                raise ValueError(
+                    f"{where} identity_key must be an Ed25519 public key")
+            frozen_signature = decode_ed25519_signature(v_signature)
+            if frozen_signature is None:
+                raise ValueError(
+                    f"{where} signature must be canonical standard base64 "
+                    f"of a 64-byte Ed25519 signature")
+            if not verify_signed_message(
+                    frozen_key, frozen_signature, v_session, v_sender,
+                    v_message_id, v_sequence, v_nonce, v_ciphertext):
+                raise ValueError(
+                    f"{where} signature does not verify against the frozen "
+                    f"identity key")
+            verified_message_submissions[v_request_id] = \
+                VerifiedMessageSubmission(
+                    request_id=v_request_id, session_id=v_session,
+                    sender_device_id=v_sender, message_id=v_message_id,
+                    sequence=v_sequence, nonce=v_nonce,
+                    ciphertext=v_ciphertext, identity_key=v_identity_key,
+                    signature=v_signature, created_at=v_created_at)
 
         delivery: Dict[Tuple[str, str], MessageDelivery] = {}
         # Global inbox-lease index, keyed by lease_id. One id is durably
@@ -12268,6 +12526,8 @@ class DeviceStore:
             self._group_sync_cursors = group_sync_cursors
             self._message_sync_cursors = message_sync_cursors
             self._message_submissions = message_submissions
+            self._verified_message_submissions = \
+                verified_message_submissions
             self._redelivery_jobs = redelivery_jobs
             self._redelivery_job_events = redelivery_job_events
             self._redelivery_job_event_checkpoints = \
