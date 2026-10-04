@@ -186,6 +186,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         elif path.startswith(_DEVICES_PATH + "/") and path.endswith("/revoke"):
             self._route_revoke(path)
         elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/revoke-verified"):
+            self._route_revoke_verified(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
                 and path.endswith("/identity-verifications"):
             self._route_identity_verifications(path)
         elif path.startswith(_DEVICES_PATH + "/") \
@@ -338,6 +341,20 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_revoke_device(unquote(parts[0]))
         elif len(parts) == 3 and parts[1] == "prekeys":
             self._handle_revoke_prekey(unquote(parts[0]), unquote(parts[2]))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_revoke_verified(self, path: str) -> None:
+        # {device_id}/revoke-verified — split on raw slashes only; a
+        # percent-encoded slash inside the id segment is part of it and
+        # decodes to an ordinary '/', exactly as on the ordinary revoke
+        # route. Anything with the right suffix but a different shape is
+        # 404/field=device_id.
+        suffix = path[len(_DEVICES_PATH) + 1:-len("/revoke-verified")]
+        parts = suffix.split("/")
+        if len(parts) == 1 and parts[0]:
+            self._handle_revoke_device_verified(unquote(parts[0]))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -1206,6 +1223,17 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
     def _handle_revoke_device(self, device_id: str) -> None:
         try:
             body = self.service.revoke_device(device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_revoke_device_verified(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body = self.service.revoke_device_verified(device_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return

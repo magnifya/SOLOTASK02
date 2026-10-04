@@ -37,6 +37,8 @@ AES_KEY_BYTES = 32
 SIGNED_PREKEY_PROOF_PREFIX = "E2EE-SIGNED-PREKEY-V1"
 #: Domain-separation prefix for the authorized identity-rotation message.
 IDENTITY_ROTATION_PREFIX = "E2EE-IDENTITY-ROTATION-V1"
+#: Domain-separation prefix for the signature-authorized device revocation.
+DEVICE_REVOCATION_PREFIX = "E2EE-DEVICE-REVOCATION-V1"
 #: Domain-separation prefix for the identity-key fingerprint message.
 IDENTITY_FINGERPRINT_PREFIX = "E2EE-IDENTITY-FINGERPRINT-V1"
 #: Domain-separation prefix for the message-envelope AAD document.
@@ -636,6 +638,42 @@ def verify_identity_rotation(identity_key: ed25519.Ed25519PublicKey,
     """
     message = identity_rotation_proof_message(
         user_id, device_id, new_identity_key, expected_version)
+    try:
+        identity_key.verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def device_revocation_proof_message(user_id: str, device_id: str,
+                                    expected_version: int) -> bytes:
+    """Build the exact bytes the current identity key signs to revoke a device.
+
+    The message is the domain prefix ``E2EE-DEVICE-REVOCATION-V1``, one
+    newline, then compact JSON of the three fields with keys sorted
+    (``device_id``, ``expected_version``, ``user_id``) and Unicode written
+    as-is. ``user_id`` is the device's registered value and *device_id* is
+    the request's path-decoded value; the strings are the stored/requested
+    original strings — no trimming or normalization — and
+    *expected_version* is serialized as a JSON integer.
+    """
+    document = json.dumps(
+        {"device_id": device_id, "expected_version": expected_version,
+         "user_id": user_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (DEVICE_REVOCATION_PREFIX + "\n" + document).encode("utf-8")
+
+
+def verify_device_revocation(identity_key: ed25519.Ed25519PublicKey,
+                             signature: bytes, user_id: str, device_id: str,
+                             expected_version: int) -> bool:
+    """Verify one signature-authorized device revocation against the Ed25519 key.
+
+    Returns ``True`` iff *signature* is valid over
+    :func:`device_revocation_proof_message` for the three field values.
+    """
+    message = device_revocation_proof_message(
+        user_id, device_id, expected_version)
     try:
         identity_key.verify(signature, message)
     except InvalidSignature:

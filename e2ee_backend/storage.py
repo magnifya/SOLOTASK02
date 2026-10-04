@@ -56,6 +56,7 @@ from .models import (
 from .crypto import (
     decode_ed25519_signature,
     load_ed25519_public_key,
+    verify_device_revocation,
     verify_identity_rotation,
     verify_signed_prekey,
 )
@@ -143,6 +144,15 @@ IDENTITY_ROTATION_VERSION_MISMATCH = "identity_rotation_version_mismatch"
 #: Outcome code for an identity-rotation authorization that fails signature
 #: verification against the device's current identity key.
 IDENTITY_ROTATION_SIGNATURE_INVALID = "identity_rotation_signature_invalid"
+#: Outcome code for an authorized device revocation whose device's current
+#: identity key is not an Ed25519 public key (the proof cannot be checked).
+DEVICE_REVOCATION_NOT_ED25519 = "device_revocation_not_ed25519"
+#: Outcome code for an authorized device revocation whose expected version
+#: does not equal the device's current identity_key_version.
+DEVICE_REVOCATION_VERSION_MISMATCH = "device_revocation_version_mismatch"
+#: Outcome code for a device-revocation authorization that fails signature
+#: verification against the device's current identity key.
+DEVICE_REVOCATION_SIGNATURE_INVALID = "device_revocation_signature_invalid"
 #: Sentinel results of the read-only signed pre-key proof lookup.
 PROOF_DEVICE_UNKNOWN = "proof_device_unknown"
 PROOF_PREKEY_UNKNOWN = "proof_prekey_unknown"
@@ -1408,6 +1418,71 @@ class DeviceStore:
                     prekey.revoked = True
                 # One event covers the whole revocation: the empty payload
                 # marks the device and every pre-key of it revoked at once.
+                self._append_key_event(
+                    device_id, KEY_EVENT_DEVICE_REVOKED, {})
+                self._notify_change()
+            return device
+
+    def revoke_device_verified(
+            self, device_id: str, expected_version: int,
+            signature: bytes) -> Optional[Device]:
+        """Atomically revoke a device under a signature authorization.
+
+        The whole check-and-revoke runs under the same store lock ordinary
+        revocation and identity rotation take, so the authorization is always
+        checked against the device's *current* identity key and version:
+        a concurrent identity rotation that commits between this call's
+        request validation and the locked checks changes the current key or
+        version, and the stale authorization then fails here — only an
+        authorization still valid at commit time is accepted. The checks and
+        the write are one linearizable transaction.
+
+        The signature is an already-decoded 64-byte Ed25519 signature over
+        the domain-separated canonical revocation message
+        (``E2EE-DEVICE-REVOCATION-V1``) for the device's stored ``user_id``
+        and the request's ``device_id`` / ``expected_version`` values; the
+        caller has already validated the request fields and the signature
+        encoding.
+
+        Checks run in a fixed order: unknown device ->
+        :class:`DeviceUpdateError` ``device_unknown`` (404); a current
+        identity key that is not Ed25519 ->
+        ``device_revocation_not_ed25519`` (400/identity_key);
+        ``expected_version`` different from the current
+        ``identity_key_version`` -> ``device_revocation_version_mismatch``
+        (409/expected_version); a signature that does not verify ->
+        ``device_revocation_signature_invalid`` (400/signature).
+
+        A device that is already revoked still presents its current
+        identity key and version for the same checks: a valid
+        authorization is a state-free idempotent replay (no migration,
+        event, file write or commit generation), while an invalid one is
+        refused exactly as for an active device. A first-time revocation
+        anchors any legacy chain, marks the device and every pre-key
+        revoked, appends exactly one ``device_revoked`` key-audit event
+        and persists once in the same transaction — exactly like the
+        ordinary revoke entry. The identity key, its version and all
+        timestamps are left untouched. On any failure nothing is written.
+        """
+        with self._lock:
+            key = self._device_index.get(device_id)
+            device = self._devices.get(key) if key is not None else None
+            if device is None:
+                raise DeviceUpdateError(DEVICE_UNKNOWN)
+            current = load_ed25519_public_key(device.identity_key)
+            if current is None:
+                raise DeviceUpdateError(DEVICE_REVOCATION_NOT_ED25519)
+            if device.identity_key_version != expected_version:
+                raise DeviceUpdateError(DEVICE_REVOCATION_VERSION_MISMATCH)
+            if not verify_device_revocation(
+                    current, signature, device.user_id, device.device_id,
+                    expected_version):
+                raise DeviceUpdateError(DEVICE_REVOCATION_SIGNATURE_INVALID)
+            if not device.revoked:
+                self._migrate_pending_anchors()
+                device.revoked = True
+                for prekey in device.prekeys:
+                    prekey.revoked = True
                 self._append_key_event(
                     device_id, KEY_EVENT_DEVICE_REVOKED, {})
                 self._notify_change()

@@ -208,6 +208,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_revoke_device.add_argument("--device-id", required=True)
     p_revoke_device.set_defaults(handler=cmd_revoke_device)
 
+    p_revoke_device_verified = sub.add_parser(
+        "revoke-device-verified",
+        help="revoke a device with a signed authorization")
+    p_revoke_device_verified.add_argument("--device-id", required=True)
+    p_revoke_device_verified.add_argument(
+        "--expected-version", required=True, type=_parse_sequence_argument,
+        help="current identity_key_version (positive integer)")
+    p_revoke_device_verified.add_argument(
+        "--signature", required=True,
+        help="standard-base64 64-byte Ed25519 revocation authorization, or "
+             "@path to read it from a file")
+    p_revoke_device_verified.set_defaults(
+        handler=cmd_revoke_device_verified)
+
     p_revoke_prekey = sub.add_parser("revoke-prekey", help="revoke a signed pre-key")
     p_revoke_prekey.add_argument("--device-id", required=True)
     p_revoke_prekey.add_argument("--key-id", required=True)
@@ -772,6 +786,29 @@ def cmd_revoke_device(args: argparse.Namespace) -> int:
     stream = sys.stdout if status == 200 else sys.stderr
     print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
     return 0 if status == 200 else 1
+
+
+def cmd_revoke_device_verified(args: argparse.Namespace) -> int:
+    """Call POST /v1/devices/{id}/revoke-verified; print the JSON response.
+
+    The signature is the standard-base64 64-byte Ed25519 authorization over
+    the device-revocation message, verified server-side against the
+    device's current identity key. Success (200) prints the single-line
+    revocation JSON on stdout and exits 0; any failure prints the
+    server's single-line JSON with its ``field`` on stderr and exits
+    non-zero.
+    """
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/devices/"
+           f"{quote(args.device_id, safe='')}/revoke-verified")
+    payload = {"expected_version": args.expected_version,
+               "signature": _read_key_argument(args.signature)}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
 
 
 def cmd_revoke_prekey(args: argparse.Namespace) -> int:
