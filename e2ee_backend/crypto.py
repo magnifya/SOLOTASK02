@@ -966,6 +966,76 @@ def sign_message(envelope: object, private_key: object) -> dict:
     return result
 
 
+def parse_signed_message(envelope: object) -> dict:
+    """Validate the eight fields of a :func:`sign_message` object structurally.
+
+    This is the request-shape check shared by the verified message-submission
+    entry: it runs exactly the structure/UTF-8/encoding rules of
+    :func:`verify_message` without the expected-session, expected-device and
+    trusted-fingerprint comparisons (the server supplies those itself, from
+    live state). *envelope* must be an object carrying the six committed
+    envelope fields plus non-empty ``identity_key`` and ``signature``
+    strings; the three identifiers are non-empty strict-UTF-8 strings kept
+    verbatim, ``sequence`` a positive non-boolean integer, ``nonce``
+    canonical standard base64 of exactly 12 bytes, ``ciphertext`` canonical
+    standard base64 of at least 16 bytes, ``identity_key`` an Ed25519 public
+    key in any encoding accepted by :func:`load_ed25519_public_key`, and
+    ``signature`` canonical standard base64 of exactly 64 bytes. The
+    signature itself is *not* verified here.
+
+    Returns a fresh dict holding the eight original string/integer values
+    verbatim (the input mapping is never modified); extra fields are
+    ignored. Every failure raises :class:`CryptoError` naming the first
+    offending field, exactly as :func:`verify_message` would
+    (``envelope`` for a non-object).
+    """
+    if not isinstance(envelope, dict):
+        raise CryptoError("envelope must be a JSON object", "envelope")
+    fields = _validate_signed_envelope_fields(envelope)
+    identity_value = envelope.get("identity_key")
+    signature_value = envelope.get("signature")
+    if not is_nonempty_string(identity_value):
+        raise CryptoError(
+            "field must be a non-empty string: identity_key", "identity_key")
+    if not is_nonempty_string(signature_value):
+        raise CryptoError(
+            "field must be a non-empty string: signature", "signature")
+    if load_ed25519_public_key(identity_value) is None:
+        raise CryptoError("identity_key must be an Ed25519 public key",
+                          "identity_key")
+    if decode_ed25519_signature(signature_value) is None:
+        raise CryptoError(
+            "signature must be canonical standard base64 of a 64-byte "
+            "Ed25519 signature", "signature")
+    result = {name: fields[name] for name in _SIGNED_MESSAGE_ENVELOPE_FIELDS}
+    result["identity_key"] = identity_value
+    result["signature"] = signature_value
+    return result
+
+
+def verify_message_signature(identity_key: "ed25519.Ed25519PublicKey",
+                             signature: bytes, fields: dict) -> bool:
+    """Verify an Ed25519 signature over one six-field signed envelope.
+
+    Returns ``True`` iff *signature* is valid over
+    :func:`_signed_message_bytes` for the six envelope values in *fields*.
+    """
+    try:
+        identity_key.verify(signature, _signed_message_bytes(fields))
+    except InvalidSignature:
+        return False
+    return True
+
+
+def same_ed25519_public_key(left: "ed25519.Ed25519PublicKey",
+                            right: "ed25519.Ed25519PublicKey") -> bool:
+    """Return whether two parsed Ed25519 public keys name the same point."""
+    return left.public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw) == \
+        right.public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
 def verify_message(envelope: object, expected_session_id: object,
                    expected_sender_device_id: object,
                    expected_fingerprint: object) -> dict:

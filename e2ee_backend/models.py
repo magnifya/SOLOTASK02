@@ -248,6 +248,13 @@ class MessageSubmission:
     freezes the six envelope fields plus the message's ``created_at`` so a
     replayed submission returns the first response byte-identically, even if
     the sender device is revoked afterwards.
+
+    A record committed through the verified entry
+    (``POST /v1/messages/submit-verified``) additionally freezes the
+    request's public ``identity_key`` spelling and ``signature`` it was
+    accepted with, both kept verbatim; records of the ordinary entry carry
+    ``None`` for both. The verified entry's ``request_id`` namespace is
+    independent: the same id may appear once in each kind of record.
     """
 
     request_id: str
@@ -258,6 +265,13 @@ class MessageSubmission:
     nonce: str
     ciphertext: str
     created_at: str = field(default_factory=utc_now_iso)
+    #: Public Ed25519 identity key (the request's original string) the
+    #: verified entry checked the message signature against at commit time.
+    #: ``None`` for records committed through the ordinary submit entry.
+    identity_key: Optional[str] = None
+    #: Canonical-base64 Ed25519 signature frozen with a verified submission;
+    #: ``None`` for ordinary-submission records.
+    signature: Optional[str] = None
 
 
 @dataclass

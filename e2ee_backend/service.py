@@ -8,12 +8,14 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto import (
+    CryptoError,
     decode_ed25519_signature,
     identity_fingerprint,
     is_fingerprint_format,
     is_nonempty_string,
     load_ed25519_public_key,
     load_public_key,
+    parse_signed_message,
     verify_signed_prekey,
 )
 from .models import Device, SignedPreKey
@@ -84,9 +86,11 @@ from .storage import (
     MESSAGE_DEVICE_INACTIVE,
     MESSAGE_DUPLICATE_ID,
     MESSAGE_DUPLICATE_NONCE,
+    MESSAGE_IDENTITY_KEY_CONFLICT,
     MESSAGE_REQUEST_ID_CONFLICT,
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
+    MESSAGE_SIGNATURE_INVALID,
     MESSAGE_SYNC_CURSOR_CONFLICT,
     MESSAGE_SYNC_DEVICE_INACTIVE,
     MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT,
@@ -6046,6 +6050,128 @@ class DeviceService:
         except MessageCreateError as error:
             raise self._message_create_error(error, payload)
         return view, 201 if created else 200
+
+    #: Maps the verified submission's storage failures to
+    #: (HTTP status, field). The message-id/sequence/nonce errors reuse the
+    #: ordinary mapping; identity-key and signature failures are unique to
+    #: this entry.
+    _VERIFIED_MESSAGE_ERROR_MAP = {
+        MESSAGE_SESSION_UNKNOWN: (404, "session_id"),
+        MESSAGE_SENDER_INACTIVE: (409, "sender_device_id"),
+        MESSAGE_DUPLICATE_ID: (409, "message_id"),
+        MESSAGE_BAD_SEQUENCE: (409, "sequence"),
+        MESSAGE_DUPLICATE_NONCE: (409, "nonce"),
+        MESSAGE_REQUEST_ID_CONFLICT: (409, "request_id"),
+        SESSION_ROTATED: (409, "session_id"),
+        MESSAGE_IDENTITY_KEY_CONFLICT: (409, "identity_key"),
+        MESSAGE_SIGNATURE_INVALID: (400, "signature"),
+    }
+
+    def submit_verified_message(self, payload: object
+                                ) -> Tuple[Dict[str, Any], int]:
+        """Validate and commit one signature-verified message submission.
+
+        ``POST /v1/messages/submit-verified`` accepts the eight fields
+        :func:`e2ee_backend.crypto.sign_message` returns (the six committed
+        envelope fields plus ``identity_key`` and ``signature``) together
+        with a non-empty UTF-8 ``request_id``; extra fields are ignored and
+        every string is kept verbatim. The ``request_id`` namespace is
+        independent of the ordinary :meth:`submit_message` entry.
+
+        Validation order: a body that is not an object is
+        400/field=request_body and an invalid ``request_id`` is
+        400/field=request_id; the eight fields then follow exactly the
+        structure, UTF-8 and encoding rules of
+        :func:`e2ee_backend.crypto.verify_message`, a structural failure
+        being 400 naming the original field. Only afterwards, inside one
+        locked transaction linearized against identity rotation and
+        revocation, does replay come first (identical eight fields return
+        the first response with 200 even after revocation/rotation/session
+        rotation; any changed field is 409/request_id), then the existing
+        session-existence, rotation-closed and sender-eligibility checks,
+        then the submitted key must name the sender device's *current*
+        Ed25519 key (a non-Ed25519 current key or a different key is
+        409/identity_key), the signature must verify against that current
+        key (400/signature), and finally the ordinary message-id, sequence
+        and nonce conflict checks run in their existing order. A first
+        success returns 201 with the ordinary idempotent-submission body
+        plus the frozen ``identity_key`` and ``signature``; a failed
+        submission consumes no id and advances no sequence, nonce, delivery
+        state or cursor. Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "request_id" not in payload:
+            raise ServiceError("missing required field: request_id",
+                               "request_id")
+        if not is_nonempty_string(payload["request_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: request_id", "request_id")
+        try:
+            payload["request_id"].encode("utf-8")
+        except UnicodeEncodeError:
+            raise ServiceError(
+                "field must be encodable as UTF-8: request_id",
+                "request_id") from None
+        try:
+            fields = parse_signed_message(payload)
+        except CryptoError as error:
+            raise ServiceError(error.message, error.field) from None
+        signature = decode_ed25519_signature(fields["signature"])
+        # parse_signed_message already guaranteed a canonical 64-byte
+        # signature; the decode is repeated here only to obtain the raw bytes.
+        assert signature is not None
+
+        try:
+            view, created = self.store.submit_verified_message(
+                payload["request_id"],
+                fields["session_id"],
+                fields["sender_device_id"],
+                fields["message_id"],
+                fields["sequence"],
+                fields["nonce"],
+                fields["ciphertext"],
+                fields["identity_key"],
+                signature)
+        except MessageCreateError as error:
+            raise self._verified_message_error(error, fields)
+        return view, 201 if created else 200
+
+    @staticmethod
+    def _verified_message_error(error: MessageCreateError,
+                                payload: Dict[str, Any]) -> ServiceError:
+        """Translate a verified-submission storage failure to a ServiceError."""
+        status_code, field = \
+            DeviceService._VERIFIED_MESSAGE_ERROR_MAP[error.reason]
+        if error.reason == MESSAGE_SESSION_UNKNOWN:
+            message_text = f"session not found: {payload['session_id']}"
+        elif error.reason == MESSAGE_SENDER_INACTIVE:
+            message_text = "sender_device_id is not an active device"
+        elif error.reason == MESSAGE_DUPLICATE_ID:
+            message_text = (f"message_id already exists in session: "
+                            f"{payload['message_id']}")
+        elif error.reason == MESSAGE_BAD_SEQUENCE:
+            message_text = ("sequence must continue the session stream "
+                            f"(got {payload['sequence']})")
+        elif error.reason == MESSAGE_REQUEST_ID_CONFLICT:
+            message_text = "request_id was already used with different fields"
+        elif error.reason == SESSION_ROTATED:
+            message_text = (
+                "session has been rotated; send new messages to its "
+                "successor session")
+        elif error.reason == MESSAGE_IDENTITY_KEY_CONFLICT:
+            message_text = (
+                "identity_key does not match the sender device's current "
+                "Ed25519 identity key")
+        elif error.reason == MESSAGE_SIGNATURE_INVALID:
+            message_text = (
+                "message signature failed verification against the sender "
+                "device's current identity key: signature")
+        else:
+            message_text = (f"nonce already used in this session: "
+                            f"{payload['nonce']}")
+        return ServiceError(message_text, field, status_code=status_code)
 
     def list_messages(self, session_id: str, device_id: str, after: int,
                       limit: int) -> Dict[str, Any]:
