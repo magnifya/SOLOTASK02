@@ -99,6 +99,20 @@ def message_envelope_aad(session_id: str, sender_device_id: str,
     return (MESSAGE_ENVELOPE_PREFIX + "\n" + document).encode("utf-8")
 
 
+def _encode_utf8_strict(value: str, field: str) -> bytes:
+    """Encode *value* as strict UTF-8; raise :class:`CryptoError` on failure.
+
+    A string that cannot be encoded (e.g. one carrying lone surrogates) is
+    reported under *field* without exposing the raw encoding exception, and
+    the value is never silently repaired or truncated.
+    """
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise CryptoError(f"field must be encodable as UTF-8: {field}",
+                          field) from None
+
+
 def _validate_envelope_metadata(sender_device_id: object,
                                 message_id: object,
                                 sequence: object) -> None:
@@ -128,10 +142,17 @@ def _message_aad(session_id: str, sender_device_id: Optional[str],
     With all three metadata fields omitted the legacy AAD (the session id's
     UTF-8 bytes) is used; otherwise the metadata group is validated and the
     envelope AAD is built. There is no mixing: exactly one AAD is tried.
+
+    A text field that cannot be encoded as strict UTF-8 raises
+    :class:`CryptoError`; the first unencodable field is reported in the
+    order ``session_id``, ``sender_device_id``, ``message_id``.
     """
     if sender_device_id is None and message_id is None and sequence is None:
-        return session_id.encode("utf-8")
+        return _encode_utf8_strict(session_id, "session_id")
     _validate_envelope_metadata(sender_device_id, message_id, sequence)
+    _encode_utf8_strict(session_id, "session_id")
+    _encode_utf8_strict(sender_device_id, "sender_device_id")
+    _encode_utf8_strict(message_id, "message_id")
     return message_envelope_aad(session_id, sender_device_id, message_id,
                                 sequence)
 
@@ -154,6 +175,11 @@ def encrypt_message(session_id: str, key_b64: str,
     The three fields form a group: supplying only some of them, empty
     strings, wrong types, or a non-positive/boolean sequence raises
     :class:`CryptoError` naming the first offending field.
+
+    A text field that cannot be encoded as strict UTF-8 (e.g. one carrying
+    lone surrogates) raises :class:`CryptoError` naming the first such field
+    in the order ``session_id``, ``sender_device_id``, ``message_id``,
+    ``plaintext``; the value is never repaired or truncated.
     """
     if not is_nonempty_string(session_id):
         raise CryptoError("field must be a non-empty string: session_id",
@@ -163,7 +189,8 @@ def encrypt_message(session_id: str, key_b64: str,
     cipher = _load_aes_key(key_b64)
     aad = _message_aad(session_id, sender_device_id, message_id, sequence)
     nonce = os.urandom(GCM_NONCE_BYTES)
-    ciphertext = cipher.encrypt(nonce, plaintext.encode("utf-8"), aad)
+    ciphertext = cipher.encrypt(nonce, _encode_utf8_strict(plaintext,
+                                                           "plaintext"), aad)
     return {
         "session_id": session_id,
         "nonce": base64.b64encode(nonce).decode("ascii"),
@@ -182,7 +209,10 @@ def decrypt_message(session_id: str, key_b64: str, nonce_b64: str,
     decoding or authentication failure raises :class:`CryptoError` naming the
     offending field. The optional envelope metadata selects the same AAD
     mode as encryption; a mode or metadata mismatch fails authentication
-    with ``field=ciphertext`` — the other mode is never retried.
+    with ``field=ciphertext`` — the other mode is never retried. A text
+    field that cannot be encoded as strict UTF-8 raises :class:`CryptoError`
+    naming the first such field in the order ``session_id``,
+    ``sender_device_id``, ``message_id``.
     """
     if not is_nonempty_string(session_id):
         raise CryptoError("field must be a non-empty string: session_id",

@@ -1380,18 +1380,41 @@ def _emit_crypto_error(error: CryptoError) -> int:
     return 2
 
 
+def _read_crypto_text_argument(value: str, field: str) -> str:
+    """Return *value* directly, or read the UTF-8 file a ``@path`` points at.
+
+    The file's text is stripped exactly as ``_read_key_argument`` does. A
+    file that does not exist, cannot be read, or is not valid UTF-8 raises
+    :class:`CryptoError` naming *field* instead of propagating the raw
+    ``OSError``/``UnicodeDecodeError``.
+    """
+    if value.startswith("@"):
+        try:
+            with open(value[1:], "r", encoding="utf-8") as handle:
+                return handle.read().strip()
+        except (OSError, UnicodeDecodeError) as error:
+            raise CryptoError(f"cannot read {field} file: {error}",
+                              field) from None
+    return value
+
+
 def cmd_encrypt_message(args: argparse.Namespace) -> int:
-    """Encrypt locally and print ``session_id``/``nonce``/``ciphertext``."""
+    """Encrypt locally and print ``session_id``/``nonce``/``ciphertext``.
+
+    The ``--key``/``--plaintext`` options accept a literal value or ``@path``
+    to a UTF-8 file; the key file is read first, so when both files fail the
+    error is reported for ``key``. Any failure prints a single-line JSON
+    with only ``message`` and ``field`` on stderr, leaves stdout empty and
+    exits 2.
+    """
     try:
-        result = encrypt_message(args.session_id,
-                                 _read_key_argument(args.key),
-                                 _read_key_argument(args.plaintext),
+        key = _read_crypto_text_argument(args.key, "key")
+        plaintext = _read_crypto_text_argument(args.plaintext, "plaintext")
+        result = encrypt_message(args.session_id, key, plaintext,
                                  sender_device_id=args.sender_device_id,
                                  message_id=args.message_id,
                                  sequence=_parse_sequence_argument(
                                      args.sequence))
-    except OSError as error:
-        return _emit_crypto_error(CryptoError(str(error), "plaintext"))
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
@@ -1399,17 +1422,21 @@ def cmd_encrypt_message(args: argparse.Namespace) -> int:
 
 
 def cmd_decrypt_message(args: argparse.Namespace) -> int:
-    """Decrypt locally and print ``session_id``/``plaintext``."""
+    """Decrypt locally and print ``session_id``/``plaintext``.
+
+    The ``--key`` option accepts a literal value or ``@path`` to a UTF-8
+    file; a missing, unreadable or non-UTF-8 key file is reported with
+    ``field=key``. Any failure prints a single-line JSON with only
+    ``message`` and ``field`` on stderr, leaves stdout empty and exits 2.
+    """
     try:
-        result = decrypt_message(args.session_id,
-                                 _read_key_argument(args.key),
+        key = _read_crypto_text_argument(args.key, "key")
+        result = decrypt_message(args.session_id, key,
                                  args.nonce, args.ciphertext,
                                  sender_device_id=args.sender_device_id,
                                  message_id=args.message_id,
                                  sequence=_parse_sequence_argument(
                                      args.sequence))
-    except OSError as error:
-        return _emit_crypto_error(CryptoError(str(error), "key"))
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
