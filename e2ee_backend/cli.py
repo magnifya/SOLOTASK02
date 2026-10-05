@@ -16,7 +16,8 @@ from urllib import request as urllib_request
 from .crypto import (CryptoError, decrypt_message,
                      derive_session_key, derive_verified_session_key,
                      encrypt_message, is_nonempty_string,
-                     sign_prekey_proof, verify_prekey_proof)
+                     sign_message, sign_prekey_proof, verify_message,
+                     verify_prekey_proof)
 from .http_app import create_server
 from .locking import StateFileLocked, acquire_state_file_lock
 from .persistence import StateFileError, attach_persistence
@@ -664,6 +665,48 @@ def build_parser() -> argparse.ArgumentParser:
              '(--private-key is the recipient\'s pre-key private key); any '
              'other value fails with field "role"')
     p_derive_verified.set_defaults(handler=cmd_derive_verified_session_key)
+
+    # The options are deliberately not marked required=True: a missing option
+    # must surface through the same single-line JSON error contract (exit 2)
+    # as the other signing failures, not as an argparse usage error. The
+    # envelope is JSON object text or @path to a UTF-8 file; --private-key is
+    # a direct text value only (no @path indirection, no trimming), so the
+    # private seed never leaves the process through a file read.
+    p_sign_message = sub.add_parser(
+        "sign-message",
+        help="sign a frozen message envelope locally with an Ed25519 "
+             "identity private key (no server needed)")
+    p_sign_message.add_argument(
+        "--envelope",
+        help="six-field envelope JSON object text, or @path to read it "
+             "from a UTF-8 file")
+    p_sign_message.add_argument(
+        "--private-key",
+        help="canonical standard-base64 raw 32-byte Ed25519 identity "
+             "private key seed (direct text only)")
+    p_sign_message.set_defaults(handler=cmd_sign_message)
+
+    # The options are deliberately not marked required=True: a missing option
+    # must surface through the same single-line JSON error contract (exit 2)
+    # as the other verification failures, not as an argparse usage error.
+    p_verify_message = sub.add_parser(
+        "verify-message",
+        help="verify a signed message envelope offline against a trusted "
+             "identity fingerprint (no server needed)")
+    p_verify_message.add_argument(
+        "--envelope",
+        help="signed envelope JSON object text (eight fields), or @path "
+             "to read it from a UTF-8 file")
+    p_verify_message.add_argument(
+        "--session-id",
+        help="expected session id, compared with the envelope as-is")
+    p_verify_message.add_argument(
+        "--sender-device-id",
+        help="expected sender device id, compared with the envelope as-is")
+    p_verify_message.add_argument(
+        "--expected-fingerprint",
+        help="64 lowercase hex characters of the trusted identity fingerprint")
+    p_verify_message.set_defaults(handler=cmd_verify_message)
 
     p_integrity_history_page = sub.add_parser(
         "integrity-history-page",
@@ -1658,6 +1701,50 @@ def cmd_derive_verified_session_key(args: argparse.Namespace) -> int:
             result = derive_verified_session_key(
                 session, proof, args.private_key, args.user_id,
                 args.expected_fingerprint, role=args.role)
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def cmd_sign_message(args: argparse.Namespace) -> int:
+    """Sign a frozen six-field ciphertext envelope locally and print it.
+
+    Purely local: no server is contacted, no backend state is read or
+    written, the private key is a direct text value (never read from a
+    path), and neither it nor the result is persisted. Success prints the
+    six envelope fields verbatim plus canonical ``identity_key`` and
+    ``signature`` as single-line JSON on stdout (``ensure_ascii=False``,
+    so Chinese characters and other non-ASCII text pass through) and exits
+    0 with empty stderr; any failure — including a missing option — prints a
+    single-line JSON with only ``message`` and ``field`` on stderr, leaves
+    stdout empty and exits 2 without a traceback. The error message never
+    echoes the private key.
+    """
+    try:
+        envelope = _read_object_argument(args.envelope, "envelope")
+        result = sign_message(envelope, args.private_key)
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def cmd_verify_message(args: argparse.Namespace) -> int:
+    """Verify a signed message envelope offline and print it with fingerprint.
+
+    Purely local: no server is contacted and no backend state is read or
+    written. Success prints the envelope's eight original fields (including
+    the literal ``identity_key``/``signature`` spellings) plus
+    ``fingerprint`` as single-line JSON on stdout and exits 0; any failure —
+    including a missing option — prints a single-line JSON with only
+    ``message`` and ``field`` on stderr, leaves stdout empty and exits 2.
+    """
+    try:
+        envelope = _read_object_argument(args.envelope, "envelope")
+        result = verify_message(envelope, args.session_id,
+                                args.sender_device_id,
+                                args.expected_fingerprint)
     except CryptoError as error:
         return _emit_crypto_error(error)
     print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
