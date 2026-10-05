@@ -250,7 +250,8 @@ class MessageSubmission:
     the sender device is revoked afterwards.
 
     A record committed through the verified entry
-    (``POST /v1/messages/submit-verified``) additionally freezes the
+    (``POST /v1/messages/submit-verified`` or one item of the atomic
+    ``POST /v1/messages/submit-verified-batch``) additionally freezes the
     request's public ``identity_key`` spelling and ``signature`` it was
     accepted with, both kept verbatim; records of the ordinary entry carry
     ``None`` for both. The verified entry's ``request_id`` namespace is

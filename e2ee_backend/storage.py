@@ -571,6 +571,19 @@ class MessageCreateError(Exception):
         self.reason = reason
 
 
+class MessageSubmitBatchError(MessageCreateError):
+    """A batch verified message submission failed at one array item.
+
+    Carries the zero-based *index* of the first (and only reported)
+    offending item alongside the single-entry reason; validation runs in
+    array order and the whole batch writes nothing.
+    """
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.index = index
+
+
 class MessageListError(Exception):
     """An atomic message listing check failed."""
 
@@ -1070,7 +1083,8 @@ class DeviceStore:
         # accepted so a replay returns the original response.
         self._message_submissions: Dict[str, MessageSubmission] = {}
         # Committed idempotent *verified* message submissions
-        # (POST /v1/messages/submit-verified), keyed by a request_id
+        # (POST /v1/messages/submit-verified and the atomic
+        # /v1/messages/submit-verified-batch), keyed by a request_id
         # namespace independent of _message_submissions: the same client id
         # may be used once in each entry. Each record additionally freezes
         # the public identity_key spelling and signature it was accepted
@@ -8558,6 +8572,95 @@ class DeviceStore:
             self._notify_change()
             return self._submission_view(record), True
 
+    @staticmethod
+    def _verified_submission_matches(
+            record: MessageSubmission, session_id: str,
+            sender_device_id: str, message_id: str, sequence: int,
+            nonce: str, ciphertext: str, identity_key: str,
+            signature_b64: str) -> bool:
+        """Whether a frozen verified record replays these eight values."""
+        return (record.session_id == session_id
+                and record.sender_device_id == sender_device_id
+                and record.message_id == message_id
+                and record.sequence == sequence
+                and record.nonce == nonce
+                and record.ciphertext == ciphertext
+                and record.identity_key == identity_key
+                and record.signature == signature_b64)
+
+    def _submit_verified_fresh_locked(
+            self, request_id: str, session_id: str, sender_device_id: str,
+            message_id: str, sequence: int, nonce: str, ciphertext: str,
+            identity_key: str, signature: bytes
+            ) -> Tuple[MessageSubmission, Message]:
+        """Live-check and commit one fresh verified submission; lock held.
+
+        Runs, in this fixed order, the checks documented on
+        :meth:`submit_verified_message`: the same session-existence /
+        rotation-closed / sender-eligibility gates as
+        :meth:`_append_message_locked` (which re-runs them below), the
+        current-Ed25519 identity-key match, the signature verification
+        against that current key, and finally the ordinary message-id,
+        sequence-continuity and nonce-replay checks. On success the
+        message, nonce and idempotency record (carrying the frozen public
+        identity key and signature) commit without notifying persistence,
+        so a batch can commit several submissions in one locked
+        transaction; a failed check writes nothing and consumes no id,
+        sequence or nonce. Returns ``(record, message)`` — the batch needs
+        the appended message to roll a later item's failure back.
+        """
+        group_session = self._group_sessions.get(session_id)
+        if session_id not in self._sessions and group_session is None:
+            raise MessageCreateError(MESSAGE_SESSION_UNKNOWN)
+        if session_id in self._session_rotation_by_predecessor:
+            raise MessageCreateError(SESSION_ROTATED)
+        sender_key = self._device_index.get(sender_device_id)
+        sender = (self._devices.get(sender_key)
+                  if sender_key is not None else None)
+        if sender is None or sender.revoked:
+            raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
+        if (group_session is not None
+                and sender_device_id not in group_session.members):
+            raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
+
+        # The new message must authenticate as the sender's *current*
+        # identity: the submitted key must name the same Ed25519 point as
+        # the device's current key (whose algorithm must be Ed25519), and
+        # the signature must verify against that current key.
+        current = load_ed25519_public_key(sender.identity_key)
+        submitted = load_ed25519_public_key(identity_key)
+        if current is None or submitted is None \
+                or not same_ed25519_public_key(current, submitted):
+            raise MessageCreateError(MESSAGE_IDENTITY_KEY_CONFLICT)
+        fields = {
+            "session_id": session_id,
+            "sender_device_id": sender_device_id,
+            "message_id": message_id,
+            "sequence": sequence,
+            "nonce": nonce,
+            "ciphertext": ciphertext,
+        }
+        if not verify_message_signature(current, signature, fields):
+            raise MessageCreateError(MESSAGE_SIGNATURE_INVALID)
+
+        message = self._append_message_locked(
+            session_id, sender_device_id, message_id, sequence, nonce,
+            ciphertext)
+        record = MessageSubmission(
+            request_id=request_id,
+            session_id=session_id,
+            sender_device_id=sender_device_id,
+            message_id=message_id,
+            sequence=sequence,
+            nonce=nonce,
+            ciphertext=ciphertext,
+            created_at=message.created_at,
+            identity_key=identity_key,
+            signature=base64.b64encode(signature).decode("ascii"),
+        )
+        self._verified_message_submissions[request_id] = record
+        return record, message
+
     def submit_verified_message(self, request_id: str, session_id: str,
                                 sender_device_id: str, message_id: str,
                                 sequence: int, nonce: str, ciphertext: str,
@@ -8595,72 +8698,104 @@ class DeviceStore:
             record = self._verified_message_submissions.get(request_id)
             if record is not None:
                 signature_b64 = base64.b64encode(signature).decode("ascii")
-                if (record.session_id == session_id
-                        and record.sender_device_id == sender_device_id
-                        and record.message_id == message_id
-                        and record.sequence == sequence
-                        and record.nonce == nonce
-                        and record.ciphertext == ciphertext
-                        and record.identity_key == identity_key
-                        and record.signature == signature_b64):
+                if self._verified_submission_matches(
+                        record, session_id, sender_device_id, message_id,
+                        sequence, nonce, ciphertext, identity_key,
+                        signature_b64):
                     return self._verified_submission_view(record), False
                 raise MessageCreateError(MESSAGE_REQUEST_ID_CONFLICT)
-
-            # Live session/sender gates, in the same order and with the same
-            # reasons as _append_message_locked (which re-runs them below).
-            group_session = self._group_sessions.get(session_id)
-            if session_id not in self._sessions and group_session is None:
-                raise MessageCreateError(MESSAGE_SESSION_UNKNOWN)
-            if session_id in self._session_rotation_by_predecessor:
-                raise MessageCreateError(SESSION_ROTATED)
-            sender_key = self._device_index.get(sender_device_id)
-            sender = (self._devices.get(sender_key)
-                      if sender_key is not None else None)
-            if sender is None or sender.revoked:
-                raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
-            if (group_session is not None
-                    and sender_device_id not in group_session.members):
-                raise MessageCreateError(MESSAGE_SENDER_INACTIVE)
-
-            # The new message must authenticate as the sender's *current*
-            # identity: the submitted key must name the same Ed25519 point as
-            # the device's current key (whose algorithm must be Ed25519), and
-            # the signature must verify against that current key.
-            current = load_ed25519_public_key(sender.identity_key)
-            submitted = load_ed25519_public_key(identity_key)
-            if current is None or submitted is None \
-                    or not same_ed25519_public_key(current, submitted):
-                raise MessageCreateError(MESSAGE_IDENTITY_KEY_CONFLICT)
-            fields = {
-                "session_id": session_id,
-                "sender_device_id": sender_device_id,
-                "message_id": message_id,
-                "sequence": sequence,
-                "nonce": nonce,
-                "ciphertext": ciphertext,
-            }
-            if not verify_message_signature(current, signature, fields):
-                raise MessageCreateError(MESSAGE_SIGNATURE_INVALID)
-
-            message = self._append_message_locked(
-                session_id, sender_device_id, message_id, sequence, nonce,
-                ciphertext)
-            signature_b64 = base64.b64encode(signature).decode("ascii")
-            record = MessageSubmission(
-                request_id=request_id,
-                session_id=session_id,
-                sender_device_id=sender_device_id,
-                message_id=message_id,
-                sequence=sequence,
-                nonce=nonce,
-                ciphertext=ciphertext,
-                created_at=message.created_at,
-                identity_key=identity_key,
-                signature=signature_b64,
-            )
-            self._verified_message_submissions[request_id] = record
+            record, _ = self._submit_verified_fresh_locked(
+                request_id, session_id, sender_device_id, message_id,
+                sequence, nonce, ciphertext, identity_key, signature)
             self._notify_change()
             return self._verified_submission_view(record), True
+
+    def submit_verified_message_batch(
+            self, items: List[Dict[str, Any]]
+            ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Atomically commit many verified submissions in input order.
+
+        *items* are mappings already validated for shape by the service,
+        each carrying ``request_id``, the six envelope fields,
+        ``identity_key`` (the submitted spelling) and ``signature`` (raw
+        64 bytes); the service also guaranteed the request ids are distinct
+        within the batch. The whole batch runs under the one store lock,
+        processing items in array order so each item's sequence-continuity
+        and nonce checks already see the messages the earlier items of
+        this same batch appended. Each item first replays against the
+        committed verified records exactly like
+        :meth:`submit_verified_message` (a byte-identical record answers
+        with the frozen view and commits nothing — even after revocation,
+        identity rotation or session rotation; any differing field is
+        ``request_id_conflict``), and a fresh id commits through
+        :meth:`_submit_verified_fresh_locked` with the single entry's
+        fixed check order.
+
+        The first failure raises :class:`MessageSubmitBatchError` carrying
+        the item's index and the single-entry reason, and every mutation
+        the batch already made is rolled back in memory before the lock is
+        released: no message, idempotency record, sequence or nonce
+        survives a failed batch, and persistence is never notified. On
+        success one persistence notification commits the whole batch (a
+        durable write failure therefore rolls every item back together);
+        an all-replay batch writes nothing and does not advance the commit
+        generation. Returns ``(views, any_created)`` with one ten-field
+        verified view per item, in input order.
+        """
+        with self._lock:
+            views: List[Dict[str, Any]] = []
+            committed: List[Tuple[str, str, Message]] = []
+            try:
+                for index, item in enumerate(items):
+                    signature_b64 = base64.b64encode(
+                        item["signature"]).decode("ascii")
+                    record = self._verified_message_submissions.get(
+                        item["request_id"])
+                    if record is not None:
+                        if self._verified_submission_matches(
+                                record, item["session_id"],
+                                item["sender_device_id"], item["message_id"],
+                                item["sequence"], item["nonce"],
+                                item["ciphertext"], item["identity_key"],
+                                signature_b64):
+                            views.append(
+                                self._verified_submission_view(record))
+                            continue
+                        raise MessageSubmitBatchError(
+                            MESSAGE_REQUEST_ID_CONFLICT, index)
+                    try:
+                        record, message = self._submit_verified_fresh_locked(
+                            item["request_id"], item["session_id"],
+                            item["sender_device_id"], item["message_id"],
+                            item["sequence"], item["nonce"],
+                            item["ciphertext"], item["identity_key"],
+                            item["signature"])
+                    except MessageCreateError as error:
+                        raise MessageSubmitBatchError(
+                            error.reason, index) from None
+                    committed.append(
+                        (item["request_id"], item["session_id"], message))
+                    views.append(self._verified_submission_view(record))
+            except MessageSubmitBatchError:
+                # Roll the batch's own mutations back in reverse commit
+                # order. Each appended message is still the last entry of
+                # its session's stream (the lock is held throughout), its
+                # nonce was fresh in that session, and its request id did
+                # not exist before this batch.
+                for request_id, session_id, message in reversed(committed):
+                    del self._verified_message_submissions[request_id]
+                    stream = self._messages[session_id]
+                    assert stream and stream[-1] is message
+                    stream.pop()
+                    self._used_nonces[session_id].discard(message.nonce)
+                raise
+            any_created = bool(committed)
+            if any_created:
+                # One persistence notification for the whole batch: every
+                # message, nonce and idempotency record commits (or rolls
+                # back) together and the generation advances at most once.
+                self._notify_change()
+            return views, any_created
 
     def message_page(self, session_id: str, device_id: str, after: int,
                      limit: int) -> Tuple[List[Dict[str, Any]], int]:

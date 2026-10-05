@@ -186,6 +186,7 @@ from .storage import (
     GroupSyncAckBatchError,
     MessageCreateError,
     MessageListError,
+    MessageSubmitBatchError,
     InboxRetryBatchError,
     InboxLeaseError,
     InboxLeaseCompleteBatchError,
@@ -6253,10 +6254,16 @@ class DeviceService:
 
     @staticmethod
     def _verified_message_error(error: MessageCreateError,
-                                payload: Dict[str, Any]) -> ServiceError:
-        """Translate a verified-submission storage failure to a ServiceError."""
+                                payload: Dict[str, Any],
+                                field_prefix: str = "") -> ServiceError:
+        """Translate a verified-submission storage failure to a ServiceError.
+
+        *field_prefix* qualifies the mapped field for a batch item (e.g.
+        ``items[2].``); it is empty for the single-item entry.
+        """
         status_code, field = \
             DeviceService._VERIFIED_MESSAGE_ERROR_MAP[error.reason]
+        field = field_prefix + field
         if error.reason == MESSAGE_SESSION_UNKNOWN:
             message_text = f"session not found: {payload['session_id']}"
         elif error.reason == MESSAGE_SENDER_INACTIVE:
@@ -6285,6 +6292,117 @@ class DeviceService:
             message_text = (f"nonce already used in this session: "
                             f"{payload['nonce']}")
         return ServiceError(message_text, field, status_code=status_code)
+
+    def submit_verified_message_batch(self, payload: object
+                                      ) -> Tuple[Dict[str, Any], int]:
+        """Validate and commit one atomic batch of verified submissions.
+
+        ``POST /v1/messages/submit-verified-batch``. The body must be an
+        object carrying a non-empty ``items`` array; each element accepts
+        the fields of the single verified submission (a non-empty UTF-8
+        ``request_id`` plus the eight :func:`e2ee_backend.crypto.sign_message`
+        fields), extra fields are ignored, and the input order is the
+        submission order. Shape errors are reported, in order, as
+        400/field ``request_body`` (bad/non-object body), ``items``
+        (missing/not-a-non-empty-array), ``items[i]`` (non-object element)
+        or ``items[i].<field>`` for the offending field: the single entry's
+        ``request_id`` rules, a ``request_id`` repeated inside the batch
+        (reported at the second occurrence), and the
+        :func:`e2ee_backend.crypto.parse_signed_message` structure/UTF-8/
+        encoding rules, each naming its items[i]-qualified field.
+
+        The whole batch then commits in one locked transaction that
+        processes the items in array order, so each item's sequence and
+        nonce checks already see the messages the earlier items of the
+        same batch appended. Each item replays against the committed
+        verified records first (identical eight fields answer the frozen
+        first response — even after revocation, identity rotation or
+        session rotation — and commit nothing; any differing field is
+        409/``items[i].request_id``), and a fresh id runs the single
+        entry's fixed-order live checks: 404/``items[i].session_id`` for an
+        unknown session, 409/``items[i].session_id`` for a rotation-closed
+        1:1 session, 409/``items[i].sender_device_id`` for an unknown,
+        revoked or non-frozen-member sender, 409/``items[i].identity_key``
+        when the submitted key is not the sender's current Ed25519 key,
+        400/``items[i].signature`` when the signature does not verify, and
+        finally 409/``items[i].message_id`` / ``items[i].sequence`` /
+        ``items[i].nonce`` for the ordinary conflicts. The first failure
+        aborts the whole batch: no message, idempotency record, sequence
+        or nonce is written, and a durable-write failure
+        (503/field=data_file) rolls every item back together, so a
+        concurrent observer only ever sees the batch fully committed or
+        not at all. On success the body is ``items`` with the single
+        entry's ten-field response per item, in input order; the status is
+        201 when at least one item was newly committed and 200 when every
+        item was a replay. Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+
+        items: List[Dict[str, Any]] = []
+        seen_request_ids: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            request_id_field = f"{item_field}.request_id"
+            if "request_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {request_id_field}",
+                    request_id_field)
+            if not is_nonempty_string(element["request_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {request_id_field}",
+                    request_id_field)
+            try:
+                element["request_id"].encode("utf-8")
+            except UnicodeEncodeError:
+                raise ServiceError(
+                    f"field must be encodable as UTF-8: {request_id_field}",
+                    request_id_field) from None
+            if element["request_id"] in seen_request_ids:
+                raise ServiceError(
+                    "duplicate request_id in items: "
+                    f"{element['request_id']}", request_id_field)
+            seen_request_ids.add(element["request_id"])
+            try:
+                fields = parse_signed_message(element)
+            except CryptoError as error:
+                raise ServiceError(
+                    error.message, f"{item_field}.{error.field}") from None
+            signature = decode_ed25519_signature(fields["signature"])
+            # parse_signed_message already guaranteed a canonical 64-byte
+            # signature; the decode is repeated only to obtain the raw bytes.
+            assert signature is not None
+            items.append({
+                "request_id": element["request_id"],
+                "session_id": fields["session_id"],
+                "sender_device_id": fields["sender_device_id"],
+                "message_id": fields["message_id"],
+                "sequence": fields["sequence"],
+                "nonce": fields["nonce"],
+                "ciphertext": fields["ciphertext"],
+                "identity_key": fields["identity_key"],
+                "signature": signature,
+            })
+
+        try:
+            views, any_created = self.store.submit_verified_message_batch(
+                items)
+        except MessageSubmitBatchError as error:
+            raise self._verified_message_error(
+                error, items[error.index],
+                field_prefix=f"items[{error.index}].")
+        return {"items": views}, 201 if any_created else 200
 
     def list_messages(self, session_id: str, device_id: str, after: int,
                       limit: int) -> Dict[str, Any]:

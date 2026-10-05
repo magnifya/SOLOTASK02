@@ -500,6 +500,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit_message.add_argument("--ciphertext", required=True)
     p_submit_message.set_defaults(handler=cmd_submit_message)
 
+    p_submit_verified_batch = sub.add_parser(
+        "submit-verified-batch",
+        help="atomically submit a batch of signature-verified message "
+             "envelopes")
+    p_submit_verified_batch.add_argument(
+        "--items", required=True,
+        help="items JSON array text (each element carries request_id plus "
+             "the eight sign-message fields), or @path to read it from a "
+             "UTF-8 file")
+    p_submit_verified_batch.set_defaults(handler=cmd_submit_verified_batch)
+
     p_pull_messages = sub.add_parser(
         "pull-messages", help="pull a page of messages from a session")
     p_pull_messages.add_argument("session_id")
@@ -1398,6 +1409,31 @@ def cmd_submit_message(args: argparse.Namespace) -> int:
     return _emit_api_response(status, response)
 
 
+def cmd_submit_verified_batch(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages/submit-verified-batch with the parsed items.
+
+    The ``--items`` option is the items JSON array text or ``@path`` to a
+    UTF-8 file; the parsed array is sent as the body's ``items`` field and
+    the server applies the whole batch atomically, in array order. Success
+    (201 when at least one item committed, 200 when every item was a
+    replay) prints the server's single-line JSON on stdout and exits 0;
+    any failure — an unreadable/invalid ``--items`` input or an HTTP error
+    — prints one single-line JSON object with ``message`` and ``field`` on
+    stderr (stdout stays empty) and exits non-zero.
+    """
+    try:
+        items = _read_items_argument(args.items)
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    try:
+        status, response = _request_json(
+            "POST", f"{args.base_url}/v1/messages/submit-verified-batch",
+            body={"items": items})
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
 def cmd_pull_messages(args: argparse.Namespace) -> int:
     """Call GET /v1/messages/{session_id} and print the single-line JSON."""
     from urllib.parse import quote, urlencode
@@ -1633,6 +1669,34 @@ def _read_object_argument(value: Optional[str], field: str) -> Any:
 def _read_proof_argument(value: Optional[str]) -> Any:
     """Parse the ``--proof`` option as a JSON object text or ``@path`` file."""
     return _read_object_argument(value, "proof")
+
+
+def _read_items_argument(value: Optional[str]) -> Any:
+    """Parse the ``--items`` option: JSON array text, or ``@path`` for a file.
+
+    The same reading rules as :func:`_read_object_argument`, except the
+    parsed JSON value must be an array; every failure raises
+    :class:`CryptoError` naming ``items``.
+    """
+    if not is_nonempty_string(value):
+        raise CryptoError(
+            "field must be a non-empty string: items", "items")
+    text = value
+    if value.startswith("@"):
+        try:
+            with open(value[1:], "r", encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError) as error:
+            raise CryptoError(f"cannot read items file: {error}",
+                              "items") from None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise CryptoError(f"items must be valid JSON: {error}",
+                          "items") from None
+    if not isinstance(obj, list):
+        raise CryptoError("items must be a JSON array", "items")
+    return obj
 
 
 def cmd_verify_prekey_proof(args: argparse.Namespace) -> int:
