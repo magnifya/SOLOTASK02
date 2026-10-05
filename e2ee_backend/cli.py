@@ -531,6 +531,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--device-id", required=True)
     p_status.set_defaults(handler=cmd_message_status)
 
+    p_message_proof = sub.add_parser(
+        "message-proof",
+        help="fetch a committed message's saved signature proof")
+    # Deliberately not required: a missing argument is reported through the
+    # same single-line JSON error contract (stderr, exit 1) as an HTTP
+    # failure, with field naming the offending input, rather than as an
+    # argparse usage error.
+    p_message_proof.add_argument("session_id", nargs="?")
+    p_message_proof.add_argument("message_id", nargs="?")
+    p_message_proof.add_argument("--device-id")
+    p_message_proof.set_defaults(handler=cmd_message_proof)
+
     p_encrypt = sub.add_parser(
         "encrypt-message",
         help="encrypt a plaintext locally with AES-256-GCM (no server needed)")
@@ -1399,6 +1411,44 @@ def cmd_message_status(args: argparse.Namespace) -> int:
     query = urlencode({"device_id": args.device_id})
     url = (f"{args.base_url}/v1/messages/"
            f"{quote(args.session_id, safe='')}/status/"
+           f"{quote(args.message_id, safe='')}?{query}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def _emit_argument_error(field: str) -> int:
+    """Print a single-line missing-argument JSON error on stderr; exit 1."""
+    print(json.dumps(
+        {"message": f"missing required argument: {field}", "field": field},
+        separators=(",", ":")),
+          file=sys.stderr)
+    return 1
+
+
+def cmd_message_proof(args: argparse.Namespace) -> int:
+    """Call GET /v1/messages/{sid}/proof/{mid}?device_id=… and print one line.
+
+    Success (200) prints the eight-field signed envelope on stdout and exits
+    0. A missing or empty argument prints one single-line JSON with the
+    offending input as ``field`` on stderr, leaves stdout empty and exits 1;
+    an HTTP failure prints the server's single-line ``message``/``field``
+    JSON on stderr with exit 1; a connection failure does the same with
+    field=server.
+    """
+    if not args.session_id:
+        return _emit_argument_error("session_id")
+    if not args.message_id:
+        return _emit_argument_error("message_id")
+    if not args.device_id:
+        return _emit_argument_error("device_id")
+    from urllib.parse import quote, urlencode
+
+    query = urlencode({"device_id": args.device_id})
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}/proof/"
            f"{quote(args.message_id, safe='')}?{query}")
     try:
         status, response = _request_json("GET", url)

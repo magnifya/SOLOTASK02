@@ -87,6 +87,9 @@ from .storage import (
     MESSAGE_DUPLICATE_ID,
     MESSAGE_DUPLICATE_NONCE,
     MESSAGE_IDENTITY_KEY_CONFLICT,
+    MESSAGE_PROOF_DEVICE_INELIGIBLE,
+    MESSAGE_PROOF_MESSAGE_UNKNOWN,
+    MESSAGE_PROOF_SESSION_UNKNOWN,
     MESSAGE_REQUEST_ID_CONFLICT,
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
@@ -6188,6 +6191,52 @@ class DeviceService:
                                    "device_id", status_code=409)
             raise  # pragma: no cover - defensive
         return {"messages": messages, "next_after": next_after}
+
+    def message_proof(self, session_id: str, message_id: str,
+                      device_id: str) -> Dict[str, Any]:
+        """Return one committed message's saved signature proof.
+
+        ``GET /v1/messages/{session_id}/proof/{message_id}`` returns exactly
+        the six envelope fields :func:`sign_message` froze at the first
+        verified submission plus the frozen ``identity_key`` and
+        ``signature`` — the first-submission original values, directly
+        consumable by :func:`verify_message` with the fingerprint trusted at
+        that time. Only messages committed through
+        ``POST /v1/messages/submit-verified`` carry a proof; an ordinary
+        :meth:`submit_message`, a direct :meth:`post_message` send and legacy
+        data have none, and a proof query never back-fills a signature.
+        Identity rotation, sender-device revocation, group membership
+        changes and session rotation leave the saved proof untouched.
+
+        The strictly validated path/query identifiers are checked in this
+        order: an unknown session is 404/field=session_id; the querying
+        device must be an active registered device with read eligibility —
+        either frozen participant of a 1:1 session, or an active frozen
+        member of a group session (the sender included) — anything else
+        (unknown, revoked, or not eligible) is 409/field=device_id; an
+        unknown message is 404/field=message_id; an existing message without
+        a saved proof is 409/field=signature. The query is read-only: it
+        advances no cursor, delivery state, audit chain or submission
+        generation, and it is linearized under the store lock so it only
+        observes complete states of concurrent submissions and revocations.
+        """
+        result = self.store.message_proof(session_id, message_id, device_id)
+        if result == MESSAGE_PROOF_SESSION_UNKNOWN:
+            raise ServiceError(f"session not found: {session_id}",
+                               "session_id", status_code=404)
+        if result == MESSAGE_PROOF_DEVICE_INELIGIBLE:
+            raise ServiceError(
+                "device_id is not an active device with read access to "
+                "this session",
+                "device_id", status_code=409)
+        if result == MESSAGE_PROOF_MESSAGE_UNKNOWN:
+            raise ServiceError(f"message not found: {message_id}",
+                               "message_id", status_code=404)
+        if result is None:
+            raise ServiceError(
+                "message has no saved signature proof: signature",
+                "signature", status_code=409)
+        return result
 
     # -- reliable delivery -------------------------------------------------
 

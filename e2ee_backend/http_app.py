@@ -18,6 +18,7 @@ _SESSIONS_FROM_BATCH_CLAIM_PATH = "/v1/sessions/from-batch-claim"
 _MESSAGES_PATH = "/v1/messages"
 _MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
 _MESSAGES_SUBMIT_VERIFIED_PATH = "/v1/messages/submit-verified"
+_MESSAGE_PROOF_SEGMENT = "proof"
 _INBOX_JOBS_PATH = "/v1/inbox-jobs"
 _EVENT_GC_PATH = "/v1/event-gc"
 _EVENT_GC_BATCH_CLEANUP_PATH = "/v1/event-gc-batch/cleanup-expired"
@@ -976,6 +977,30 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             suffix = path[len(_MESSAGES_PATH) + 1:]
             if "/" in suffix:
                 parts = suffix.split("/")
+                if len(parts) == 3 and parts[1] == _MESSAGE_PROOF_SEGMENT:
+                    # {session_id}/proof/{message_id} — routing splits on raw
+                    # slashes only; a percent-encoded slash inside either id
+                    # segment decodes to an ordinary '/' that stays part of
+                    # the identifier. Both segments strictly decode as
+                    # UTF-8 to a non-empty string: a malformed escape, an
+                    # invalid encoding or an empty decoded value is 400
+                    # naming that identifier, session_id first.
+                    session_id = _strict_percent_decode(parts[0])
+                    if not session_id:
+                        self._send_json(400, {
+                            "message": "session_id must decode to a non-empty "
+                                       "UTF-8 string",
+                            "field": "session_id"})
+                        return
+                    message_id = _strict_percent_decode(parts[2])
+                    if not message_id:
+                        self._send_json(400, {
+                            "message": "message_id must decode to a non-empty "
+                                       "UTF-8 string",
+                            "field": "message_id"})
+                        return
+                    self._handle_message_proof(session_id, message_id)
+                    return
                 if len(parts) == 3 and parts[1] == "status" and parts[0] and parts[2]:
                     self._handle_message_status(
                         unquote(parts[0]), unquote(parts[2]))
@@ -2938,6 +2963,26 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return  # a 400 response was already sent
         try:
             body = self.service.message_status(
+                session_id, message_id, device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_message_proof(self, session_id: str, message_id: str) -> None:
+        # The proof entry is GET-only: any request body is ignored, as are
+        # query parameters other than the single required device_id. Blank
+        # values are kept (unlike the shared helper) so a device_id given
+        # twice with one empty value still counts as repeated/empty.
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        values = query.get("device_id", [])
+        if len(values) != 1 or not values[0]:
+            self._send_json(400, {"message": "device_id is required",
+                                  "field": "device_id"})
+            return
+        device_id = values[0]
+        try:
+            body = self.service.message_proof(
                 session_id, message_id, device_id)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())

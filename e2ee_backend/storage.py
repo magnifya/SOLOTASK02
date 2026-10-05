@@ -128,6 +128,12 @@ MESSAGE_SIGNATURE_INVALID = "message_signature_invalid"
 #: Outcome code for a failed message listing.
 MESSAGE_DEVICE_INACTIVE = "device_inactive"
 
+#: Sentinel results of the read-only historical message-proof lookup
+#: (``GET /v1/messages/{session_id}/proof/{message_id}``).
+MESSAGE_PROOF_SESSION_UNKNOWN = "message_proof_session_unknown"
+MESSAGE_PROOF_DEVICE_INELIGIBLE = "message_proof_device_ineligible"
+MESSAGE_PROOF_MESSAGE_UNKNOWN = "message_proof_message_unknown"
+
 #: Outcome codes for delivery (retry/ack/status) failures.
 DELIVERY_SESSION_UNKNOWN = "session_unknown"
 DELIVERY_MESSAGE_UNKNOWN = "message_unknown"
@@ -8606,6 +8612,85 @@ class DeviceStore:
             page = [m for m in stream if m.sequence > after][:limit]
             next_after = page[-1].sequence if page else after
             return [self.message_view(m) for m in page], next_after
+
+    @staticmethod
+    def _message_proof_view(record: MessageSubmission) -> Dict[str, Any]:
+        """Copy one verified submission record into its eight-field proof view.
+
+        Exactly the six envelope fields :func:`sign_message` freezes plus the
+        frozen ``identity_key`` and ``signature`` (no ``request_id`` or
+        ``created_at``) — directly consumable by
+        :func:`verify_message`.
+        """
+        return {
+            "session_id": record.session_id,
+            "sender_device_id": record.sender_device_id,
+            "message_id": record.message_id,
+            "sequence": record.sequence,
+            "nonce": record.nonce,
+            "ciphertext": record.ciphertext,
+            "identity_key": record.identity_key,
+            "signature": record.signature,
+        }
+
+    def message_proof(self, session_id: str, message_id: str,
+                      device_id: str) -> Any:
+        """Atomically look up one message's saved signature proof.
+
+        Read-only historical query: it neither mutates state nor notifies, so
+        it consumes no commit generation and cannot move a cursor, a delivery
+        record, the audit chain or a submission generation.
+
+        All checks run under the store lock in one fixed order, so a query
+        concurrent with a submission or a device revocation observes only a
+        complete state (a revocation linearized before the lookup rejects the
+        querying device):
+
+        1. The session must exist (a rotated-closed predecessor keeps its
+           history and is still found). ``MESSAGE_PROOF_SESSION_UNKNOWN``
+           otherwise.
+        2. The querying device must be an active registered device with read
+           eligibility: for a 1:1 session either of the frozen initiator or
+           recipient, for a group session one of the frozen members (the
+           sender included). An unknown, revoked or non-member device is
+           ``MESSAGE_PROOF_DEVICE_INELIGIBLE``.
+        3. The message must exist in the session's stream
+           (``MESSAGE_PROOF_MESSAGE_UNKNOWN``).
+        4. The message has a proof only when it was committed through the
+           verified entry: returns the eight-field proof view, or ``None``
+           for an ordinary submission, a direct send and any legacy data.
+           The query never back-fills a signature.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            group_session = (self._group_sessions.get(session_id)
+                             if session is None else None)
+            if session is None and group_session is None:
+                return MESSAGE_PROOF_SESSION_UNKNOWN
+
+            device_key = self._device_index.get(device_id)
+            device = (self._devices.get(device_key)
+                      if device_key is not None else None)
+            if device is None or device.revoked:
+                return MESSAGE_PROOF_DEVICE_INELIGIBLE
+            if session is not None:
+                if device_id not in (session.initiator_device_id,
+                                     session.recipient_device_id):
+                    return MESSAGE_PROOF_DEVICE_INELIGIBLE
+            elif device_id not in group_session.members:
+                return MESSAGE_PROOF_DEVICE_INELIGIBLE
+
+            message = next((m for m in self._messages.get(session_id, [])
+                            if m.message_id == message_id), None)
+            if message is None:
+                return MESSAGE_PROOF_MESSAGE_UNKNOWN
+
+            record = next((r for r in self._verified_message_submissions.values()
+                           if r.session_id == session_id
+                           and r.message_id == message_id), None)
+            if record is None:
+                return None
+            return self._message_proof_view(record)
 
     # -- delivery (reliable retry/ack/status) ------------------------------
 
