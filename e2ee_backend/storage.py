@@ -566,9 +566,13 @@ class SessionCreateError(Exception):
 class MessageCreateError(Exception):
     """An atomic message append check failed (nothing was written)."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, index: Optional[int] = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        #: For batch verified submissions, the 0-based request-array
+        #: position of the item the failure is attributed to; ``None`` for
+        #: single-item submissions.
+        self.index = index
 
 
 class MessageListError(Exception):
@@ -8661,6 +8665,170 @@ class DeviceStore:
             self._verified_message_submissions[request_id] = record
             self._notify_change()
             return self._verified_submission_view(record), True
+
+    def submit_verified_message_batch(self, items: List[Dict[str, Any]]
+                                      ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically commit a batch of signature-verified submissions.
+
+        *items* is the request's non-empty ``items`` array, already
+        field-validated by the caller: each element carries the verbatim
+        ``request_id``, the six envelope fields and ``identity_key``
+        strings, plus the decoded 64-byte Ed25519 ``signature``. The whole
+        check-and-commit runs under the store lock — the same lock identity
+        rotation, revocation, session rotation and the single-item verified
+        entry take — so the batch linearizes as one transaction: it is
+        either committed in full or fails in full, and a concurrent
+        identical batch observes exactly one writer.
+
+        Items are processed in request order and each item's checks mirror
+        :meth:`submit_verified_message`: replay first (a record whose eight
+        fields match returns its frozen view and consumes nothing, even if
+        the sender was revoked or the identity/session rotated since; any
+        differing field is ``request_id_conflict``), then the
+        session-existence / rotation-closed / sender-eligibility gates, the
+        current-Ed25519 identity-key match, the signature verification, and
+        finally the message-id, sequence and nonce checks. The stream
+        checks see a *virtual* stream: earlier fresh items of this same
+        batch count as already appended, so sequences must continue the
+        session stream across the batch and message ids/nonces planned by
+        earlier items conflict. Every failure raises
+        :class:`MessageCreateError` carrying the item's 0-based index and
+        writes nothing — no message, idempotency record, sequence or nonce.
+
+        When every item passes, the fresh items commit in request order
+        (message, nonce and idempotency record each, one change
+        notification — a single durable commit generation — for the whole
+        batch); a batch of only replays neither notifies nor consumes a
+        generation. Returns ``({"items": views}, created_any)`` with one
+        view per item in request order.
+        """
+        with self._lock:
+            # (record, item): a replay pairs its stored record with None; a
+            # fresh item pairs None with its validated request values.
+            plans: List[Tuple[Optional[MessageSubmission],
+                              Optional[Dict[str, Any]]]] = []
+            planned_ids: Dict[str, set] = {}
+            planned_nonces: Dict[str, set] = {}
+            planned_sequences: Dict[str, int] = {}
+            for index, item in enumerate(items):
+                record = self._verified_message_submissions.get(
+                    item["request_id"])
+                if record is not None:
+                    signature_b64 = base64.b64encode(
+                        item["signature"]).decode("ascii")
+                    if (record.session_id == item["session_id"]
+                            and record.sender_device_id
+                            == item["sender_device_id"]
+                            and record.message_id == item["message_id"]
+                            and record.sequence == item["sequence"]
+                            and record.nonce == item["nonce"]
+                            and record.ciphertext == item["ciphertext"]
+                            and record.identity_key == item["identity_key"]
+                            and record.signature == signature_b64):
+                        plans.append((record, None))
+                        continue
+                    raise MessageCreateError(
+                        MESSAGE_REQUEST_ID_CONFLICT, index)
+
+                # Live session/sender gates, in the same order and with the
+                # same reasons as the single-item verified entry.
+                session_id = item["session_id"]
+                sender_device_id = item["sender_device_id"]
+                group_session = self._group_sessions.get(session_id)
+                if session_id not in self._sessions \
+                        and group_session is None:
+                    raise MessageCreateError(MESSAGE_SESSION_UNKNOWN, index)
+                if session_id in self._session_rotation_by_predecessor:
+                    raise MessageCreateError(SESSION_ROTATED, index)
+                sender_key = self._device_index.get(sender_device_id)
+                sender = (self._devices.get(sender_key)
+                          if sender_key is not None else None)
+                if sender is None or sender.revoked:
+                    raise MessageCreateError(MESSAGE_SENDER_INACTIVE, index)
+                if (group_session is not None
+                        and sender_device_id not in group_session.members):
+                    raise MessageCreateError(MESSAGE_SENDER_INACTIVE, index)
+
+                # The submitted key must name the sender's *current*
+                # Ed25519 identity and the signature must verify against
+                # it, exactly as in the single-item entry.
+                current = load_ed25519_public_key(sender.identity_key)
+                submitted = load_ed25519_public_key(item["identity_key"])
+                if current is None or submitted is None \
+                        or not same_ed25519_public_key(current, submitted):
+                    raise MessageCreateError(
+                        MESSAGE_IDENTITY_KEY_CONFLICT, index)
+                fields = {
+                    "session_id": session_id,
+                    "sender_device_id": sender_device_id,
+                    "message_id": item["message_id"],
+                    "sequence": item["sequence"],
+                    "nonce": item["nonce"],
+                    "ciphertext": item["ciphertext"],
+                }
+                if not verify_message_signature(
+                        current, item["signature"], fields):
+                    raise MessageCreateError(MESSAGE_SIGNATURE_INVALID, index)
+
+                # Stream checks against the committed stream plus the fresh
+                # items this batch already planned (the virtual sequence).
+                stream = self._messages.get(session_id, [])
+                new_ids = planned_ids.setdefault(session_id, set())
+                if item["message_id"] in new_ids or any(
+                        m.message_id == item["message_id"] for m in stream):
+                    raise MessageCreateError(MESSAGE_DUPLICATE_ID, index)
+                last_sequence = planned_sequences.get(session_id)
+                if last_sequence is None:
+                    last_sequence = stream[-1].sequence if stream else 0
+                if item["sequence"] != last_sequence + 1:
+                    raise MessageCreateError(MESSAGE_BAD_SEQUENCE, index)
+                used_nonces = self._used_nonces.get(session_id, set())
+                new_nonces = planned_nonces.setdefault(session_id, set())
+                if item["nonce"] in used_nonces \
+                        or item["nonce"] in new_nonces:
+                    raise MessageCreateError(MESSAGE_DUPLICATE_NONCE, index)
+                new_ids.add(item["message_id"])
+                new_nonces.add(item["nonce"])
+                planned_sequences[session_id] = item["sequence"]
+                plans.append((None, item))
+
+            created_any = any(record is None for record, _ in plans)
+            views: List[Dict[str, Any]] = []
+            for record, item in plans:
+                if record is not None:
+                    # Idempotent replay element: its frozen record answers;
+                    # nothing is written for it.
+                    views.append(self._verified_submission_view(record))
+                    continue
+                assert item is not None
+                # The virtual plan above matches what the locked append
+                # re-checks as earlier items land, so this cannot fail.
+                message = self._append_message_locked(
+                    item["session_id"], item["sender_device_id"],
+                    item["message_id"], item["sequence"], item["nonce"],
+                    item["ciphertext"])
+                signature_b64 = base64.b64encode(
+                    item["signature"]).decode("ascii")
+                record = MessageSubmission(
+                    request_id=item["request_id"],
+                    session_id=item["session_id"],
+                    sender_device_id=item["sender_device_id"],
+                    message_id=item["message_id"],
+                    sequence=item["sequence"],
+                    nonce=item["nonce"],
+                    ciphertext=item["ciphertext"],
+                    created_at=message.created_at,
+                    identity_key=item["identity_key"],
+                    signature=signature_b64,
+                )
+                self._verified_message_submissions[
+                    item["request_id"]] = record
+                views.append(self._verified_submission_view(record))
+            if created_any:
+                # One notification for the whole batch: a single durable
+                # commit generation covers every appended message/record.
+                self._notify_change()
+            return {"items": views}, created_any
 
     def message_page(self, session_id: str, device_id: str, after: int,
                      limit: int) -> Tuple[List[Dict[str, Any]], int]:

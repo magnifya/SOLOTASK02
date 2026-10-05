@@ -500,6 +500,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit_message.add_argument("--ciphertext", required=True)
     p_submit_message.set_defaults(handler=cmd_submit_message)
 
+    p_submit_verified_batch = sub.add_parser(
+        "submit-verified-batch",
+        help="atomically submit a batch of signature-verified message "
+             "envelopes")
+    p_submit_verified_batch.add_argument(
+        "items",
+        help="the batch's items array as JSON text, or @path to a UTF-8 "
+             "file containing it; each element carries request_id plus the "
+             "eight fields sign_message returns")
+    p_submit_verified_batch.set_defaults(handler=cmd_submit_verified_batch)
+
     p_pull_messages = sub.add_parser(
         "pull-messages", help="pull a page of messages from a session")
     p_pull_messages.add_argument("session_id")
@@ -1393,6 +1404,38 @@ def cmd_submit_message(args: argparse.Namespace) -> int:
     try:
         status, response = _request_json(
             "POST", f"{args.base_url}/v1/messages/submit", body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_submit_verified_batch(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages/submit-verified-batch; 201 or 200 replay.
+
+    The ``items`` argument is the batch's items array as JSON text, or
+    ``@path`` to a UTF-8 file containing it; each element carries
+    ``request_id`` plus the eight fields ``sign_message`` returns, and the
+    array order is the submission order. The batch commits all-or-nothing.
+    A 2xx response prints the single-line JSON on stdout and exits 0; any
+    failure prints the server's single-line JSON with its ``field`` on
+    stderr and exits non-zero. An unreadable file or invalid JSON is a
+    local error (exit 2, field ``items``).
+    """
+    try:
+        text = _read_crypto_text_argument(args.items, "items")
+    except CryptoError as error:
+        return _emit_crypto_error(error)
+    try:
+        items = json.loads(text)
+    except json.JSONDecodeError as error:
+        print(json.dumps({"message": f"items is not valid JSON: {error}",
+                          "field": "items"}, separators=(",", ":")),
+              file=sys.stderr)
+        return 2
+    try:
+        status, response = _request_json(
+            "POST", f"{args.base_url}/v1/messages/submit-verified-batch",
+            body={"items": items})
     except ServerUnavailable:
         return _emit_server_error()
     return _emit_api_response(status, response)

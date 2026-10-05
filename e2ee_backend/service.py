@@ -6286,6 +6286,126 @@ class DeviceService:
                             f"{payload['nonce']}")
         return ServiceError(message_text, field, status_code=status_code)
 
+    def submit_verified_message_batch(self, payload: object
+                                      ) -> Tuple[Dict[str, Any], int]:
+        """Validate and atomically commit a batch of verified submissions.
+
+        ``POST /v1/messages/submit-verified-batch`` accepts a JSON object
+        whose ``items`` is a non-empty array; each element carries the same
+        ``request_id`` plus the eight fields :meth:`submit_verified_message`
+        accepts (the six committed envelope fields plus ``identity_key``
+        and ``signature``), and the input order is the submission order.
+        The batch shares the single-item entry's ``request_id`` namespace.
+
+        A body that is not an object is 400/field=request_body; a missing,
+        non-array or empty ``items`` is 400/field=items; a non-object
+        element is 400 naming ``items[i]`` (0-based); a missing, wrongly
+        typed, empty or non-UTF-8 ``request_id`` is 400 naming
+        ``items[i].request_id``, as is a ``request_id`` repeated inside the
+        batch (reported at its second occurrence); the eight signed fields
+        then follow exactly the rules of
+        :func:`e2ee_backend.crypto.parse_signed_message`, a structural
+        failure being 400 naming ``items[i].<field>``.
+
+        All further checks run in the store's single locked transaction, in
+        input order and with the single-item entry's per-item order (replay
+        first, then session/sender gates, identity-key match, signature,
+        then message-id/sequence/nonce against the stream virtually
+        extended by the batch's earlier fresh items): an unknown session is
+        404/items[i].session_id, a rotation-closed 1:1 session
+        409/items[i].session_id, an inactive or non-frozen-member sender
+        409/items[i].sender_device_id, a key that is not the sender's
+        current Ed25519 key 409/items[i].identity_key, a signature that
+        does not verify 400/items[i].signature, and message-id, sequence
+        and nonce conflicts 409 naming ``items[i].message_id`` /
+        ``items[i].sequence`` / ``items[i].nonce``; an existing id with any
+        changed field is 409/items[i].request_id.
+
+        The batch is all-or-nothing: any failure writes no message,
+        idempotency record, sequence or nonce. Success returns
+        ``{"items": [...]}`` with one single-item response view (including
+        ``created_at``) per element in input order — 201 when at least one
+        item is new, 200 for a pure replay (unaffected by later revocation
+        or rotation). Returns ``(body, status_code)``.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+
+        items: List[Dict[str, Any]] = []
+        seen_request_ids: set = set()
+        for index, element in enumerate(raw_items):
+            prefix = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {prefix}", prefix)
+            request_path = f"{prefix}.request_id"
+            if "request_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {request_path}", request_path)
+            if not is_nonempty_string(element["request_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {request_path}",
+                    request_path)
+            try:
+                element["request_id"].encode("utf-8")
+            except UnicodeEncodeError:
+                raise ServiceError(
+                    f"field must be encodable as UTF-8: {request_path}",
+                    request_path) from None
+            if element["request_id"] in seen_request_ids:
+                raise ServiceError(
+                    f"duplicate request_id in items: "
+                    f"{element['request_id']}", request_path)
+            seen_request_ids.add(element["request_id"])
+            try:
+                fields = parse_signed_message(element)
+            except CryptoError as error:
+                raise ServiceError(
+                    error.message, f"{prefix}.{error.field}") from None
+            signature = decode_ed25519_signature(fields["signature"])
+            # parse_signed_message already guaranteed a canonical 64-byte
+            # signature; the decode only obtains the raw bytes.
+            assert signature is not None
+            items.append({
+                "request_id": element["request_id"],
+                "session_id": fields["session_id"],
+                "sender_device_id": fields["sender_device_id"],
+                "message_id": fields["message_id"],
+                "sequence": fields["sequence"],
+                "nonce": fields["nonce"],
+                "ciphertext": fields["ciphertext"],
+                "identity_key": fields["identity_key"],
+                "signature": signature,
+            })
+
+        try:
+            view, created = self.store.submit_verified_message_batch(items)
+        except MessageCreateError as error:
+            raise self._verified_batch_message_error(error, items)
+        return view, 201 if created else 200
+
+    @staticmethod
+    def _verified_batch_message_error(
+            error: MessageCreateError,
+            items: List[Dict[str, Any]]) -> ServiceError:
+        """Translate a batch verified-submission storage failure.
+
+        The single-item entry's (status, field, message) mapping is reused
+        verbatim; only the field is re-reported under the failing element's
+        ``items[i]`` path.
+        """
+        index = error.index if error.index is not None else 0
+        single = DeviceService._verified_message_error(error, items[index])
+        return ServiceError(single.message, f"items[{index}].{single.field}",
+                            status_code=single.status_code)
+
     def list_messages(self, session_id: str, device_id: str, after: int,
                       limit: int) -> Dict[str, Any]:
         """Return one page of a session's messages plus the resume cursor."""

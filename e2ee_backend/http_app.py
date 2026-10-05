@@ -18,6 +18,7 @@ _SESSIONS_FROM_BATCH_CLAIM_PATH = "/v1/sessions/from-batch-claim"
 _MESSAGES_PATH = "/v1/messages"
 _MESSAGES_SUBMIT_PATH = "/v1/messages/submit"
 _MESSAGES_SUBMIT_VERIFIED_PATH = "/v1/messages/submit-verified"
+_MESSAGES_SUBMIT_VERIFIED_BATCH_PATH = "/v1/messages/submit-verified-batch"
 _INBOX_JOBS_PATH = "/v1/inbox-jobs"
 _EVENT_GC_PATH = "/v1/event-gc"
 _EVENT_GC_BATCH_CLEANUP_PATH = "/v1/event-gc-batch/cleanup-expired"
@@ -134,6 +135,8 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._handle_submit_message()
         elif path == _MESSAGES_SUBMIT_VERIFIED_PATH:
             self._handle_submit_verified_message()
+        elif path == _MESSAGES_SUBMIT_VERIFIED_BATCH_PATH:
+            self._handle_submit_verified_message_batch()
         elif path == _INBOX_JOBS_PATH:
             self._handle_inbox_job()
         elif path == _EVENT_GC_BATCH_CLEANUP_PATH:
@@ -2816,6 +2819,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.submit_verified_message(payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_submit_verified_message_batch(self) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.submit_verified_message_batch(
+                payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
