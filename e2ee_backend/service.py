@@ -69,6 +69,9 @@ from .storage import (
     GROUP_DEVICE_REVOKED,
     GROUP_DEVICE_UNKNOWN,
     GROUP_DUPLICATE_ID,
+    GROUP_MEMBERSHIP_NOT_ED25519,
+    GROUP_MEMBERSHIP_REVISION_MISMATCH,
+    GROUP_MEMBERSHIP_SIGNATURE_INVALID,
     GROUP_SESSION_GROUP_UNKNOWN,
     GROUP_SESSION_INITIATOR_INACTIVE,
     GROUP_SESSION_INITIATOR_NOT_MEMBER,
@@ -1636,6 +1639,131 @@ class DeviceService:
         except GroupError as error:
             raise self._group_member_error(error, group_id)
         return self.store.group_view(group)
+
+    #: Maps the verified membership change's storage failures to
+    #: (HTTP status, field); the group/actor/target reasons mirror the
+    #: ordinary mapping, the identity-key, revision and signature failures
+    #: are unique to the verified entry.
+    _GROUP_MEMBER_VERIFIED_ERROR_MAP = {
+        GROUP_UNKNOWN: (404, "group_id"),
+        GROUP_ACTOR_UNKNOWN: (404, "actor_device_id"),
+        GROUP_ACTOR_REVOKED: (409, "actor_device_id"),
+        GROUP_ACTOR_NOT_CREATOR: (409, "actor_device_id"),
+        GROUP_MEMBERSHIP_NOT_ED25519: (400, "identity_key"),
+        GROUP_MEMBERSHIP_REVISION_MISMATCH: (409, "expected_revision"),
+        GROUP_DEVICE_UNKNOWN: (404, "device_id"),
+        GROUP_DEVICE_REVOKED: (409, "device_id"),
+        GROUP_MEMBERSHIP_SIGNATURE_INVALID: (400, "signature"),
+    }
+
+    def change_group_member_verified(self, group_id: str, payload: object
+                                     ) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply a signature-authorized membership change.
+
+        ``POST /v1/groups/{group_id}/members/verified`` accepts a JSON
+        object with ``operation`` (``"add"`` or ``"remove"``),
+        ``actor_device_id``, ``device_id``, ``expected_revision`` and
+        ``signature``; extra fields are ignored. ``expected_revision`` is
+        the group's current revision: a positive integer (booleans are
+        refused) that must equal it at commit time. ``signature`` is
+        standard base64 decoding to exactly 64 bytes — an Ed25519
+        signature verified against the creator device's *current*
+        identity key over the domain-separated canonical membership
+        message (``E2EE-GROUP-MEMBERSHIP-V1``) for the path-decoded
+        ``group_id`` and the request's other four fields.
+
+        A body that is not an object is 400/field=request_body; a
+        missing/empty/wrong-typed ``operation``, ``actor_device_id`` or
+        ``device_id``, an ``operation`` other than ``add``/``remove``, a
+        missing or non-positive/boolean/non-integer ``expected_revision``
+        and a missing, empty, wrong-type, bad-encoding or wrong-length
+        ``signature`` are 400 naming that field. The state checks then
+        run atomically in the store: unknown group 404/field=group_id,
+        unknown actor 404/field=actor_device_id, a revoked or non-creator
+        actor 409/field=actor_device_id, a current identity key that is
+        not Ed25519 400/field=identity_key, a revision mismatch
+        409/field=expected_revision, an unknown target device
+        404/field=device_id, for ``add`` a revoked non-member target
+        409/field=device_id, and a failed verification
+        400/field=signature. A failed request changes neither the members
+        nor the revision.
+
+        Returns ``(view, status_code)`` with the ordinary group view: an
+        appended member is 201, an existing one 200; ``remove`` is always
+        200 — removing a non-member or the creator is a no-op. Only a
+        real membership change advances the revision.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "operation" not in payload:
+            raise ServiceError("missing required field: operation",
+                               "operation")
+        operation = payload["operation"]
+        if operation not in ("add", "remove"):
+            raise ServiceError(
+                "field must be \"add\" or \"remove\": operation",
+                "operation")
+        for name in ("actor_device_id", "device_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if "expected_revision" not in payload:
+            raise ServiceError(
+                "missing required field: expected_revision",
+                "expected_revision")
+        expected_revision = payload["expected_revision"]
+        if not isinstance(expected_revision, int) \
+                or isinstance(expected_revision, bool) \
+                or expected_revision < 1:
+            raise ServiceError(
+                "field must be a positive integer: expected_revision",
+                "expected_revision")
+        if "signature" not in payload:
+            raise ServiceError("missing required field: signature",
+                               "signature")
+        signature = decode_ed25519_signature(payload["signature"])
+        if signature is None:
+            raise ServiceError(
+                "field must be a standard base64 64-byte Ed25519 "
+                "signature: signature", "signature")
+
+        try:
+            group, changed = self.store.change_group_member_verified(
+                group_id, operation, payload["actor_device_id"],
+                payload["device_id"], expected_revision, signature)
+        except GroupError as error:
+            raise self._group_member_verified_error(error, group_id)
+        status_code = 201 if operation == "add" and changed else 200
+        return self.store.group_view(group), status_code
+
+    def _group_member_verified_error(self, error: GroupError,
+                                     group_id: str) -> ServiceError:
+        """Translate a verified membership storage failure to a ServiceError."""
+        status_code, field = self._GROUP_MEMBER_VERIFIED_ERROR_MAP[
+            error.reason]
+        if error.reason == GROUP_UNKNOWN:
+            text = f"group not found: {group_id}"
+        elif error.reason == GROUP_ACTOR_UNKNOWN:
+            text = "actor_device_id is not a registered device"
+        elif error.reason == GROUP_MEMBERSHIP_NOT_ED25519:
+            text = ("stored identity key is not an Ed25519 public key: "
+                    "identity_key")
+        elif error.reason == GROUP_MEMBERSHIP_REVISION_MISMATCH:
+            text = ("expected_revision does not match the group's current "
+                    "revision")
+        elif error.reason == GROUP_DEVICE_UNKNOWN:
+            text = "device_id is not a registered device"
+        elif error.reason == GROUP_MEMBERSHIP_SIGNATURE_INVALID:
+            text = ("group membership authorization failed verification: "
+                    "signature")
+        elif field == "actor_device_id":
+            text = "actor_device_id is revoked or is not the group creator"
+        else:
+            text = "device_id is revoked and cannot be added to the group"
+        return ServiceError(text, field, status_code=status_code)
 
     # -- group sessions ----------------------------------------------------
 
