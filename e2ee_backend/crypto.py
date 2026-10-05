@@ -39,6 +39,9 @@ SIGNED_PREKEY_PROOF_PREFIX = "E2EE-SIGNED-PREKEY-V1"
 IDENTITY_ROTATION_PREFIX = "E2EE-IDENTITY-ROTATION-V1"
 #: Domain-separation prefix for the signature-authorized device revocation.
 DEVICE_REVOCATION_PREFIX = "E2EE-DEVICE-REVOCATION-V1"
+#: Domain-separation prefix for the signature-authorized group-membership
+#: change (add/remove) message.
+GROUP_MEMBERSHIP_PREFIX = "E2EE-GROUP-MEMBERSHIP-V1"
 #: Domain-separation prefix for the identity-key fingerprint message.
 IDENTITY_FINGERPRINT_PREFIX = "E2EE-IDENTITY-FINGERPRINT-V1"
 #: Domain-separation prefix for the message-envelope AAD document.
@@ -674,6 +677,45 @@ def verify_device_revocation(identity_key: ed25519.Ed25519PublicKey,
     """
     message = device_revocation_proof_message(
         user_id, device_id, expected_version)
+    try:
+        identity_key.verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def group_membership_proof_message(group_id: str, operation: str,
+                                   actor_device_id: str, device_id: str,
+                                   expected_revision: int) -> bytes:
+    """Build the exact bytes the creator's identity key signs for a member change.
+
+    The message is the domain prefix ``E2EE-GROUP-MEMBERSHIP-V1``, one
+    newline, then compact JSON of the five fields with keys sorted
+    (``actor_device_id``, ``device_id``, ``expected_revision``, ``group_id``,
+    ``operation``) and Unicode written as-is. ``group_id`` is the
+    request's path-decoded value and the other strings are the request's
+    original strings — no trimming or normalization — and
+    ``expected_revision`` is serialized as a JSON integer.
+    """
+    document = json.dumps(
+        {"actor_device_id": actor_device_id, "device_id": device_id,
+         "expected_revision": expected_revision, "group_id": group_id,
+         "operation": operation},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (GROUP_MEMBERSHIP_PREFIX + "\n" + document).encode("utf-8")
+
+
+def verify_group_membership(identity_key: ed25519.Ed25519PublicKey,
+                            signature: bytes, group_id: str, operation: str,
+                            actor_device_id: str, device_id: str,
+                            expected_revision: int) -> bool:
+    """Verify one signature-authorized membership change against the Ed25519 key.
+
+    Returns ``True`` iff *signature* is valid over
+    :func:`group_membership_proof_message` for the five field values.
+    """
+    message = group_membership_proof_message(
+        group_id, operation, actor_device_id, device_id, expected_revision)
     try:
         identity_key.verify(signature, message)
     except InvalidSignature:

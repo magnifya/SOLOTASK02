@@ -59,6 +59,7 @@ from .crypto import (
     load_ed25519_public_key,
     same_ed25519_public_key,
     verify_device_revocation,
+    verify_group_membership,
     verify_identity_rotation,
     verify_message_signature,
     verify_signed_prekey,
@@ -194,6 +195,10 @@ GROUP_ACTOR_REVOKED = "actor_revoked"
 GROUP_ACTOR_NOT_CREATOR = "actor_not_creator"
 GROUP_DEVICE_UNKNOWN = "group_device_unknown"
 GROUP_DEVICE_REVOKED = "group_device_revoked"
+#: Outcome codes for a signature-authorized group-membership change.
+GROUP_MEMBERSHIP_NOT_ED25519 = "group_membership_not_ed25519"
+GROUP_MEMBERSHIP_REVISION_MISMATCH = "group_membership_revision_mismatch"
+GROUP_MEMBERSHIP_SIGNATURE_INVALID = "group_membership_signature_invalid"
 
 #: Outcome codes for group-session creation.
 GROUP_SESSION_GROUP_UNKNOWN = "group_unknown"
@@ -2755,6 +2760,82 @@ class DeviceStore:
                 group.revision += 1
                 self._notify_change()
             return group
+
+    def change_group_member_verified(
+            self, group_id: str, operation: str, actor_device_id: str,
+            device_id: str, expected_revision: int,
+            signature: bytes) -> Tuple[Group, bool]:
+        """Atomically apply a signature-authorized membership change.
+
+        The whole check-and-mutate runs under the same store lock ordinary
+        membership changes, device revocations and identity rotations take,
+        so the authorization is always checked against the creator device's
+        *current* identity key and the group's *current* revision: a
+        concurrent rotation, revocation or membership change that commits
+        first changes the state the authorization was issued for, and the
+        stale authorization then fails here. The checks and the write are
+        one linearizable transaction.
+
+        *operation* is ``"add"`` or ``"remove"``; *signature* is an
+        already-decoded 64-byte Ed25519 signature over the domain-separated
+        canonical membership message (``E2EE-GROUP-MEMBERSHIP-V1``) for the
+        request's ``group_id`` / ``operation`` / ``actor_device_id`` /
+        ``device_id`` / ``expected_revision`` values; the caller has
+        already validated the request fields and the signature encoding.
+
+        Checks run in a fixed order: unknown group ->
+        :class:`GroupError` ``group_unknown`` (404); unknown actor ->
+        ``actor_unknown`` (404); revoked or non-creator actor ->
+        ``actor_revoked`` / ``actor_not_creator`` (409); a current actor
+        identity key that is not Ed25519 ->
+        ``group_membership_not_ed25519`` (400/identity_key);
+        ``expected_revision`` different from the group's current revision
+        -> ``group_membership_revision_mismatch`` (409/expected_revision);
+        unknown target device -> ``group_device_unknown`` (404); an
+        ``add`` whose target is revoked and not already a member ->
+        ``group_device_revoked`` (409); a signature that does not verify
+        against the actor's current identity key ->
+        ``group_membership_signature_invalid`` (400/signature).
+
+        Returns ``(group, created)``: ``created`` is True only for an
+        ``add`` that appended a new member (201). An ``add`` naming an
+        existing member (even a revoked one) is a 200 no-op; a ``remove``
+        of a current member (revoked or not) drops it and advances the
+        revision, while removing a non-member or the creator is a 200
+        no-op. Only a real roster change advances the revision and
+        persists. On any failure nothing is written.
+        """
+        with self._lock:
+            group = self._authorize_group_actor(group_id, actor_device_id)
+            actor = self._find_device(actor_device_id)
+            current = load_ed25519_public_key(actor.identity_key)
+            if current is None:
+                raise GroupError(GROUP_MEMBERSHIP_NOT_ED25519)
+            if group.revision != expected_revision:
+                raise GroupError(GROUP_MEMBERSHIP_REVISION_MISMATCH)
+            target = self._find_device(device_id)
+            if target is None:
+                raise GroupError(GROUP_DEVICE_UNKNOWN)
+            if operation == "add" and target.revoked \
+                    and device_id not in group.members:
+                raise GroupError(GROUP_DEVICE_REVOKED)
+            if not verify_group_membership(
+                    current, signature, group_id, operation,
+                    actor_device_id, device_id, expected_revision):
+                raise GroupError(GROUP_MEMBERSHIP_SIGNATURE_INVALID)
+            if operation == "add":
+                if device_id in group.members:
+                    return group, False
+                group.members.append(device_id)
+                group.revision += 1
+                self._notify_change()
+                return group, True
+            if device_id != group.creator_device_id \
+                    and device_id in group.members:
+                group.members.remove(device_id)
+                group.revision += 1
+                self._notify_change()
+            return group, False
 
     def group_session_view(self, session: GroupSession) -> Dict[str, Any]:
         """Copy one group session into its public seven-field view."""

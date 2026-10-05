@@ -283,6 +283,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] and parts[1] == "members":
             self._handle_add_group_member(unquote(parts[0]))
         elif (len(parts) == 3 and parts[0] and parts[1] == "members"
+                and parts[2] == "verified"):
+            self._handle_change_group_member_verified(unquote(parts[0]))
+        elif (len(parts) == 3 and parts[0] and parts[1] == "members"
                 and parts[2] in ("add", "remove")):
             group_id = unquote(parts[0])
             if parts[2] == "add":
@@ -1503,6 +1506,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(error.status_code, error.to_body())
             return
         self._send_json(200, body)
+
+    def _handle_change_group_member_verified(self, group_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.change_group_member_verified(
+                group_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
 
     def _handle_create_group_session(self) -> None:
         payload = self._read_json_request()
