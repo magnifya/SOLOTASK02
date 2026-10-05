@@ -1,6 +1,7 @@
 """Tests for offline Ed25519 ciphertext-envelope signing and verification.
 
-Covers the Python entry points ``sign_message`` and ``verify_message``.
+Covers the Python entry points ``sign_message`` and ``verify_message`` and
+the ``sign-message``/``verify-message`` CLI commands (real subprocesses).
 Signing is purely local: an Ed25519 identity private key seed signs the
 public ``E2EE-SIGNED-MESSAGE-V1`` message over the same six envelope fields
 a message submission freezes (``session_id``, ``sender_device_id``,
@@ -15,6 +16,9 @@ the private seed never appears in the result.
 import base64
 import json
 import os
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from cryptography.hazmat.primitives import serialization
@@ -26,6 +30,10 @@ from e2ee_backend.crypto import (CryptoError, identity_fingerprint,
 _ENVELOPE_FIELDS = ("session_id", "sender_device_id", "message_id",
                     "sequence", "nonce", "ciphertext")
 _SIGNED_FIELDS = (*_ENVELOPE_FIELDS, "identity_key", "signature")
+
+#: Repository root, prepended onto PYTHONPATH so subprocesses resolve the
+#: package regardless of their working directory.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _seed_b64(private) -> str:
@@ -616,6 +624,295 @@ class VerifyMessageTest(unittest.TestCase):
         with self.assertRaises(CryptoError) as ctx:
             verify_message(envelope, self.sid, self.dev, "bad")
         self.assertEqual(ctx.exception.field, "expected_fingerprint")
+
+
+class SignMessageCLITest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.private = ed25519.Ed25519PrivateKey.generate()
+        self.seed = _seed_b64(self.private)
+        self.identity = _raw_b64(self.private.public_key())
+        self.fingerprint = identity_fingerprint(self.identity)
+        self.envelope = {
+            "session_id": "sess-1",
+            "sender_device_id": "dev-1",
+            "message_id": "msg-1",
+            "sequence": 1,
+            "nonce": base64.b64encode(os.urandom(12)).decode(),
+            "ciphertext": base64.b64encode(os.urandom(32)).decode(),
+        }
+        self.env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        self.env["PYTHONPATH"] = (
+            _REPO_ROOT + (os.pathsep + existing_pythonpath
+                          if existing_pythonpath else ""))
+
+    def _run(self, *arguments: str, text: bool = True):
+        return subprocess.run(
+            [sys.executable, "-m", "e2ee_backend", "sign-message",
+             *arguments],
+            capture_output=True, env=self.env, timeout=15, text=text)
+
+    def _good_args(self, envelope=None, private_key=None):
+        return ("--envelope",
+                json.dumps(self.envelope) if envelope is None else envelope,
+                "--private-key",
+                self.seed if private_key is None else private_key)
+
+    def test_success_single_line_eight_fields(self) -> None:
+        result = self._run(*self._good_args())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        line = result.stdout.rstrip("\n")
+        self.assertEqual(line.count("\n"), 0)
+        body = json.loads(line)
+        self.assertEqual(body, sign_message(self.envelope, self.seed))
+        self.assertEqual(set(body), set(_SIGNED_FIELDS))
+        self.assertEqual(body["identity_key"], self.identity)
+        self.assertNotIn(self.seed, line)
+
+    def test_non_ascii_and_spaces_passthrough_unescaped(self) -> None:
+        envelope = dict(self.envelope, session_id=" 会话/s ",
+                        sender_device_id=" dev/一 ", message_id=" 消息/m ")
+        result = self._run(*self._good_args(envelope=json.dumps(
+            envelope, ensure_ascii=False)), text=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        raw = result.stdout.rstrip(b"\n")
+        self.assertEqual(raw.count(b"\n"), 0)
+        self.assertIn(" 会话/s ".encode("utf-8"), raw)
+        body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(body["session_id"], " 会话/s ")
+        self.assertEqual(body["sender_device_id"], " dev/一 ")
+
+    def test_envelope_from_at_file(self) -> None:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", suffix=".json", delete=False) as handle:
+            json.dump(dict(self.envelope, extra="ignored"), handle)
+            path = handle.name
+        try:
+            result = self._run("--envelope", "@" + path,
+                               "--private-key", self.seed)
+        finally:
+            os.unlink(path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads(result.stdout)
+        self.assertEqual(set(body), set(_SIGNED_FIELDS))
+
+    def test_two_invocations_are_identical(self) -> None:
+        first = self._run(*self._good_args())
+        second = self._run(*self._good_args())
+        self.assertEqual(first.stdout, second.stdout)
+
+    def test_output_verifies_with_verify_message_cli(self) -> None:
+        signed = self._run(*self._good_args())
+        verified = subprocess.run(
+            [sys.executable, "-m", "e2ee_backend", "verify-message",
+             "--envelope", signed.stdout.strip(),
+             "--session-id", "sess-1", "--sender-device-id", "dev-1",
+             "--expected-fingerprint", self.fingerprint],
+            capture_output=True, env=self.env, timeout=15, text=True)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(verified.stderr, "")
+        body = json.loads(verified.stdout)
+        self.assertEqual(body["fingerprint"], self.fingerprint)
+        self.assertEqual(body["signature"],
+                         json.loads(signed.stdout)["signature"])
+
+    def _run_error(self, *arguments: str) -> dict:
+        result = self._run(*arguments)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("Traceback", result.stderr)
+        line = result.stderr.rstrip("\n")
+        self.assertEqual(line.count("\n"), 0)
+        body = json.loads(line)
+        self.assertEqual(set(body), {"message", "field"})
+        return body
+
+    def test_missing_each_option_names_its_field(self) -> None:
+        for option, field in (("--envelope", "envelope"),
+                              ("--private-key", "private_key")):
+            args = list(self._good_args())
+            index = args.index(option)
+            del args[index:index + 2]
+            with self.subTest(option=option):
+                body = self._run_error(*args)
+                self.assertEqual(body["field"], field)
+
+    def test_envelope_json_and_file_failures_name_envelope(self) -> None:
+        body = self._run_error(*self._good_args(envelope="not json"))
+        self.assertEqual(body["field"], "envelope")
+        body = self._run_error(*self._good_args(envelope="[1, 2]"))
+        self.assertEqual(body["field"], "envelope")
+        body = self._run_error(
+            *self._good_args(envelope="@/nonexistent/envelope.json"))
+        self.assertEqual(body["field"], "envelope")
+
+    def test_envelope_field_failures_name_that_field(self) -> None:
+        envelope = dict(self.envelope)
+        del envelope["nonce"]
+        body = self._run_error(*self._good_args(envelope=json.dumps(envelope)))
+        self.assertEqual(body["field"], "nonce")
+        body = self._run_error(*self._good_args(
+            envelope=json.dumps(dict(self.envelope, sequence=0))))
+        self.assertEqual(body["field"], "sequence")
+
+    def test_private_key_direct_text_only(self) -> None:
+        # @path, PEM, hex, whitespace and URL-safe spellings are all
+        # rejected as private_key, never opened or decoded. The URL-safe
+        # spelling of 32 0xff bytes is all "_", so it always exercises the
+        # URL-safe alphabet regardless of the random seed's characters.
+        pkcs8_pem = self.private.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()).decode()
+        for bad in ("@/nonexistent/seed.b64", pkcs8_pem,
+                    base64.b64decode(self.seed).hex(),
+                    self.seed + " ", self.seed.rstrip("="),
+                    base64.urlsafe_b64encode(b"\xff" * 32).decode()):
+            with self.subTest(bad=bad[:16]):
+                body = self._run_error(*self._good_args(private_key=bad))
+                self.assertEqual(body["field"], "private_key")
+                self.assertNotIn(self.seed, body["message"])
+
+    def test_success_does_not_touch_filesystem_state(self) -> None:
+        directory = tempfile.mkdtemp()
+        before = set(os.listdir(directory))
+        result = subprocess.run(
+            [sys.executable, "-m", "e2ee_backend", "sign-message",
+             *self._good_args()],
+            capture_output=True, env=self.env, timeout=15, text=True,
+            cwd=directory)
+        try:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(set(os.listdir(directory)), before)
+        finally:
+            os.rmdir(directory)
+
+
+class VerifyMessageCLITest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.private = ed25519.Ed25519PrivateKey.generate()
+        self.seed = _seed_b64(self.private)
+        self.identity = _raw_b64(self.private.public_key())
+        self.fingerprint = identity_fingerprint(self.identity)
+        self.envelope = {
+            "session_id": "sess-1",
+            "sender_device_id": "dev-1",
+            "message_id": "msg-1",
+            "sequence": 1,
+            "nonce": base64.b64encode(os.urandom(12)).decode(),
+            "ciphertext": base64.b64encode(os.urandom(32)).decode(),
+        }
+        self.signed = sign_message(self.envelope, self.seed)
+        self.env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        self.env["PYTHONPATH"] = (
+            _REPO_ROOT + (os.pathsep + existing_pythonpath
+                          if existing_pythonpath else ""))
+
+    def _run(self, *arguments: str, text: bool = True):
+        return subprocess.run(
+            [sys.executable, "-m", "e2ee_backend", "verify-message",
+             *arguments],
+            capture_output=True, env=self.env, timeout=15, text=text)
+
+    def _good_args(self, envelope=None, session_id="sess-1",
+                   sender_device_id="dev-1", fingerprint=None):
+        return ("--envelope",
+                json.dumps(self.signed) if envelope is None else envelope,
+                "--session-id", session_id,
+                "--sender-device-id", sender_device_id,
+                "--expected-fingerprint",
+                self.fingerprint if fingerprint is None else fingerprint)
+
+    def test_success_single_line_nine_fields(self) -> None:
+        result = self._run(*self._good_args())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        line = result.stdout.rstrip("\n")
+        self.assertEqual(line.count("\n"), 0)
+        body = json.loads(line)
+        self.assertEqual(set(body), set(_SIGNED_FIELDS) | {"fingerprint"})
+        for name in _SIGNED_FIELDS:
+            self.assertEqual(body[name], self.signed[name])
+        self.assertEqual(body["fingerprint"], self.fingerprint)
+
+    def test_envelope_from_at_file_and_extra_fields_ignored(self) -> None:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", suffix=".json", delete=False) as handle:
+            json.dump(dict(self.signed, extra="ignored"), handle)
+            path = handle.name
+        try:
+            result = self._run(*self._good_args(envelope="@" + path))
+        finally:
+            os.unlink(path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads(result.stdout)
+        self.assertEqual(set(body), set(_SIGNED_FIELDS) | {"fingerprint"})
+
+    def test_old_envelope_verifies_with_old_fingerprint_after_rotation(
+            self) -> None:
+        rotated = ed25519.Ed25519PrivateKey.generate()
+        new_fingerprint = identity_fingerprint(_raw_b64(
+            rotated.public_key()))
+        result = self._run(*self._good_args())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["fingerprint"],
+                         self.fingerprint)
+        body = self._run_error(*self._good_args(fingerprint=new_fingerprint))
+        self.assertEqual(body["field"], "expected_fingerprint")
+
+    def _run_error(self, *arguments: str) -> dict:
+        result = self._run(*arguments)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("Traceback", result.stderr)
+        line = result.stderr.rstrip("\n")
+        self.assertEqual(line.count("\n"), 0)
+        body = json.loads(line)
+        self.assertEqual(set(body), {"message", "field"})
+        return body
+
+    def test_missing_each_option_names_its_field(self) -> None:
+        for option, field in (("--envelope", "envelope"),
+                              ("--session-id", "session_id"),
+                              ("--sender-device-id", "sender_device_id"),
+                              ("--expected-fingerprint",
+                               "expected_fingerprint")):
+            args = list(self._good_args())
+            index = args.index(option)
+            del args[index:index + 2]
+            with self.subTest(option=option):
+                body = self._run_error(*args)
+                self.assertEqual(body["field"], field)
+
+    def test_envelope_json_and_file_failures_name_envelope(self) -> None:
+        body = self._run_error(*self._good_args(envelope="not json"))
+        self.assertEqual(body["field"], "envelope")
+        body = self._run_error(*self._good_args(envelope="[1, 2]"))
+        self.assertEqual(body["field"], "envelope")
+        body = self._run_error(
+            *self._good_args(envelope="@/nonexistent/envelope.json"))
+        self.assertEqual(body["field"], "envelope")
+
+    def test_mismatched_identifiers_name_their_field(self) -> None:
+        body = self._run_error(*self._good_args(session_id="other"))
+        self.assertEqual(body["field"], "session_id")
+        body = self._run_error(*self._good_args(sender_device_id="other"))
+        self.assertEqual(body["field"], "sender_device_id")
+
+    def test_tampered_field_fails_signature(self) -> None:
+        bad = dict(self.signed, message_id=self.signed["message_id"] + "x")
+        body = self._run_error(*self._good_args(envelope=json.dumps(bad)))
+        self.assertEqual(body["field"], "signature")
+
+    def test_bad_identity_key_and_signature_name_their_field(self) -> None:
+        body = self._run_error(*self._good_args(
+            envelope=json.dumps(dict(self.signed, identity_key="not-a-key"))))
+        self.assertEqual(body["field"], "identity_key")
+        body = self._run_error(*self._good_args(
+            envelope=json.dumps(dict(self.signed, signature="!!!"))))
+        self.assertEqual(body["field"], "signature")
 
 
 if __name__ == "__main__":
