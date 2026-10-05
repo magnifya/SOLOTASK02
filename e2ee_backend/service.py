@@ -87,6 +87,8 @@ from .storage import (
     MESSAGE_DUPLICATE_ID,
     MESSAGE_DUPLICATE_NONCE,
     MESSAGE_IDENTITY_KEY_CONFLICT,
+    MESSAGE_MESSAGE_UNKNOWN,
+    MESSAGE_PROOF_ABSENT,
     MESSAGE_REQUEST_ID_CONFLICT,
     MESSAGE_SENDER_INACTIVE,
     MESSAGE_SESSION_UNKNOWN,
@@ -6188,6 +6190,45 @@ class DeviceService:
                                    "device_id", status_code=409)
             raise  # pragma: no cover - defensive
         return {"messages": messages, "next_after": next_after}
+
+    def message_proof(self, session_id: str, message_id: str,
+                      device_id: str) -> Dict[str, Any]:
+        """Return one message's frozen signature proof (a pure read).
+
+        The session is resolved first (unknown is 404/field=session_id),
+        then the reader's eligibility: a 1:1 session is readable by any
+        active registered device, a group session only by an active device
+        frozen into its member snapshot — an unknown, revoked or
+        ineligible device is 409/field=device_id. An unknown message id is
+        404/field=message_id; a message that exists but was not committed
+        through the verified submission entry (ordinary submit, direct
+        send or legacy data) has no proof and is 409/field=signature — the
+        query never backfills one. The answer freezes the first verified
+        submission's eight values (the six envelope fields plus
+        ``identity_key`` and ``signature``), so identity rotations, sender
+        revocations, group roster changes and session rotations after the
+        commit do not alter it. The query changes no cursor, delivery
+        state, audit chain or commit generation.
+        """
+        try:
+            return self.store.message_proof(session_id, message_id,
+                                            device_id)
+        except MessageListError as error:
+            if error.reason == MESSAGE_SESSION_UNKNOWN:
+                raise ServiceError(f"session not found: {session_id}",
+                                   "session_id", status_code=404)
+            if error.reason == MESSAGE_DEVICE_INACTIVE:
+                raise ServiceError(
+                    "device_id is not an active eligible reader",
+                    "device_id", status_code=409)
+            if error.reason == MESSAGE_MESSAGE_UNKNOWN:
+                raise ServiceError(f"message not found: {message_id}",
+                                   "message_id", status_code=404)
+            if error.reason == MESSAGE_PROOF_ABSENT:
+                raise ServiceError(
+                    "message has no saved signature proof: signature",
+                    "signature", status_code=409)
+            raise  # pragma: no cover - defensive
 
     # -- reliable delivery -------------------------------------------------
 

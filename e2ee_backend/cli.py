@@ -531,6 +531,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--device-id", required=True)
     p_status.set_defaults(handler=cmd_message_status)
 
+    # The arguments are deliberately not marked required=True: a missing
+    # argument must surface through the same single-line JSON error
+    # contract (exit 1) as an HTTP failure, not as an argparse usage error.
+    p_message_proof = sub.add_parser(
+        "message-proof",
+        help="show a message's frozen signature proof")
+    p_message_proof.add_argument("session_id", nargs="?", default=None)
+    p_message_proof.add_argument("message_id", nargs="?", default=None)
+    p_message_proof.add_argument("--device-id", default=None)
+    p_message_proof.set_defaults(handler=cmd_message_proof)
+
     p_encrypt = sub.add_parser(
         "encrypt-message",
         help="encrypt a plaintext locally with AES-256-GCM (no server needed)")
@@ -1399,6 +1410,37 @@ def cmd_message_status(args: argparse.Namespace) -> int:
     query = urlencode({"device_id": args.device_id})
     url = (f"{args.base_url}/v1/messages/"
            f"{quote(args.session_id, safe='')}/status/"
+           f"{quote(args.message_id, safe='')}?{query}")
+    try:
+        status, response = _request_json("GET", url)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_message_proof(args: argparse.Namespace) -> int:
+    """Call GET /v1/messages/{sid}/proof/{mid}?device_id=….
+
+    Success (200) prints the server's single-line JSON proof on stdout and
+    exits 0. A missing argument, any HTTP failure or a connection failure
+    prints one single-line JSON object with ``message`` and ``field`` on
+    stderr (stdout stays empty) and exits 1 — a missing argument names its
+    own input (``session_id``/``message_id``/``device_id``), a connection
+    failure names ``server``.
+    """
+    from urllib.parse import quote, urlencode
+
+    for value, field in ((args.session_id, "session_id"),
+                         (args.message_id, "message_id"),
+                         (args.device_id, "device_id")):
+        if not value:
+            print(json.dumps({"message": f"missing required argument: {field}",
+                              "field": field}, separators=(",", ":")),
+                  file=sys.stderr)
+            return 1
+    query = urlencode({"device_id": args.device_id})
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}/proof/"
            f"{quote(args.message_id, safe='')}?{query}")
     try:
         status, response = _request_json("GET", url)

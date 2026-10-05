@@ -128,6 +128,12 @@ MESSAGE_SIGNATURE_INVALID = "message_signature_invalid"
 #: Outcome code for a failed message listing.
 MESSAGE_DEVICE_INACTIVE = "device_inactive"
 
+#: Outcome codes for a failed message-proof query: the message id does not
+#: exist in the session (404/field=message_id), or the message exists but
+#: carries no saved signature proof (409/field=signature).
+MESSAGE_MESSAGE_UNKNOWN = "message_unknown"
+MESSAGE_PROOF_ABSENT = "proof_absent"
+
 #: Outcome codes for delivery (retry/ack/status) failures.
 DELIVERY_SESSION_UNKNOWN = "session_unknown"
 DELIVERY_MESSAGE_UNKNOWN = "message_unknown"
@@ -8606,6 +8612,68 @@ class DeviceStore:
             page = [m for m in stream if m.sequence > after][:limit]
             next_after = page[-1].sequence if page else after
             return [self.message_view(m) for m in page], next_after
+
+    def message_proof(self, session_id: str, message_id: str,
+                      device_id: str) -> Dict[str, Any]:
+        """Atomically read one message's frozen signature proof.
+
+        The checks run in one fixed order under the store lock, so a
+        concurrent submission, revocation or rotation is linearized either
+        wholly before or wholly after this read: unknown session (1:1 and
+        group sessions both qualify) -> ``session_unknown``; the querying
+        device unknown or revoked, or — for a group session — not frozen
+        into the member snapshot -> ``device_inactive`` (a 1:1 session is
+        readable by any active registered device); unknown message id ->
+        ``message_unknown``; the message exists but was not committed
+        through the verified submission entry (ordinary submit, direct
+        send or legacy data) -> ``proof_absent``. The query never backfills
+        a proof and changes nothing: no cursor, delivery state, audit chain
+        or commit generation moves.
+
+        Returns the eight-field proof view — the six committed envelope
+        fields plus the ``identity_key`` spelling and ``signature`` frozen
+        at the first successful verified submission — directly acceptable
+        by :func:`e2ee_backend.crypto.verify_message`.
+        """
+        with self._lock:
+            group_session = self._group_sessions.get(session_id)
+            if session_id not in self._sessions and group_session is None:
+                raise MessageListError(MESSAGE_SESSION_UNKNOWN)
+
+            device_key = self._device_index.get(device_id)
+            device = (self._devices.get(device_key)
+                      if device_key is not None else None)
+            if device is None or device.revoked:
+                raise MessageListError(MESSAGE_DEVICE_INACTIVE)
+            # Group sessions are readable by the frozen member set only; a
+            # device added or removed after the freeze is not a reader.
+            if group_session is not None and device_id not in \
+                    group_session.members:
+                raise MessageListError(MESSAGE_DEVICE_INACTIVE)
+
+            message = next((m for m in self._messages.get(session_id, [])
+                            if m.message_id == message_id), None)
+            if message is None:
+                raise MessageListError(MESSAGE_MESSAGE_UNKNOWN)
+            # Message ids are unique within a session, so at most one
+            # verified submission record can carry this (session, message)
+            # pair; the record freezes the first submission's values.
+            record = next(
+                (r for r in self._verified_message_submissions.values()
+                 if r.session_id == session_id
+                 and r.message_id == message_id), None)
+            if record is None:
+                raise MessageListError(MESSAGE_PROOF_ABSENT)
+            return {
+                "session_id": record.session_id,
+                "sender_device_id": record.sender_device_id,
+                "message_id": record.message_id,
+                "sequence": record.sequence,
+                "nonce": record.nonce,
+                "ciphertext": record.ciphertext,
+                "identity_key": record.identity_key,
+                "signature": record.signature,
+            }
 
     # -- delivery (reliable retry/ack/status) ------------------------------
 

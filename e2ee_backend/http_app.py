@@ -979,6 +979,28 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 if len(parts) == 3 and parts[1] == "status" and parts[0] and parts[2]:
                     self._handle_message_status(
                         unquote(parts[0]), unquote(parts[2]))
+                elif len(parts) == 3 and parts[1] == "proof":
+                    # {session_id}/proof/{message_id} — split on raw
+                    # slashes only; a percent-encoded slash inside either
+                    # id segment is part of it. Each segment is strictly
+                    # percent-decoded as UTF-8 (session first): a bad
+                    # escape, invalid UTF-8 or an empty decoded identifier
+                    # is 400 naming that identifier.
+                    session_id = _strict_percent_decode(parts[0])
+                    if not session_id:
+                        self._send_json(400, {
+                            "message": "session_id must decode to a "
+                                       "non-empty UTF-8 string",
+                            "field": "session_id"})
+                        return
+                    message_id = _strict_percent_decode(parts[2])
+                    if not message_id:
+                        self._send_json(400, {
+                            "message": "message_id must decode to a "
+                                       "non-empty UTF-8 string",
+                            "field": "message_id"})
+                        return
+                    self._handle_message_proof(session_id, message_id)
                 else:
                     self._send_json(404, {"message": "session not found",
                                           "field": "session_id"})
@@ -2939,6 +2961,28 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         try:
             body = self.service.message_status(
                 session_id, message_id, device_id)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(200, body)
+
+    def _handle_message_proof(self, session_id: str, message_id: str) -> None:
+        # A pure read: any other query parameter and any request body are
+        # ignored; only device_id is validated — it must appear exactly
+        # once with a non-empty value (keep_blank_values so an explicit
+        # ``device_id=`` counts as an empty occurrence rather than
+        # vanishing).
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        values = query.get("device_id", [])
+        if len(values) != 1 or not values[0]:
+            self._send_json(400, {
+                "message": "device_id must appear exactly once with a "
+                           "non-empty value",
+                "field": "device_id"})
+            return
+        try:
+            body = self.service.message_proof(
+                session_id, message_id, values[0])
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
