@@ -101,6 +101,9 @@ from .storage import (
     MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT,
     MESSAGE_SYNC_DEVICE_UNKNOWN,
     MESSAGE_SYNC_SESSION_UNKNOWN,
+    MESSAGE_SYNC_ACK_NOT_ED25519,
+    MESSAGE_SYNC_ACK_SIGNATURE_INVALID,
+    MESSAGE_SYNC_ACK_VERSION_MISMATCH,
     INBOX_RETRY_MESSAGE_ACKED,
     INBOX_RETRY_MESSAGE_UNKNOWN,
     INBOX_RETRY_NOT_RECIPIENT,
@@ -2110,6 +2113,32 @@ class DeviceService:
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object",
                                "request_body")
+        items = self._sync_ack_items(payload)
+
+        try:
+            results, any_advanced = self.store.message_sync_ack_batch(
+                device_id, items)
+        except MessageSyncError as error:
+            # Batch-level device failure (unknown/revoked): 409/device_id.
+            raise self._message_sync_error(error, device_id)
+        except MessageSyncAckBatchError as error:
+            raise self._sync_ack_batch_item_error(error, items)
+        body = {"device_id": device_id, "results": results}
+        return body, 201 if any_advanced else 200
+
+    @staticmethod
+    def _sync_ack_items(payload: Dict[str, Any]) -> List[Tuple[str, int]]:
+        """Validate the ``items`` array of a 1:1 batch sync-ack body.
+
+        Shared by the plain and the signature-authorized batch entries:
+        ``items`` must be a non-empty array of objects, each with a
+        non-empty string ``session_id`` and a non-negative non-bool integer
+        ``cursor``, with no repeated session. Shape errors are reported, in
+        order, as 400/field ``items`` (missing/not-a-non-empty-array),
+        ``items[i]`` (non-object element or repeated session) or
+        ``items[i].session_id`` / ``items[i].cursor`` for the offending
+        field. Returns the ``(session_id, cursor)`` pairs in array order.
+        """
         if "items" not in payload:
             raise ServiceError("missing required field: items", "items")
         raw_items = payload["items"]
@@ -2152,31 +2181,130 @@ class DeviceService:
                     f"{element['session_id']}", item_field)
             seen_sessions.add(element["session_id"])
             items.append((element["session_id"], cursor))
+        return items
+
+    @staticmethod
+    def _sync_ack_batch_item_error(
+            error: MessageSyncAckBatchError,
+            items: List[Tuple[str, int]]) -> ServiceError:
+        """Translate one item-level batch sync-ack failure to a ServiceError."""
+        session_id = items[error.index][0]
+        status_code, _ = DeviceService._MESSAGE_SYNC_ERROR_MAP[error.reason]
+        if error.reason == MESSAGE_SYNC_SESSION_UNKNOWN:
+            field = f"items[{error.index}].session_id"
+            text = f"session not found: {session_id}"
+        elif error.reason == MESSAGE_SYNC_CURSOR_CONFLICT:
+            field = f"items[{error.index}].cursor"
+            text = "cursor is out of range or moved backwards"
+        else:
+            # A group session, or a 1:1 session the device is not the
+            # recipient of, is not ack-able here.
+            field = f"items[{error.index}].session_id"
+            text = ("session is a group session or device is not its "
+                    "recipient")
+        return ServiceError(text, field, status_code=status_code)
+
+    def sync_device_ack_batch_verified(
+            self, device_id: str,
+            payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply a signature-authorized multi-session sync-ack.
+
+        ``POST /v1/devices/{device_id}/sync/ack-batch-verified``. The body
+        must be an object carrying the same ``items`` array as the plain
+        batch entry plus ``expected_version`` and ``signature``; any other
+        field is ignored. ``expected_version`` is the device's current
+        ``identity_key_version``: a positive integer (booleans are
+        refused). ``signature`` is standard base64 decoding to exactly 64
+        bytes — an Ed25519 signature verified against the device's current
+        identity key over the domain-separated canonical message
+        (``E2EE-SYNC-ACK-V1``) for the stored ``user_id``, the path-decoded
+        ``device_id``, ``expected_version`` and the validated items (each
+        contributing only its verbatim ``session_id`` and integer
+        ``cursor``, array order preserved).
+
+        Shape errors are reported, in order, as 400/field ``request_body``
+        (bad/non-object body), the same ``items`` errors as the plain
+        batch entry, ``expected_version`` (missing, not a positive integer
+        or a boolean) and ``signature`` (missing, not a non-empty string,
+        bad encoding or wrong length). The device/identity/version/
+        signature checks then run atomically in the store, before any item
+        check: unknown device is 404/field=device_id, revoked
+        409/field=device_id, a current identity key that is not Ed25519
+        400/field=identity_key, a version mismatch
+        409/field=expected_version and a failed verification
+        400/field=signature — the authorization is checked even when every
+        cursor equals the stored one. Session and cursor checks then
+        follow the plain batch entry's order and error rules, the first
+        error aborting the whole batch with nothing written.
+
+        On success the response is the plain batch entry's body
+        (``device_id`` then ``results``) and status: 201 when at least one
+        cursor advanced, 200 otherwise (writing nothing). On any failure
+        no acknowledgement, cursor, timestamp or durable generation
+        changes.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        items = self._sync_ack_items(payload)
+        if "expected_version" not in payload:
+            raise ServiceError(
+                "missing required field: expected_version",
+                "expected_version")
+        expected_version = payload["expected_version"]
+        if not isinstance(expected_version, int) \
+                or isinstance(expected_version, bool) \
+                or expected_version < 1:
+            raise ServiceError(
+                "field must be a positive integer: expected_version",
+                "expected_version")
+        if "signature" not in payload:
+            raise ServiceError("missing required field: signature",
+                               "signature")
+        if not is_nonempty_string(payload["signature"]):
+            raise ServiceError(
+                "field must be a non-empty string: signature", "signature")
+        signature = decode_ed25519_signature(payload["signature"])
+        if signature is None:
+            raise ServiceError(
+                "field must be a standard base64 64-byte Ed25519 "
+                "signature: signature", "signature")
 
         try:
-            results, any_advanced = self.store.message_sync_ack_batch(
-                device_id, items)
+            results, any_advanced = \
+                self.store.message_sync_ack_batch_verified(
+                    device_id, items, expected_version, signature)
         except MessageSyncError as error:
-            # Batch-level device failure (unknown/revoked): 409/device_id.
-            raise self._message_sync_error(error, device_id)
+            raise self._sync_ack_verified_error(error, device_id)
         except MessageSyncAckBatchError as error:
-            session_id = items[error.index][0]
-            status_code, _ = self._MESSAGE_SYNC_ERROR_MAP[error.reason]
-            if error.reason == MESSAGE_SYNC_SESSION_UNKNOWN:
-                field = f"items[{error.index}].session_id"
-                text = f"session not found: {session_id}"
-            elif error.reason == MESSAGE_SYNC_CURSOR_CONFLICT:
-                field = f"items[{error.index}].cursor"
-                text = "cursor is out of range or moved backwards"
-            else:
-                # A group session, or a 1:1 session the device is not the
-                # recipient of, is not ack-able here.
-                field = f"items[{error.index}].session_id"
-                text = ("session is a group session or device is not its "
-                        "recipient")
-            raise ServiceError(text, field, status_code=status_code)
+            raise self._sync_ack_batch_item_error(error, items)
         body = {"device_id": device_id, "results": results}
         return body, 201 if any_advanced else 200
+
+    @staticmethod
+    def _sync_ack_verified_error(error: MessageSyncError,
+                                 device_id: str) -> ServiceError:
+        """Translate a verified batch sync-ack device-level failure."""
+        if error.reason == MESSAGE_SYNC_DEVICE_UNKNOWN:
+            return ServiceError(f"device not found: {device_id}",
+                                "device_id", status_code=404)
+        if error.reason == MESSAGE_SYNC_DEVICE_INACTIVE:
+            return ServiceError("device_id is revoked",
+                                "device_id", status_code=409)
+        if error.reason == MESSAGE_SYNC_ACK_NOT_ED25519:
+            return ServiceError(
+                "stored identity key is not an Ed25519 public key: "
+                "identity_key", "identity_key")
+        if error.reason == MESSAGE_SYNC_ACK_VERSION_MISMATCH:
+            return ServiceError(
+                "expected_version does not match the device's current "
+                "identity_key_version",
+                "expected_version", status_code=409)
+        if error.reason == MESSAGE_SYNC_ACK_SIGNATURE_INVALID:
+            return ServiceError(
+                "sync-ack authorization failed verification: signature",
+                "signature")
+        raise  # pragma: no cover - defensive
 
     def sync_group_ack_batch(self, device_id: str,
                              payload: object) -> Tuple[Dict[str, Any], int]:

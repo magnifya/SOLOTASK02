@@ -24,7 +24,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 
 #: AES-GCM nonce size in bytes (96-bit nonces, as recommended for GCM).
 GCM_NONCE_BYTES = 12
@@ -50,6 +50,8 @@ MESSAGE_ENVELOPE_PREFIX = "E2EE-MESSAGE-ENVELOPE-V1"
 SIGNED_MESSAGE_PREFIX = "E2EE-SIGNED-MESSAGE-V1"
 #: Domain-separation prefix for the one-to-one session-key HKDF info.
 SESSION_KEY_INFO_PREFIX = "E2EE-SESSION-KEY-V1"
+#: Domain-separation prefix for the signature-authorized batch sync-ack.
+SYNC_ACK_PREFIX = "E2EE-SYNC-ACK-V1"
 #: Length of a derived one-to-one session key in bytes.
 SESSION_KEY_BYTES = 32
 #: Fixed HKDF salt for session-key derivation: 32 zero bytes.
@@ -716,6 +718,48 @@ def verify_group_membership(identity_key: ed25519.Ed25519PublicKey,
     """
     message = group_membership_proof_message(
         group_id, operation, actor_device_id, device_id, expected_revision)
+    try:
+        identity_key.verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def sync_ack_proof_message(user_id: str, device_id: str,
+                           expected_version: int,
+                           items: List[Tuple[str, int]]) -> bytes:
+    """Build the exact bytes the identity key signs for a batch sync-ack.
+
+    The message is the domain prefix ``E2EE-SYNC-ACK-V1``, one newline,
+    then compact JSON of the four fields with keys sorted at every level
+    (``device_id``, ``expected_version``, ``items``, ``user_id``) and
+    Unicode written as-is. ``user_id`` is the device's registered value,
+    ``device_id`` the request's path-decoded value and
+    ``expected_version`` is serialized as a JSON integer; *items* are the
+    already-validated ``(session_id, cursor)`` pairs in request order —
+    each contributes exactly its verbatim ``session_id`` string and
+    integer ``cursor``, and the array order is preserved.
+    """
+    document = json.dumps(
+        {"device_id": device_id, "expected_version": expected_version,
+         "items": [{"session_id": session_id, "cursor": cursor}
+                   for session_id, cursor in items],
+         "user_id": user_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (SYNC_ACK_PREFIX + "\n" + document).encode("utf-8")
+
+
+def verify_sync_ack(identity_key: ed25519.Ed25519PublicKey,
+                    signature: bytes, user_id: str, device_id: str,
+                    expected_version: int,
+                    items: List[Tuple[str, int]]) -> bool:
+    """Verify one signature-authorized batch sync-ack against the Ed25519 key.
+
+    Returns ``True`` iff *signature* is valid over
+    :func:`sync_ack_proof_message` for the four field values.
+    """
+    message = sync_ack_proof_message(
+        user_id, device_id, expected_version, items)
     try:
         identity_key.verify(signature, message)
     except InvalidSignature:
