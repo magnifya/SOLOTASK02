@@ -24,7 +24,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 
 #: AES-GCM nonce size in bytes (96-bit nonces, as recommended for GCM).
 GCM_NONCE_BYTES = 12
@@ -39,6 +39,8 @@ SIGNED_PREKEY_PROOF_PREFIX = "E2EE-SIGNED-PREKEY-V1"
 IDENTITY_ROTATION_PREFIX = "E2EE-IDENTITY-ROTATION-V1"
 #: Domain-separation prefix for the signature-authorized device revocation.
 DEVICE_REVOCATION_PREFIX = "E2EE-DEVICE-REVOCATION-V1"
+#: Domain-separation prefix for the signature-authorized 1:1 sync-ack batch.
+SYNC_ACK_PREFIX = "E2EE-SYNC-ACK-V1"
 #: Domain-separation prefix for the signature-authorized group-membership
 #: change (add/remove) message.
 GROUP_MEMBERSHIP_PREFIX = "E2EE-GROUP-MEMBERSHIP-V1"
@@ -677,6 +679,48 @@ def verify_device_revocation(identity_key: ed25519.Ed25519PublicKey,
     """
     message = device_revocation_proof_message(
         user_id, device_id, expected_version)
+    try:
+        identity_key.verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def sync_ack_proof_message(user_id: str, device_id: str,
+                           expected_version: int,
+                           items: List[Tuple[str, int]]) -> bytes:
+    """Build the exact bytes the current identity key signs to authorize a batch.
+
+    The message is the domain prefix ``E2EE-SYNC-ACK-V1``, one newline, then
+    compact JSON of the four fields with keys sorted
+    (``device_id``, ``expected_version``, ``items``, ``user_id``) and Unicode
+    written as-is. ``user_id`` is the device's registered value, *device_id*
+    is the request's path-decoded value and *items* is the array of
+    ``{"cursor": n, "session_id": s}`` objects in the request's original
+    array order (each object's keys sorted); the strings are the
+    stored/requested original strings — no trimming or normalization — and
+    *expected_version* is serialized as a JSON integer.
+    """
+    document = json.dumps(
+        {"device_id": device_id, "expected_version": expected_version,
+         "items": [{"cursor": cursor, "session_id": session_id}
+                   for session_id, cursor in items],
+         "user_id": user_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (SYNC_ACK_PREFIX + "\n" + document).encode("utf-8")
+
+
+def verify_sync_ack(identity_key: ed25519.Ed25519PublicKey,
+                    signature: bytes, user_id: str, device_id: str,
+                    expected_version: int,
+                    items: List[Tuple[str, int]]) -> bool:
+    """Verify one signature-authorized 1:1 sync-ack batch against the key.
+
+    Returns ``True`` iff *signature* is valid over
+    :func:`sync_ack_proof_message` for the four field values.
+    """
+    message = sync_ack_proof_message(
+        user_id, device_id, expected_version, items)
     try:
         identity_key.verify(signature, message)
     except InvalidSignature:

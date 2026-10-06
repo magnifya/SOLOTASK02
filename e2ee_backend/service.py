@@ -167,6 +167,9 @@ from .storage import (
     SESSION_ROTATION_RECIPIENT_REVOKED,
     SESSION_ROTATION_SESSION_UNKNOWN,
     SYNC_BAD_SEQUENCE,
+    SYNC_ACK_IDENTITY_NOT_ED25519,
+    SYNC_ACK_SIGNATURE_INVALID,
+    SYNC_ACK_VERSION_MISMATCH,
     SYNC_CURSOR_CONFLICT,
     SYNC_DEVICE_INACTIVE,
     SYNC_DEVICE_NOT_MEMBER,
@@ -2177,6 +2180,158 @@ class DeviceService:
             raise ServiceError(text, field, status_code=status_code)
         body = {"device_id": device_id, "results": results}
         return body, 201 if any_advanced else 200
+
+    def sync_device_ack_batch_verified(self, device_id: str,
+                                       payload: object
+                                       ) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one signature-authorized device batch sync-ack.
+
+        ``POST /v1/devices/{device_id}/sync/ack-batch-verified``. The body
+        must be an object carrying the ordinary ``items`` array plus
+        ``expected_version`` and ``signature``; any other field is ignored.
+        The item shape, ordering and duplicate-session rules are exactly the
+        unsigned entry's: 400/field ``request_body`` (bad/non-object body),
+        ``items`` (missing/not-a-non-empty-array), ``items[i]`` (non-object
+        element or repeated session) or ``items[i].session_id`` /
+        ``items[i].cursor`` for the offending field. ``expected_version``
+        missing, non-integer, boolean or not positive is
+        400/field=expected_version; ``signature`` missing, wrong-type,
+        non-canonical standard-base64 or not decoding to exactly 64 bytes is
+        400/field=signature.
+
+        The device/identity/version/signature checks then run atomically in
+        the store: unknown device is 404/field=device_id, a revoked device
+        409/field=device_id, a current key that is not Ed25519
+        400/field=identity_key, a version mismatch
+        409/field=expected_version and a failed verification
+        400/field=signature. The authorization is always checked, even when
+        every cursor equals its stored value. Only afterward do the items
+        follow the ordinary batch session-permission and cursor-range rules
+        in array order; the first error aborts the whole batch with nothing
+        written. Success is the ordinary batch body and status (201 when at
+        least one cursor advanced, 200 with no write otherwise); the
+        authorization and all updates are one linearizable transaction
+        against revocation and identity rotation, and a durable write
+        failure rolls everything back.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        if "items" not in payload:
+            raise ServiceError("missing required field: items", "items")
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ServiceError(
+                "field must be a non-empty array: items", "items")
+
+        items: List[Tuple[str, int]] = []
+        seen_sessions: set = set()
+        for index, element in enumerate(raw_items):
+            item_field = f"items[{index}]"
+            if not isinstance(element, dict):
+                raise ServiceError(
+                    f"array element must be an object: {item_field}",
+                    item_field)
+            session_field = f"{item_field}.session_id"
+            if "session_id" not in element:
+                raise ServiceError(
+                    f"missing required field: {session_field}", session_field)
+            if not is_nonempty_string(element["session_id"]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {session_field}",
+                    session_field)
+            cursor_field = f"{item_field}.cursor"
+            if "cursor" not in element:
+                raise ServiceError(
+                    f"missing required field: {cursor_field}", cursor_field)
+            cursor = element["cursor"]
+            # bool is a subclass of int; reject it explicitly.
+            if not isinstance(cursor, int) or isinstance(cursor, bool):
+                raise ServiceError(
+                    f"field must be an integer: {cursor_field}", cursor_field)
+            if cursor < 0:
+                raise ServiceError(
+                    f"field must be a non-negative integer: {cursor_field}",
+                    cursor_field)
+            if element["session_id"] in seen_sessions:
+                raise ServiceError(
+                    "duplicate session_id in items: "
+                    f"{element['session_id']}", item_field)
+            seen_sessions.add(element["session_id"])
+            items.append((element["session_id"], cursor))
+
+        if "expected_version" not in payload:
+            raise ServiceError(
+                "missing required field: expected_version",
+                "expected_version")
+        expected_version = payload["expected_version"]
+        if not isinstance(expected_version, int) \
+                or isinstance(expected_version, bool):
+            raise ServiceError(
+                "field must be a positive integer: expected_version",
+                "expected_version")
+        if expected_version < 1:
+            raise ServiceError(
+                "field must be a positive integer: expected_version",
+                "expected_version")
+        if "signature" not in payload:
+            raise ServiceError("missing required field: signature",
+                               "signature")
+        signature = decode_ed25519_signature(payload["signature"])
+        if signature is None:
+            raise ServiceError(
+                "field must be a standard base64 64-byte Ed25519 "
+                "signature: signature", "signature")
+
+        try:
+            results, any_advanced = self.store. \
+                message_sync_ack_batch_verified(
+                    device_id, items, expected_version, signature)
+        except DeviceUpdateError as error:
+            raise self._sync_ack_verified_error(error, device_id)
+        except MessageSyncAckBatchError as error:
+            session_id = items[error.index][0]
+            status_code, _ = self._MESSAGE_SYNC_ERROR_MAP[error.reason]
+            if error.reason == MESSAGE_SYNC_SESSION_UNKNOWN:
+                field = f"items[{error.index}].session_id"
+                text = f"session not found: {session_id}"
+            elif error.reason == MESSAGE_SYNC_CURSOR_CONFLICT:
+                field = f"items[{error.index}].cursor"
+                text = "cursor is out of range or moved backwards"
+            else:
+                # A group session, or a 1:1 session the device is not the
+                # recipient of, is not ack-able here.
+                field = f"items[{error.index}].session_id"
+                text = ("session is a group session or device is not its "
+                        "recipient")
+            raise ServiceError(text, field, status_code=status_code)
+        body = {"device_id": device_id, "results": results}
+        return body, 201 if any_advanced else 200
+
+    @staticmethod
+    def _sync_ack_verified_error(error: DeviceUpdateError,
+                                 device_id: str) -> ServiceError:
+        """Translate a verified sync-ack storage failure to a ServiceError."""
+        if error.reason == DEVICE_UNKNOWN:
+            return ServiceError(f"device not found: {device_id}",
+                                "device_id", status_code=404)
+        if error.reason == DEVICE_REVOKED:
+            return ServiceError("device_id is revoked",
+                                "device_id", status_code=409)
+        if error.reason == SYNC_ACK_IDENTITY_NOT_ED25519:
+            return ServiceError(
+                "stored identity key is not an Ed25519 public key: "
+                "identity_key", "identity_key")
+        if error.reason == SYNC_ACK_VERSION_MISMATCH:
+            return ServiceError(
+                "expected_version does not match the device's current "
+                "identity_key_version",
+                "expected_version", status_code=409)
+        if error.reason == SYNC_ACK_SIGNATURE_INVALID:
+            return ServiceError(
+                "sync-ack batch authorization failed verification: "
+                "signature", "signature")
+        raise  # pragma: no cover - defensive
 
     def sync_group_ack_batch(self, device_id: str,
                              payload: object) -> Tuple[Dict[str, Any], int]:

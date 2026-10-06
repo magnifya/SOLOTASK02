@@ -204,6 +204,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 and path.endswith("/identity-key/rotate"):
             self._route_rotate_identity(path)
         elif path.startswith(_DEVICES_PATH + "/") \
+                and path.endswith("/sync/ack-batch-verified"):
+            self._route_device_sync_ack_batch_verified(path)
+        elif path.startswith(_DEVICES_PATH + "/") \
                 and path.endswith("/sync/ack-batch"):
             self._route_device_sync_ack_batch(path)
         elif path.startswith(_DEVICES_PATH + "/") \
@@ -400,6 +403,15 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         suffix = path[len(_DEVICES_PATH) + 1:-len("/sync/ack-batch")]
         if suffix and "/" not in suffix:
             self._handle_device_sync_ack_batch(unquote(suffix))
+        else:
+            self._send_json(404, {"message": "device not found",
+                                  "field": "device_id"})
+
+    def _route_device_sync_ack_batch_verified(self, path: str) -> None:
+        suffix = path[len(_DEVICES_PATH) + 1:
+                      -len("/sync/ack-batch-verified")]
+        if suffix and "/" not in suffix:
+            self._handle_device_sync_ack_batch_verified(unquote(suffix))
         else:
             self._send_json(404, {"message": "device not found",
                                   "field": "device_id"})
@@ -1621,6 +1633,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.sync_device_ack_batch(
+                device_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_device_sync_ack_batch_verified(self, device_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.sync_device_ack_batch_verified(
                 device_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())

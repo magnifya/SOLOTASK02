@@ -63,6 +63,7 @@ from .crypto import (
     verify_identity_rotation,
     verify_message_signature,
     verify_signed_prekey,
+    verify_sync_ack,
 )
 
 #: Outcome codes for a failed atomic session creation.
@@ -170,6 +171,15 @@ DEVICE_REVOCATION_VERSION_MISMATCH = "device_revocation_version_mismatch"
 #: Outcome code for a device-revocation authorization that fails signature
 #: verification against the device's current identity key.
 DEVICE_REVOCATION_SIGNATURE_INVALID = "device_revocation_signature_invalid"
+#: Outcome code for an authorized sync-ack batch whose device's current
+#: identity key is not an Ed25519 public key (the proof cannot be checked).
+SYNC_ACK_IDENTITY_NOT_ED25519 = "sync_ack_identity_not_ed25519"
+#: Outcome code for an authorized sync-ack batch whose expected version does
+#: not equal the device's current identity_key_version.
+SYNC_ACK_VERSION_MISMATCH = "sync_ack_version_mismatch"
+#: Outcome code for a sync-ack batch authorization that fails signature
+#: verification against the device's current identity key.
+SYNC_ACK_SIGNATURE_INVALID = "sync_ack_signature_invalid"
 #: Sentinel results of the read-only signed pre-key proof lookup.
 PROOF_DEVICE_UNKNOWN = "proof_device_unknown"
 PROOF_PREKEY_UNKNOWN = "proof_prekey_unknown"
@@ -3687,41 +3697,7 @@ class DeviceStore:
                 raise MessageSyncError(MESSAGE_SYNC_DEVICE_UNKNOWN)
             if device.revoked:
                 raise MessageSyncError(MESSAGE_SYNC_DEVICE_INACTIVE)
-            plans: List[Dict[str, Any]] = []
-            for index, (session_id, cursor) in enumerate(items):
-                session = self._sessions.get(session_id)
-                if session is None:
-                    reason = MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT \
-                        if self._group_sessions.get(session_id) is not None \
-                        else MESSAGE_SYNC_SESSION_UNKNOWN
-                    raise MessageSyncAckBatchError(reason, index)
-                if device_id != session.recipient_device_id:
-                    raise MessageSyncAckBatchError(
-                        MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT, index)
-                stream = self._messages.get(session_id, [])
-                max_sequence = stream[-1].sequence if stream else 0
-                if cursor > max_sequence:
-                    raise MessageSyncAckBatchError(
-                        MESSAGE_SYNC_CURSOR_CONFLICT, index)
-                cursor_key = (session_id, device_id)
-                record = self._message_sync_cursors.get(cursor_key)
-                current = record.cursor if record is not None else 0
-                if cursor < current:
-                    raise MessageSyncAckBatchError(
-                        MESSAGE_SYNC_CURSOR_CONFLICT, index)
-                # Validate in array order; only after every item passes are
-                # any of them committed below.
-                plans.append({
-                    "session_id": session_id,
-                    "device_id": device_id,
-                    "cursor": cursor,
-                    "current": current,
-                    "record": record,
-                    "stream": stream,
-                    "is_group": False,
-                    "anchor_created_at": session.created_at,
-                    "advanced": cursor > current,
-                })
+            plans = self._plan_sync_ack_batch_items_locked(device, items)
             any_advanced = any(plan["advanced"] for plan in plans)
             records = self._commit_sync_ack_plans_locked(
                 plans, utc_now_iso())
@@ -3729,6 +3705,134 @@ class DeviceStore:
                 # One persistence notification for the whole batch: all the
                 # per-session acks and cursors commit (or roll back) together
                 # and the generation advances at most once.
+                self._notify_change()
+            results = [{
+                "session_id": plan["session_id"],
+                "cursor": record.cursor,
+                "updated_at": record.updated_at,
+            } for plan, record in zip(plans, records)]
+            return results, any_advanced
+
+    def _plan_sync_ack_batch_items_locked(
+            self, device: Device, items: List[Tuple[str, int]]
+    ) -> List[Dict[str, Any]]:
+        """Validate a resolved active device's 1:1 ack items under the lock.
+
+        Mirrors the item checks of :meth:`message_sync_ack_batch` for reuse by
+        the signature-authorized entry. Items are validated in array order;
+        the first failure raises :class:`MessageSyncAckBatchError` carrying
+        that item's index:
+
+        * a session that is neither a 1:1 nor a group session ->
+          ``session_unknown`` (404);
+        * a group session, or a 1:1 session whose recipient is not this device
+          -> ``device_not_participant`` (409);
+        * a cursor below the stored cursor (0 when none) or above the
+          session's largest sequence -> ``cursor_conflict`` (409).
+
+        No state is mutated; every item is returned as a plan for
+        :meth:`_commit_sync_ack_plans_locked`.
+        """
+        device_id = device.device_id
+        plans: List[Dict[str, Any]] = []
+        for index, (session_id, cursor) in enumerate(items):
+            session = self._sessions.get(session_id)
+            if session is None:
+                reason = MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT \
+                    if self._group_sessions.get(session_id) is not None \
+                    else MESSAGE_SYNC_SESSION_UNKNOWN
+                raise MessageSyncAckBatchError(reason, index)
+            if device_id != session.recipient_device_id:
+                raise MessageSyncAckBatchError(
+                    MESSAGE_SYNC_DEVICE_NOT_PARTICIPANT, index)
+            stream = self._messages.get(session_id, [])
+            max_sequence = stream[-1].sequence if stream else 0
+            if cursor > max_sequence:
+                raise MessageSyncAckBatchError(
+                    MESSAGE_SYNC_CURSOR_CONFLICT, index)
+            cursor_key = (session_id, device_id)
+            record = self._message_sync_cursors.get(cursor_key)
+            current = record.cursor if record is not None else 0
+            if cursor < current:
+                raise MessageSyncAckBatchError(
+                    MESSAGE_SYNC_CURSOR_CONFLICT, index)
+            # Validate in array order; only after every item passes are
+            # any of them committed by the caller.
+            plans.append({
+                "session_id": session_id,
+                "device_id": device_id,
+                "cursor": cursor,
+                "current": current,
+                "record": record,
+                "stream": stream,
+                "is_group": False,
+                "anchor_created_at": session.created_at,
+                "advanced": cursor > current,
+            })
+        return plans
+
+    def message_sync_ack_batch_verified(
+            self, device_id: str, items: List[Tuple[str, int]],
+            expected_version: int, signature: bytes
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Apply a signature-authorized device 1:1 sync-ack batch atomically.
+
+        The whole authorization, the item checks and the commit run under the
+        same store lock ordinary revocation and identity rotation take, so
+        the authorization is always checked against the device's *current*
+        identity key and version: a concurrent revocation or identity
+        rotation that commits between this call's request validation and the
+        locked checks changes the device state, and the stale authorization
+        then fails here — only an authorization still valid at commit time is
+        accepted. The signature is an already-decoded 64-byte Ed25519
+        signature over the domain-separated canonical message
+        (``E2EE-SYNC-ACK-V1``) for the device's stored ``user_id`` and the
+        request's path-decoded *device_id* / *expected_version* / *items*
+        values; the caller has already validated the request fields, the
+        item shapes and the signature encoding.
+
+        Checks run in a fixed order: unknown device ->
+        :class:`DeviceUpdateError` ``device_unknown`` (404); revoked device
+        -> ``device_revoked`` (409); a current identity key that is not
+        Ed25519 -> :class:`DeviceUpdateError`
+        ``sync_ack_identity_not_ed25519`` (400/identity_key);
+        ``expected_version`` different from the current
+        ``identity_key_version`` -> ``sync_ack_version_mismatch``
+        (409/expected_version); a signature that does not verify ->
+        ``sync_ack_signature_invalid`` (400/signature). Only then do the
+        items follow the ordinary batch rules in array order, with a
+        :class:`MessageSyncAckBatchError` aborting the whole batch and
+        writing nothing — the authorization is fully checked even when every
+        cursor equals its stored value. On success the semantics match
+        :meth:`message_sync_ack_batch`: one shared timestamp for every
+        advancing item and a single persistence notification; equal items
+        write nothing. A durable write failure rolls every ack and cursor
+        back. Returns ``(results, any_advanced)``.
+        """
+        with self._lock:
+            device = self._find_device(device_id)
+            if device is None:
+                raise DeviceUpdateError(DEVICE_UNKNOWN)
+            if device.revoked:
+                raise DeviceUpdateError(DEVICE_REVOKED)
+            current = load_ed25519_public_key(device.identity_key)
+            if current is None:
+                raise DeviceUpdateError(SYNC_ACK_IDENTITY_NOT_ED25519)
+            if device.identity_key_version != expected_version:
+                raise DeviceUpdateError(SYNC_ACK_VERSION_MISMATCH)
+            if not verify_sync_ack(
+                    current, signature, device.user_id, device.device_id,
+                    expected_version, items):
+                raise DeviceUpdateError(SYNC_ACK_SIGNATURE_INVALID)
+            plans = self._plan_sync_ack_batch_items_locked(device, items)
+            any_advanced = any(plan["advanced"] for plan in plans)
+            records = self._commit_sync_ack_plans_locked(
+                plans, utc_now_iso())
+            if any_advanced:
+                # Authorization, all per-session acks, cursors and the one
+                # durable commit are one linearizable transaction: a write
+                # failure rolls the whole batch (and its authorization
+                # decision) back.
                 self._notify_change()
             results = [{
                 "session_id": plan["session_id"],
