@@ -148,10 +148,13 @@ from .storage import (
     ROTATION_ACTOR_NOT_CREATOR,
     ROTATION_ACTOR_REVOKED,
     ROTATION_ACTOR_UNKNOWN,
+    ROTATION_NOT_ED25519,
     ROTATION_PREDECESSOR_ROTATED,
     ROTATION_REVISION_MISMATCH,
     ROTATION_ID_CONFLICT,
     ROTATION_SESSION_UNKNOWN,
+    ROTATION_SIGNATURE_INVALID,
+    ROTATION_VERSION_MISMATCH,
     SESSION_INITIATOR_REVOKED,
     SESSION_INITIATOR_UNKNOWN,
     SESSION_PREKEY_CONSUMED,
@@ -1870,6 +1873,127 @@ class DeviceService:
                 message = (
                     "rotation_id has already rotated another session: "
                     f"{payload['rotation_id']}")
+            elif error.reason == ROTATION_PREDECESSOR_ROTATED:
+                message = "session has already been rotated"
+            else:
+                message = (
+                    "actor_device_id is revoked or is not the group creator")
+            raise ServiceError(message, field, status_code=status_code)
+        return self.store.rotation_view(successor, rotation), \
+            201 if created else 200
+
+    #: Maps a verified-rotation failure reason to (HTTP status, field name).
+    _ROTATION_VERIFIED_ERROR_MAP = {
+        ROTATION_SESSION_UNKNOWN: (404, "session_id"),
+        ROTATION_ACTOR_UNKNOWN: (404, "actor_device_id"),
+        ROTATION_ACTOR_REVOKED: (409, "actor_device_id"),
+        ROTATION_ACTOR_NOT_CREATOR: (409, "actor_device_id"),
+        ROTATION_NOT_ED25519: (400, "identity_key"),
+        ROTATION_REVISION_MISMATCH: (409, "expected_revision"),
+        ROTATION_VERSION_MISMATCH: (409, "expected_version"),
+        ROTATION_SIGNATURE_INVALID: (400, "signature"),
+        ROTATION_ID_CONFLICT: (409, "rotation_id"),
+        ROTATION_PREDECESSOR_ROTATED: (409, "session_id"),
+    }
+
+    def rotate_group_session_verified(
+            self, predecessor_session_id: str,
+            payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply a signature-authorized group-session rotation.
+
+        The body is a JSON object with ``rotation_id``, ``actor_device_id``,
+        ``ephemeral_key``, ``expected_revision``, ``expected_version`` and
+        ``signature``. The two identifiers and the key must be non-empty
+        strings (the key must parse as a public key), the two expected
+        counters positive integers (booleans are refused) and ``signature``
+        canonical standard base64 decoding to exactly 64 bytes; any
+        structural or encoding problem is a 400 naming the field.
+
+        The signature is an Ed25519 authorization verified atomically in the
+        store against the creator device's *current* identity key over the
+        domain-separated canonical rotation message
+        (``E2EE-GROUP-SESSION-ROTATION-V1``) binding the five request values
+        to the stored ``group_id`` / ``predecessor_session_id`` /
+        ``user_id``. The first rotation commits 201 with the nine-field
+        rotation view; an identical replay on the same predecessor returns
+        200 with the original response even after later state changes, while
+        the same ``rotation_id`` with any field or the signature changed —
+        or naming another predecessor — is 409/field=rotation_id, and a
+        predecessor already rotated under another id is
+        409/field=session_id. On any failure nothing is written.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("rotation_id", "actor_device_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        if "ephemeral_key" not in payload:
+            raise ServiceError(
+                "missing required field: ephemeral_key", "ephemeral_key")
+        if not is_nonempty_string(payload["ephemeral_key"]):
+            raise ServiceError(
+                "field must be a non-empty string: ephemeral_key",
+                "ephemeral_key")
+        if load_public_key(payload["ephemeral_key"]) is None:
+            raise ServiceError(
+                "field is not a valid public key: ephemeral_key",
+                "ephemeral_key")
+        for name in ("expected_revision", "expected_version"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            value = payload[name]
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or value < 1:
+                raise ServiceError(
+                    f"field must be a positive integer: {name}", name)
+        if "signature" not in payload:
+            raise ServiceError("missing required field: signature",
+                               "signature")
+        if not is_nonempty_string(payload["signature"]):
+            raise ServiceError(
+                "field must be a non-empty string: signature", "signature")
+        if decode_ed25519_signature(payload["signature"]) is None:
+            raise ServiceError(
+                "field must be a standard base64 64-byte Ed25519 "
+                "signature: signature", "signature")
+
+        try:
+            successor, rotation, created = \
+                self.store.rotate_group_session_verified(
+                    predecessor_session_id, payload["rotation_id"],
+                    payload["actor_device_id"], payload["ephemeral_key"],
+                    payload["expected_revision"], payload["expected_version"],
+                    payload["signature"])
+        except GroupSessionRotationError as error:
+            status_code, field = self._ROTATION_VERIFIED_ERROR_MAP[
+                error.reason]
+            if error.reason == ROTATION_SESSION_UNKNOWN:
+                message = f"session not found: {predecessor_session_id}"
+            elif error.reason == ROTATION_ACTOR_UNKNOWN:
+                message = ("actor_device_id is not a registered device: "
+                           f"{payload['actor_device_id']}")
+            elif error.reason == ROTATION_NOT_ED25519:
+                message = ("stored identity key is not an Ed25519 public "
+                           "key: identity_key")
+            elif error.reason == ROTATION_REVISION_MISMATCH:
+                message = (
+                    "expected_revision does not match the group's current "
+                    "revision")
+            elif error.reason == ROTATION_VERSION_MISMATCH:
+                message = (
+                    "expected_version does not match the creator's current "
+                    "identity_key_version")
+            elif error.reason == ROTATION_SIGNATURE_INVALID:
+                message = ("group session rotation authorization failed "
+                           "verification: signature")
+            elif error.reason == ROTATION_ID_CONFLICT:
+                message = (
+                    "rotation_id has already rotated another session or "
+                    f"fields differ: {payload['rotation_id']}")
             elif error.reason == ROTATION_PREDECESSOR_ROTATED:
                 message = "session has already been rotated"
             else:

@@ -437,6 +437,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_rotate_group_session.set_defaults(
         handler=cmd_rotate_group_session)
 
+    p_rotate_group_session_verified = sub.add_parser(
+        "rotate-group-session-verified",
+        help="rotate a group session with the creator's signed authorization")
+    p_rotate_group_session_verified.add_argument("session_id")
+    p_rotate_group_session_verified.add_argument(
+        "--rotation-id", required=True)
+    p_rotate_group_session_verified.add_argument(
+        "--actor-device-id", required=True)
+    p_rotate_group_session_verified.add_argument(
+        "--ephemeral-key", required=True,
+        help="ephemeral public key (string), or @path to read it from a file")
+    p_rotate_group_session_verified.add_argument(
+        "--expected-revision", required=True, type=int)
+    p_rotate_group_session_verified.add_argument(
+        "--expected-version", required=True, type=int)
+    p_rotate_group_session_verified.add_argument(
+        "--signature", required=True,
+        help="base64 Ed25519 authorization signature, or @path for a file")
+    p_rotate_group_session_verified.set_defaults(
+        handler=cmd_rotate_group_session_verified)
+
     p_sync_group_messages = sub.add_parser(
         "sync-group-messages",
         help="sync a page of a group session's messages for a device")
@@ -1280,6 +1301,37 @@ def cmd_rotate_group_session(args: argparse.Namespace) -> int:
     }
     url = (f"{args.base_url}/v1/group-sessions/"
            f"{quote(args.session_id, safe='')}/rotate")
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    stream = sys.stdout if status in (200, 201) else sys.stderr
+    print(json.dumps(response, separators=(",", ":"), ensure_ascii=False), file=stream)
+    return 0 if status in (200, 201) else 1
+
+
+def cmd_rotate_group_session_verified(args: argparse.Namespace) -> int:
+    """Call POST /v1/group-sessions/{sid}/rotate-verified; print the JSON.
+
+    The signature is the standard-base64 64-byte Ed25519 authorization over
+    the group-session-rotation message, verified server-side against the
+    creator device's current identity key. Success (201 created, or 200 for
+    an identical replay) prints the single-line rotation JSON on stdout and
+    exits 0; any failure prints the server's single-line JSON with its
+    ``field`` on stderr and exits non-zero.
+    """
+    from urllib.parse import quote
+
+    payload = {
+        "rotation_id": args.rotation_id,
+        "actor_device_id": args.actor_device_id,
+        "ephemeral_key": _read_key_argument(args.ephemeral_key),
+        "expected_revision": args.expected_revision,
+        "expected_version": args.expected_version,
+        "signature": _read_key_argument(args.signature),
+    }
+    url = (f"{args.base_url}/v1/group-sessions/"
+           f"{quote(args.session_id, safe='')}/rotate-verified")
     try:
         status, response = _request_json("POST", url, body=payload)
     except ServerUnavailable:

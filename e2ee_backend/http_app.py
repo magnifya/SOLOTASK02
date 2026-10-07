@@ -185,6 +185,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
                 and path.endswith("/sync/checkpoint"):
             self._route_group_sync_checkpoint(path)
         elif path.startswith(_GROUP_SESSIONS_PATH + "/") \
+                and path.endswith("/rotate-verified"):
+            self._route_rotate_group_session_verified(path)
+        elif path.startswith(_GROUP_SESSIONS_PATH + "/") \
                 and path.endswith("/rotate"):
             self._route_rotate_group_session(path)
         elif path.startswith(_GROUPS_PATH + "/"):
@@ -332,6 +335,15 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         suffix = path[len(_GROUP_SESSIONS_PATH) + 1:-len("/rotate")]
         if suffix and "/" not in suffix:
             self._handle_rotate_group_session(unquote(suffix))
+        else:
+            self._send_json(404, {"message": "session not found",
+                                  "field": "session_id"})
+
+    def _route_rotate_group_session_verified(self, path: str) -> None:
+        suffix = path[len(_GROUP_SESSIONS_PATH) + 1:
+                      -len("/rotate-verified")]
+        if suffix and "/" not in suffix:
+            self._handle_rotate_group_session_verified(unquote(suffix))
         else:
             self._send_json(404, {"message": "session not found",
                                   "field": "session_id"})
@@ -1561,6 +1573,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.rotate_group_session(
+                session_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_rotate_group_session_verified(self, session_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.rotate_group_session_verified(
                 session_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())

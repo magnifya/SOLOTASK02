@@ -707,6 +707,11 @@ class GroupSessionRotation:
     returns the original successor. A given predecessor may be rotated at
     most once (no forks), and a given ``rotation_id`` may succeed for at
     most one predecessor.
+
+    A signature-authorized rotation additionally freezes the creator's
+    ``identity_key`` at commit time, the authorized ``expected_version``
+    (the creator's identity-key version then) and the request's
+    ``signature``; legacy unsigned records carry ``None`` for all three.
     """
 
     rotation_id: str
@@ -717,6 +722,14 @@ class GroupSessionRotation:
     revision: int
     members: List[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now_iso)
+    #: Frozen creator identity key the signature verified against (verified
+    #: rotations only); ``None`` on a legacy unsigned record.
+    identity_key: Optional[str] = None
+    #: The authorized identity-key version (verified rotations only).
+    expected_version: Optional[int] = None
+    #: The request's canonical base64 Ed25519 authorization signature
+    #: (verified rotations only).
+    signature: Optional[str] = None
 
 
 @dataclass
