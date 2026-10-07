@@ -717,6 +717,18 @@ class GroupSessionRotation:
     revision: int
     members: List[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now_iso)
+    #: The creator's identity public key frozen at commit time, kept only on
+    #: a signature-authorized (``rotate-verified``) record. It is frozen
+    #: history: a later identity rotation never replaces it. ``None`` marks
+    #: an ordinary unsigned rotation; the three signed fields are either all
+    #: present or all ``None``.
+    identity_key: Optional[str] = None
+    #: The creator's ``identity_key_version`` the signature authorized, kept
+    #: only on a signature-authorized record.
+    expected_version: Optional[int] = None
+    #: The canonical standard-base64 64-byte Ed25519 authorization signature
+    #: exactly as received, kept only on a signature-authorized record.
+    signature: Optional[str] = None
 
 
 @dataclass

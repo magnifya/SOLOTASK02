@@ -42,6 +42,9 @@ DEVICE_REVOCATION_PREFIX = "E2EE-DEVICE-REVOCATION-V1"
 #: Domain-separation prefix for the signature-authorized group-membership
 #: change (add/remove) message.
 GROUP_MEMBERSHIP_PREFIX = "E2EE-GROUP-MEMBERSHIP-V1"
+#: Domain-separation prefix for the signature-authorized group-session
+#: rotation message.
+GROUP_SESSION_ROTATION_PREFIX = "E2EE-GROUP-SESSION-ROTATION-V1"
 #: Domain-separation prefix for the identity-key fingerprint message.
 IDENTITY_FINGERPRINT_PREFIX = "E2EE-IDENTITY-FINGERPRINT-V1"
 #: Domain-separation prefix for the message-envelope AAD document.
@@ -718,6 +721,52 @@ def verify_group_membership(identity_key: ed25519.Ed25519PublicKey,
     """
     message = group_membership_proof_message(
         group_id, operation, actor_device_id, device_id, expected_revision)
+    try:
+        identity_key.verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def group_session_rotation_proof_message(
+        user_id: str, group_id: str, predecessor_session_id: str,
+        rotation_id: str, actor_device_id: str, ephemeral_key: str,
+        expected_revision: int, expected_version: int) -> bytes:
+    """Build the exact bytes the creator's identity key signs for a rotation.
+
+    The message is the domain prefix ``E2EE-GROUP-SESSION-ROTATION-V1``, one
+    newline, then compact JSON of the eight fields with keys sorted
+    (``actor_device_id``, ``ephemeral_key``, ``expected_revision``,
+    ``expected_version``, ``group_id``, ``predecessor_session_id``,
+    ``rotation_id``, ``user_id``) and Unicode written as-is. ``user_id``,
+    ``group_id`` and ``predecessor_session_id`` are the stored values; the
+    other strings are the request's original strings — no trimming or
+    normalization — and ``expected_revision`` / ``expected_version`` are
+    serialized as JSON integers.
+    """
+    document = json.dumps(
+        {"actor_device_id": actor_device_id, "ephemeral_key": ephemeral_key,
+         "expected_revision": expected_revision,
+         "expected_version": expected_version, "group_id": group_id,
+         "predecessor_session_id": predecessor_session_id,
+         "rotation_id": rotation_id, "user_id": user_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (GROUP_SESSION_ROTATION_PREFIX + "\n" + document).encode("utf-8")
+
+
+def verify_group_session_rotation(
+        identity_key: ed25519.Ed25519PublicKey, signature: bytes,
+        user_id: str, group_id: str, predecessor_session_id: str,
+        rotation_id: str, actor_device_id: str, ephemeral_key: str,
+        expected_revision: int, expected_version: int) -> bool:
+    """Verify one signature-authorized group-session rotation.
+
+    Returns ``True`` iff *signature* is valid over
+    :func:`group_session_rotation_proof_message` for the eight field values.
+    """
+    message = group_session_rotation_proof_message(
+        user_id, group_id, predecessor_session_id, rotation_id,
+        actor_device_id, ephemeral_key, expected_revision, expected_version)
     try:
         identity_key.verify(signature, message)
     except InvalidSignature:

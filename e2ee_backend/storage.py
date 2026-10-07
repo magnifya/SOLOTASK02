@@ -60,6 +60,7 @@ from .crypto import (
     same_ed25519_public_key,
     verify_device_revocation,
     verify_group_membership,
+    verify_group_session_rotation,
     verify_identity_rotation,
     verify_message_signature,
     verify_signed_prekey,
@@ -510,6 +511,15 @@ ROTATION_ACTOR_NOT_CREATOR = "actor_not_creator"
 ROTATION_REVISION_MISMATCH = "revision_mismatch"
 ROTATION_ID_CONFLICT = "rotation_id_conflict"
 ROTATION_PREDECESSOR_ROTATED = "predecessor_rotated"
+#: The creator's current identity key is not an Ed25519 public key, so a
+#: signature-authorized rotation cannot be checked (400/field=identity_key).
+ROTATION_NOT_ED25519 = "rotation_not_ed25519"
+#: ``expected_version`` does not equal the creator's current
+#: ``identity_key_version`` (409/field=expected_version).
+ROTATION_VERSION_MISMATCH = "version_mismatch"
+#: The rotation authorization signature does not verify against the
+#: creator's current identity key (400/field=signature).
+ROTATION_SIGNATURE_INVALID = "signature_invalid"
 
 #: Outcome codes for one-to-one session rotation.
 SESSION_ROTATION_SESSION_UNKNOWN = "session_unknown"
@@ -3021,6 +3031,156 @@ class DeviceStore:
                 revision=group.revision,
                 members=list(group.members),
                 created_at=successor.created_at,
+            )
+            self._group_sessions[new_id] = successor
+            self._group_session_rotations[rotation_id] = rotation
+            self._rotation_by_predecessor[predecessor_session_id] = rotation
+            self._rotation_by_successor[new_id] = rotation
+            self._notify_change()
+            return successor, rotation, True
+
+    def rotate_group_session_verified(
+            self, predecessor_session_id: str, rotation_id: str,
+            actor_device_id: str, ephemeral_key: str,
+            expected_revision: int, expected_version: int,
+            signature: bytes, signature_b64: str
+            ) -> Tuple[GroupSession, GroupSessionRotation, bool]:
+        """Atomically apply a signature-authorized group-session rotation.
+
+        The whole check-and-rotate runs under the same store lock ordinary
+        rotations, membership changes, identity rotations and device
+        revocations take, so the authorization is always checked against the
+        creator's *current* identity key and version and the group's
+        *current* revision, and the checks and the write are one
+        linearizable transaction.
+
+        *signature* is an already-decoded 64-byte Ed25519 signature over the
+        domain-separated canonical rotation message
+        (``E2EE-GROUP-SESSION-ROTATION-V1``) for the stored ``user_id`` /
+        ``group_id`` / ``predecessor_session_id`` and the request's
+        ``rotation_id`` / ``actor_device_id`` / ``ephemeral_key`` /
+        ``expected_revision`` / ``expected_version`` values; *signature_b64*
+        is its canonical standard-base64 spelling, stored verbatim on the
+        record. The caller has already validated the request fields and the
+        signature encoding.
+
+        Returns ``(successor, rotation, created)`` with ``created`` False
+        only for an exact replay: the same ``rotation_id`` on the same
+        predecessor carrying the same actor, ephemeral key, expected values
+        and signature returns the original successor (200) even if the actor
+        was since revoked or the group revision moved. The same id with any
+        field or the signature changed — or naming another predecessor — is
+        ``rotation_id_conflict`` (409/field=rotation_id).
+
+        First-time failure reasons (nothing written), checked in this order:
+
+        * ``session_unknown`` — the predecessor is not a group session
+          (404/field=session_id);
+        * ``actor_unknown`` — the actor is not a registered device
+          (404/field=actor_device_id);
+        * ``actor_revoked`` / ``actor_not_creator`` — the actor is revoked or
+          is not the group's creator (409/field=actor_device_id);
+        * ``rotation_not_ed25519`` — the creator's current identity key is
+          not Ed25519, so the authorization cannot be checked
+          (400/field=identity_key);
+        * ``revision_mismatch`` — the group's current revision differs from
+          ``expected_revision`` (409/field=expected_revision);
+        * ``version_mismatch`` — the creator's current
+          ``identity_key_version`` differs from ``expected_version``
+          (409/field=expected_version);
+        * ``signature_invalid`` — the signature does not verify
+          (400/field=signature);
+        * ``predecessor_rotated`` — the predecessor already has a successor
+          under a different id, so granting this would fork it
+          (409/field=session_id).
+
+        The committed record freezes the creator's current identity key, the
+        authorized ``expected_version`` and the signature alongside the
+        ordinary rotation fields, so a later identity rotation or revocation
+        cannot invalidate the durable authorization.
+        """
+        with self._lock:
+            predecessor = self._group_sessions.get(predecessor_session_id)
+            if predecessor is None:
+                raise GroupSessionRotationError(ROTATION_SESSION_UNKNOWN)
+
+            existing = self._group_session_rotations.get(rotation_id)
+            if existing is not None:
+                if existing.predecessor_session_id != predecessor_session_id:
+                    # The id is already committed for another predecessor:
+                    # the rotation id namespace is global, so this is a 409
+                    # on rotation_id regardless of the other request fields.
+                    raise GroupSessionRotationError(ROTATION_ID_CONFLICT)
+                successor = self._group_sessions[
+                    existing.successor_session_id]
+                if existing.signature is not None \
+                        and existing.actor_device_id == actor_device_id \
+                        and successor.ephemeral_key == ephemeral_key \
+                        and existing.revision == expected_revision \
+                        and existing.expected_version == expected_version \
+                        and existing.signature == signature_b64:
+                    # Exact replay of the same signed request on the same
+                    # predecessor: return the original successor even if the
+                    # actor was since revoked or the group revision moved.
+                    return successor, existing, False
+                # Same id but any field or the signature changed: the id is
+                # already committed, so this is a 409 on rotation_id.
+                raise GroupSessionRotationError(ROTATION_ID_CONFLICT)
+
+            actor = self._find_device(actor_device_id)
+            if actor is None:
+                raise GroupSessionRotationError(ROTATION_ACTOR_UNKNOWN)
+            if actor.revoked:
+                raise GroupSessionRotationError(ROTATION_ACTOR_REVOKED)
+            group = self._groups[predecessor.group_id]
+            if actor_device_id != group.creator_device_id:
+                raise GroupSessionRotationError(
+                    ROTATION_ACTOR_NOT_CREATOR)
+
+            current = load_ed25519_public_key(actor.identity_key)
+            if current is None:
+                raise GroupSessionRotationError(ROTATION_NOT_ED25519)
+            if expected_revision != group.revision:
+                raise GroupSessionRotationError(ROTATION_REVISION_MISMATCH)
+            if actor.identity_key_version != expected_version:
+                raise GroupSessionRotationError(ROTATION_VERSION_MISMATCH)
+            if not verify_group_session_rotation(
+                    current, signature, actor.user_id, group.group_id,
+                    predecessor_session_id, rotation_id, actor_device_id,
+                    ephemeral_key, expected_revision, expected_version):
+                raise GroupSessionRotationError(ROTATION_SIGNATURE_INVALID)
+
+            if predecessor_session_id in self._rotation_by_predecessor:
+                # Another rotation id already succeeded for this predecessor:
+                # never fork.
+                raise GroupSessionRotationError(
+                    ROTATION_PREDECESSOR_ROTATED)
+
+            # Fresh unique session id (shared keyspace with 1:1 sessions).
+            new_id = uuid.uuid4().hex
+            while new_id in self._group_sessions or new_id in self._sessions:
+                new_id = uuid.uuid4().hex
+
+            successor = GroupSession(
+                session_id=new_id,
+                group_id=group.group_id,
+                initiator_device_id=actor_device_id,
+                ephemeral_key=ephemeral_key,
+                members=list(group.members),
+                revision=group.revision,
+            )
+            rotation = GroupSessionRotation(
+                rotation_id=rotation_id,
+                predecessor_session_id=predecessor_session_id,
+                successor_session_id=new_id,
+                group_id=group.group_id,
+                actor_device_id=actor_device_id,
+                revision=group.revision,
+                members=list(group.members),
+                created_at=successor.created_at,
+                identity_key=actor.identity_key,
+                expected_version=expected_version,
+                signature=signature_b64,
             )
             self._group_sessions[new_id] = successor
             self._group_session_rotations[rotation_id] = rotation
@@ -9246,6 +9406,13 @@ class DeviceStore:
                 "revision": r.revision,
                 "members": list(r.members),
                 "created_at": r.created_at,
+                # Signature-authorized records also freeze the creator's
+                # identity key, the authorized version and the signature;
+                # unsigned records keep the legacy eight-field shape.
+                **({"identity_key": r.identity_key,
+                    "expected_version": r.expected_version,
+                    "signature": r.signature}
+                   if r.signature is not None else {}),
             } for r in self._group_session_rotations.values()]
             session_rotations = [{
                 "rotation_id": r.rotation_id,
@@ -10388,7 +10555,11 @@ class DeviceStore:
         # records pointing at one successor), the actor is the group's
         # registered creator, and the frozen revision/members/created_at agree
         # exactly with the successor snapshot. A contradiction refuses
-        # startup rather than silently dropping the record.
+        # startup rather than silently dropping the record. Records written
+        # by a signature-authorized rotation additionally carry the frozen
+        # identity_key/expected_version/signature triple: all three must be
+        # present and the signature must verify against the frozen key over
+        # the stored values, or startup is refused.
         group_session_rotations: Dict[str, GroupSessionRotation] = {}
         rotation_predecessors: Set[str] = set()
         rotation_successors: Set[str] = set()
@@ -10484,6 +10655,55 @@ class DeviceStore:
                 raise ValueError(
                     f"{where} revision {revision} predates the predecessor "
                     f"revision {predecessor.revision}")
+            # Signature-authorized records (written by rotate-verified)
+            # carry three extra fields; legacy unsigned records carry none
+            # and load as before. A record with only some of them is
+            # incomplete, and a complete record whose signature does not
+            # verify against the frozen identity key over the stored values
+            # is a forgery: either way startup is refused rather than
+            # loading (and later re-persisting) a bad authorization.
+            signed_keys = ("identity_key", "expected_version", "signature")
+            present = [key for key in signed_keys if key in raw]
+            identity_key = None
+            expected_version = None
+            signature = None
+            if present:
+                if len(present) != len(signed_keys):
+                    missing = ", ".join(
+                        key for key in signed_keys if key not in raw)
+                    raise ValueError(
+                        f"{where} signed rotation record is incomplete: "
+                        f"missing {missing}")
+                identity_key = raw.get("identity_key")
+                if not isinstance(identity_key, str) or not identity_key:
+                    raise ValueError(
+                        f"{where}.identity_key must be a non-empty string")
+                frozen_key = load_ed25519_public_key(identity_key)
+                if frozen_key is None:
+                    raise ValueError(
+                        f"{where}.identity_key is not an Ed25519 public key")
+                expected_version = raw.get("expected_version")
+                if not isinstance(expected_version, int) \
+                        or isinstance(expected_version, bool) \
+                        or expected_version <= 0:
+                    raise ValueError(
+                        f"{where}.expected_version must be a positive "
+                        f"integer")
+                signature = raw.get("signature")
+                signature_bytes = decode_ed25519_signature(signature)
+                if signature_bytes is None:
+                    raise ValueError(
+                        f"{where}.signature must be a standard base64 "
+                        f"64-byte Ed25519 signature")
+                actor_device = devices[device_index[actor_device_id]]
+                if not verify_group_session_rotation(
+                        frozen_key, signature_bytes, actor_device.user_id,
+                        group_id, predecessor_session_id, rotation_id,
+                        actor_device_id, successor.ephemeral_key, revision,
+                        expected_version):
+                    raise ValueError(
+                        f"{where} signature does not verify against the "
+                        f"frozen identity key")
             rotation_predecessors.add(predecessor_session_id)
             rotation_successors.add(successor_session_id)
             group_session_rotations[rotation_id] = GroupSessionRotation(
@@ -10492,7 +10712,10 @@ class DeviceStore:
                 successor_session_id=successor_session_id,
                 group_id=group_id, actor_device_id=actor_device_id,
                 revision=revision, members=list(members),
-                created_at=created_at)
+                created_at=created_at,
+                identity_key=identity_key,
+                expected_version=expected_version,
+                signature=signature)
 
         # One-to-one session rotation records. Older files predate the
         # section: it is absent and treated as empty. A present section is
