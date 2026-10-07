@@ -567,8 +567,10 @@ class GroupRenewPersistenceTest(GroupRenewMixin, unittest.TestCase):
         self._assert_refuses_startup(self._malformed_document(mutate))
 
     def test_restore_rejects_group_terminal_keys(self) -> None:
-        # Group leases never carry completion or ack id fields.
-        for key in ("completion", "ack_id"):
+        # Group leases never carry the 1:1 bulk-ack id field (their
+        # optional completion is a legal key since completions were
+        # added).
+        for key in ("ack_id",):
             with self.subTest(key=key):
                 def mutate(document, key=key):
                     for lease in (l for r in document["group_delivery"]

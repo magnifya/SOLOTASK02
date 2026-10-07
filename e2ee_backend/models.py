@@ -295,11 +295,13 @@ class MessageLeaseRenewal:
 
 @dataclass
 class MessageLeaseCompletion:
-    """The one committed completion of a 1:1-inbox redelivery lease.
+    """The one committed completion of an inbox redelivery lease (1:1 or
+    group).
 
-    ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/complete`` is
-    the terminal lease operation: it records whether the client finished
-    the redelivery as ``delivered`` or ``failed``. The record freezes the
+    ``POST /v1/devices/{device_id}/inbox/leases/{lease_id}/complete`` and
+    its ``group-inbox`` counterpart are the terminal lease operation: they
+    record whether the client finished the redelivery as ``delivered`` or
+    ``failed``. The record freezes the
     client-chosen ``completion_id`` (unique within one lease, but reusable
     across different leases), the ``outcome`` and the UTC
     ``completed_at`` timestamp, so a replayed completion returns its first
