@@ -558,6 +558,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_ack.add_argument("--sequence", required=True, type=int)
     p_ack.set_defaults(handler=cmd_ack_message)
 
+    p_ack_verified = sub.add_parser(
+        "ack-message-verified",
+        help="acknowledge a message with an Ed25519 signature authorization")
+    p_ack_verified.add_argument("session_id")
+    p_ack_verified.add_argument("--device-id", required=True)
+    p_ack_verified.add_argument("--message-id", required=True)
+    p_ack_verified.add_argument("--sequence", required=True, type=int)
+    p_ack_verified.add_argument("--expected-version", required=True, type=int)
+    p_ack_verified.add_argument(
+        "--signature", required=True,
+        help="standard-base64 64-byte Ed25519 signature over the canonical "
+             "E2EE-MESSAGE-ACK-V1 message")
+    p_ack_verified.set_defaults(handler=cmd_ack_message_verified)
+
     p_status = sub.add_parser(
         "message-status", help="show a message's delivery status")
     p_status.add_argument("session_id")
@@ -1534,6 +1548,28 @@ def cmd_ack_message(args: argparse.Namespace) -> int:
     payload = {"device_id": args.device_id,
                "message_id": args.message_id,
                "sequence": args.sequence}
+    try:
+        status, response = _request_json("POST", url, body=payload)
+    except ServerUnavailable:
+        return _emit_server_error()
+    return _emit_api_response(status, response)
+
+
+def cmd_ack_message_verified(args: argparse.Namespace) -> int:
+    """Call POST /v1/messages/{sid}/acks-verified; 201 or 200 both succeed.
+
+    The client signs offline — the server only ever sees the public
+    identity key and the base64 signature, never a private key.
+    """
+    from urllib.parse import quote
+
+    url = (f"{args.base_url}/v1/messages/"
+           f"{quote(args.session_id, safe='')}/acks-verified")
+    payload = {"device_id": args.device_id,
+               "message_id": args.message_id,
+               "sequence": args.sequence,
+               "expected_version": args.expected_version,
+               "signature": args.signature}
     try:
         status, response = _request_json("POST", url, body=payload)
     except ServerUnavailable:

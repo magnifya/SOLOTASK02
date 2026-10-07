@@ -147,6 +147,7 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 - 命令行 `send-message` / `submit-message` / `pull-messages` 与上述接口一一对应，同样打印单行 JSON（`submit-message` 的 201 与 200 均为成功）。
 - `POST /v1/messages/{session_id}/retry/{message_id}`：可靠投递重试。体含非空 `device_id`、`attempt_id`；接收方须活跃，未知会话/消息 `404`（`field=session_id`/`message_id`），设备不符、未知或已撤销 `409/field=device_id`，字段缺失或类型错误 `400`。首次尝试 `201`、`attempts=1`；相同 `attempt_id` 幂等 `200` 不计数，新 id `200` 且 `attempts+1`；acked 后重试仍 `200` 且保持 `acked`。返回 `session_id`/`message_id`/`status(pending|acked)`/`attempts`/`sequence`。
 - `POST /v1/messages/{session_id}/acks`：体含 `device_id`、`message_id`、整数 `sequence`；权限/未知同上，序号不符 `409/field=sequence`。首次 `201` 置 acked，重复 `200` 幂等；响应同五字段（无重试时 `attempts=0`）。
+- `POST /v1/messages/{session_id}/acks-verified`：投递确认的签名授权入口（原未签名 `acks` 行为不变），支持 1:1 与群组会话。请求体含非空字符串 `device_id`、`message_id`，正整数 `sequence`、`expected_version`（拒绝布尔值）与规范标准 base64 的 64 字节 Ed25519 `signature`；被签消息为域前缀 `E2EE-MESSAGE-ACK-V1`、一个换行符与六字段紧凑 JSON（键按字典序 `device_id`/`expected_version`/`message_id`/`sequence`/`session_id`/`user_id`，Unicode 原样，整数为 JSON 整数）拼接的 UTF-8 字节，前四项取请求原值、`session_id` 取路径解码值、`user_id` 取设备注册值，由设备当前 identity_key 验签。坏 JSON 或非对象 `400/field=request_body`；字段缺失、类型或编码错误 `400/field=对应字段`。结构合法后在存储同一把锁内按固定顺序检查：未知会话 `404/field=session_id`、未知消息 `404/field=message_id`、设备未知/撤销/越权/非冻结成员 `409/field=device_id`、当前身份非 Ed25519 `400/field=identity_key`、`expected_version` 与当前 `identity_key_version` 不符 `409/field=expected_version`、验签失败 `400/field=signature`、序号不符 `409/field=sequence`；与撤销、身份轮换线性化，任一失败不改变投递状态。成功响应同五字段且 `status=acked`：首次 `201`，重复 `200` 幂等（不落盘、不增代次，仍须通过授权）；落盘失败 `503/field=data_file` 并回滚投递状态、内存与代次。不新增持久化段，version=1 文件与重启恢复完全兼容。CLI 新增 `ack-message-verified SESSION_ID --device-id … --message-id … --sequence N --expected-version N --signature …`，成功 stdout 单行 JSON（201/200 均退出 0），失败 stderr 单行 JSON 且非零退出；签名在客户端离线计算，服务端不接收私钥。
 - `GET /v1/messages/{session_id}/status/{message_id}?device_id=…`：`device_id` 缺失/为空/重复 `400/field=device_id`；未知 `404`，越权或接收方撤销 `409/field=device_id`；`200` 返回五字段投递状态（无记录时 `pending`/`0`）。
 - 命令行 `retry-message` / `ack-message` / `message-status` 与三个接口一一对应；成功 stdout 单行 JSON（含 200/201），失败 stderr 单行 JSON 且非零退出。
 - 可靠投递的校验、去重计数与确认在存储同一把锁下原子完成，失败不改变状态。
@@ -374,6 +375,12 @@ python3 -m e2ee_backend retry-message SESSION_ID MESSAGE_ID \
 # 显式确认（首次 201，重复 200）
 python3 -m e2ee_backend ack-message SESSION_ID \
   --device-id phone --message-id MESSAGE_ID --sequence 1
+# => {"session_id":"…","message_id":"…","status":"acked","attempts":1,"sequence":1}
+
+# 签名授权确认（E2EE-MESSAGE-ACK-V1 离线签名；首次 201，重复 200）
+python3 -m e2ee_backend ack-message-verified SESSION_ID \
+  --device-id phone --message-id MESSAGE_ID --sequence 1 \
+  --expected-version 1 --signature BASE64_ED25519_SIGNATURE
 # => {"session_id":"…","message_id":"…","status":"acked","attempts":1,"sequence":1}
 
 # 查询投递状态

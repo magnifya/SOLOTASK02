@@ -272,6 +272,9 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             self._route_add_prekey_verified(path)
         elif path.startswith(_DEVICES_PATH + "/"):
             self._route_add_prekey(path)
+        elif path.startswith(_MESSAGES_PATH + "/") \
+                and path.endswith("/acks-verified"):
+            self._route_acks_verified(path)
         elif path.startswith(_MESSAGES_PATH + "/") and path.endswith("/acks"):
             self._route_acks(path)
         elif path.startswith(_MESSAGES_PATH + "/") and "/retry/" in path:
@@ -293,6 +296,15 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
         parts = suffix.split("/")
         if len(parts) == 1 and parts[0]:
             self._handle_ack_message(unquote(parts[0]))
+        else:
+            self._send_json(404, {"message": "session not found",
+                                  "field": "session_id"})
+
+    def _route_acks_verified(self, path: str) -> None:
+        suffix = path[len(_MESSAGES_PATH) + 1:-len("/acks-verified")]
+        parts = suffix.split("/")
+        if len(parts) == 1 and parts[0]:
+            self._handle_ack_message_verified(unquote(parts[0]))
         else:
             self._send_json(404, {"message": "session not found",
                                   "field": "session_id"})
@@ -3178,6 +3190,18 @@ class DeviceHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             body, status_code = self.service.ack_message(session_id, payload)
+        except ServiceError as error:
+            self._send_json(error.status_code, error.to_body())
+            return
+        self._send_json(status_code, body)
+
+    def _handle_ack_message_verified(self, session_id: str) -> None:
+        payload = self._read_json_request()
+        if payload is _BAD_REQUEST:
+            return
+        try:
+            body, status_code = self.service.ack_message_verified(
+                session_id, payload)
         except ServiceError as error:
             self._send_json(error.status_code, error.to_body())
             return
