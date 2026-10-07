@@ -58,6 +58,9 @@ SYNC_ACK_PREFIX = "E2EE-SYNC-ACK-V1"
 #: Domain-separation prefix for the signature-authorized batch group
 #: sync-ack.
 GROUP_SYNC_ACK_PREFIX = "E2EE-GROUP-SYNC-ACK-V1"
+#: Domain-separation prefix for the signature-authorized single-message
+#: delivery ack.
+MESSAGE_ACK_PREFIX = "E2EE-MESSAGE-ACK-V1"
 #: Length of a derived one-to-one session key in bytes.
 SESSION_KEY_BYTES = 32
 #: Fixed HKDF salt for session-key derivation: 32 zero bytes.
@@ -854,6 +857,47 @@ def verify_group_sync_ack(identity_key: ed25519.Ed25519PublicKey,
     """
     message = group_sync_ack_proof_message(
         user_id, device_id, expected_version, items)
+    try:
+        identity_key.verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def message_ack_proof_message(user_id: str, device_id: str, message_id: str,
+                              sequence: int, session_id: str,
+                              expected_version: int) -> bytes:
+    """Build the exact bytes the identity key signs for a verified ack.
+
+    The message is the domain prefix ``E2EE-MESSAGE-ACK-V1``, one newline,
+    then compact JSON of the six fields with keys sorted at every level
+    (``device_id``, ``expected_version``, ``message_id``, ``sequence``,
+    ``session_id``, ``user_id``) and Unicode written as-is. ``user_id`` is
+    the device's registered value, ``session_id`` the request's
+    path-decoded value, ``device_id``/``message_id`` the request's verbatim
+    strings and ``sequence``/``expected_version`` are serialized as JSON
+    integers.
+    """
+    document = json.dumps(
+        {"device_id": device_id, "expected_version": expected_version,
+         "message_id": message_id, "sequence": sequence,
+         "session_id": session_id, "user_id": user_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (MESSAGE_ACK_PREFIX + "\n" + document).encode("utf-8")
+
+
+def verify_message_ack(identity_key: ed25519.Ed25519PublicKey,
+                       signature: bytes, user_id: str, device_id: str,
+                       message_id: str, sequence: int, session_id: str,
+                       expected_version: int) -> bool:
+    """Verify one signature-authorized message ack against the Ed25519 key.
+
+    Returns ``True`` iff *signature* is valid over
+    :func:`message_ack_proof_message` for the six field values.
+    """
+    message = message_ack_proof_message(
+        user_id, device_id, message_id, sequence, session_id,
+        expected_version)
     try:
         identity_key.verify(signature, message)
     except InvalidSignature:

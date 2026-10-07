@@ -63,6 +63,7 @@ from .crypto import (
     verify_group_session_rotation,
     verify_group_sync_ack,
     verify_identity_rotation,
+    verify_message_ack,
     verify_message_signature,
     verify_signed_prekey,
     verify_sync_ack,
@@ -144,6 +145,13 @@ DELIVERY_MESSAGE_UNKNOWN = "message_unknown"
 DELIVERY_DEVICE_MISMATCH = "device_mismatch"
 DELIVERY_DEVICE_INACTIVE = "device_inactive"
 DELIVERY_BAD_SEQUENCE = "bad_sequence"
+#: Outcome codes for a signature-authorized message ack whose device's
+#: current identity key is not Ed25519, whose expected version does not
+#: equal the device's current identity_key_version, or whose signature
+#: fails verification against the device's current identity key.
+DELIVERY_ACK_NOT_ED25519 = "ack_identity_not_ed25519"
+DELIVERY_ACK_VERSION_MISMATCH = "ack_version_mismatch"
+DELIVERY_ACK_SIGNATURE_INVALID = "ack_signature_invalid"
 
 #: Outcome codes for identity-key rotation.
 DEVICE_UNKNOWN = "device_unknown"
@@ -9556,28 +9564,91 @@ class DeviceStore:
                 session_id, message_id, device_id)
             if sequence != message.sequence:
                 raise DeliveryError(DELIVERY_BAD_SEQUENCE)
-            if group_session is not None:
-                bucket: Dict[Tuple, MessageDelivery] = self._group_delivery
-                key: Tuple = (session_id, message_id, device_id)
-            else:
-                bucket = self._delivery
-                key = (session_id, message_id)
-            state = bucket.get(key)
-            first_ack = state is None or not state.acked
-            if first_ack:
-                # The first ack (also creating the record when no retry ever
-                # happened) is the only transition: the acked flag, sequence
-                # and persistence commit atomically together. A repeated ack
-                # by the same device is a state-free idempotent replay — no
-                # file write, no commit generation, no anchor migration.
-                if state is None:
-                    state = MessageDelivery()
-                    bucket[key] = state
-                state.acked = True
-                state.ack_sequence = sequence
-                self._notify_change()
-            view = self._delivery_view(session_id, message, state)
-            return view, first_ack
+            return self._ack_message_locked(
+                session_id, group_session, message, device_id, sequence)
+
+    def ack_message_verified(
+            self, session_id: str, message_id: str, device_id: str,
+            sequence: int, expected_version: int, signature: bytes
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically apply a signature-authorized message acknowledgement.
+
+        The whole check-and-ack runs under the store lock — the same lock
+        device revocation and identity rotation take — so the signature is
+        always verified against the device's *current* identity key and
+        version, and the checks and the write are one linearizable
+        transaction. *signature* is the already-decoded 64-byte Ed25519
+        signature over the canonical ``E2EE-MESSAGE-ACK-V1`` message for
+        the device's stored ``user_id`` and the request's
+        ``device_id``/``message_id``/``sequence``/``session_id``/
+        ``expected_version``.
+
+        Checks run in a fixed order, raising :class:`DeliveryError`:
+        unknown session -> ``session_unknown``; unknown message ->
+        ``message_unknown``; unknown/revoked device -> ``device_inactive``;
+        a device that is not the session's active recipient (or not a
+        frozen non-sender member, for a group session) ->
+        ``device_mismatch``; a current identity key that is not Ed25519 ->
+        ``ack_identity_not_ed25519``; ``expected_version`` different from
+        the current ``identity_key_version`` -> ``ack_version_mismatch``; a
+        signature that does not verify -> ``ack_signature_invalid``; a
+        sequence that differs from the message's stored one ->
+        ``bad_sequence``. The authorization is verified even when the
+        message is already acked. On success the ack commits exactly as in
+        :meth:`ack_message`. Returns ``(view, first_ack)``.
+        """
+        with self._lock:
+            _, group_session, message = self._delivery_target(
+                session_id, message_id, device_id)
+            device = self._find_device(device_id)
+            # _delivery_target authorized the device, so it exists and is
+            # active here.
+            current_key = load_ed25519_public_key(device.identity_key)
+            if current_key is None:
+                raise DeliveryError(DELIVERY_ACK_NOT_ED25519)
+            if device.identity_key_version != expected_version:
+                raise DeliveryError(DELIVERY_ACK_VERSION_MISMATCH)
+            if not verify_message_ack(current_key, signature, device.user_id,
+                                      device_id, message_id, sequence,
+                                      session_id, expected_version):
+                raise DeliveryError(DELIVERY_ACK_SIGNATURE_INVALID)
+            if sequence != message.sequence:
+                raise DeliveryError(DELIVERY_BAD_SEQUENCE)
+            return self._ack_message_locked(
+                session_id, group_session, message, device_id, sequence)
+
+    def _ack_message_locked(
+            self, session_id: str, group_session: Optional[GroupSession],
+            message: Message, device_id: str, sequence: int
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Commit one message acknowledgement (lock held).
+
+        Shared tail of :meth:`ack_message` and
+        :meth:`ack_message_verified`: the target is resolved and every
+        check has passed. The first ack (also creating the record when no
+        retry ever happened) is the only transition: the acked flag,
+        sequence and persistence commit atomically together. A repeated ack
+        by the same device is a state-free idempotent replay — no file
+        write, no commit generation, no anchor migration. Returns
+        ``(view, first_ack)``.
+        """
+        if group_session is not None:
+            bucket: Dict[Tuple, MessageDelivery] = self._group_delivery
+            key: Tuple = (session_id, message.message_id, device_id)
+        else:
+            bucket = self._delivery
+            key = (session_id, message.message_id)
+        state = bucket.get(key)
+        first_ack = state is None or not state.acked
+        if first_ack:
+            if state is None:
+                state = MessageDelivery()
+                bucket[key] = state
+            state.acked = True
+            state.ack_sequence = sequence
+            self._notify_change()
+        view = self._delivery_view(session_id, message, state)
+        return view, first_ack
 
     def message_delivery_status(self, session_id: str, message_id: str,
                                 device_id: str) -> Dict[str, Any]:

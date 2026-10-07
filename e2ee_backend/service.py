@@ -51,6 +51,9 @@ from .storage import (
     CLEANUP_LEASE_NOT_FOUND,
     CLEANUP_LEASE_RENEW_CONFLICT,
     CLEANUP_LEASE_STATE_CONFLICT,
+    DELIVERY_ACK_NOT_ED25519,
+    DELIVERY_ACK_SIGNATURE_INVALID,
+    DELIVERY_ACK_VERSION_MISMATCH,
     DELIVERY_BAD_SEQUENCE,
     DELIVERY_DEVICE_INACTIVE,
     DELIVERY_DEVICE_MISMATCH,
@@ -6970,6 +6973,9 @@ class DeviceService:
         DELIVERY_DEVICE_INACTIVE: (409, "device_id"),
         DELIVERY_DEVICE_MISMATCH: (409, "device_id"),
         DELIVERY_BAD_SEQUENCE: (409, "sequence"),
+        DELIVERY_ACK_NOT_ED25519: (400, "identity_key"),
+        DELIVERY_ACK_VERSION_MISMATCH: (409, "expected_version"),
+        DELIVERY_ACK_SIGNATURE_INVALID: (400, "signature"),
     }
 
     def _delivery_error(self, error: DeliveryError,
@@ -6983,6 +6989,15 @@ class DeviceService:
             text = f"message not found: {message_id}"
         elif error.reason == DELIVERY_BAD_SEQUENCE:
             text = f"sequence does not match the message (got {sequence})"
+        elif error.reason == DELIVERY_ACK_NOT_ED25519:
+            text = ("stored identity key is not an Ed25519 public key: "
+                    "identity_key")
+        elif error.reason == DELIVERY_ACK_VERSION_MISMATCH:
+            text = ("expected_version does not match the device's current "
+                    "identity_key_version")
+        elif error.reason == DELIVERY_ACK_SIGNATURE_INVALID:
+            text = ("message-ack authorization failed verification: "
+                    "signature")
         else:
             text = "device_id is not the active recipient of this session"
         return ServiceError(text, field, status_code=status_code)
@@ -7044,6 +7059,80 @@ class DeviceService:
         except DeliveryError as error:
             raise self._delivery_error(
                 error, session_id, payload["message_id"], sequence)
+        return view, 201 if first_ack else 200
+
+    def ack_message_verified(self, session_id: str, payload: object
+                             ) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply a signature-authorized acknowledgement.
+
+        ``POST /v1/messages/{session_id}/acks-verified`` — the signed
+        counterpart of :meth:`ack_message` (the unsigned entry keeps its
+        behavior). The session is taken from the URL; the body must be an
+        object carrying non-empty strings ``device_id``/``message_id``,
+        positive integers ``sequence``/``expected_version`` (booleans are
+        refused) and ``signature`` — standard base64 decoding to exactly
+        64 bytes, an Ed25519 signature verified against the device's
+        current identity key over the domain-separated canonical message
+        (``E2EE-MESSAGE-ACK-V1``) for the stored ``user_id``, the
+        path-decoded ``session_id`` and the request's ``device_id`` /
+        ``message_id`` / ``sequence`` / ``expected_version``.
+
+        Shape errors are reported, in order, as 400/field ``request_body``
+        (bad/non-object body), ``device_id``, ``message_id``, ``sequence``,
+        ``expected_version`` and ``signature``. The session/message/
+        device/identity/version/signature/sequence checks then run
+        atomically in the store: unknown session or message is
+        404/field ``session_id``/``message_id``; an unknown, revoked,
+        mismatched or non-frozen-member device is 409/field ``device_id``;
+        a current identity key that is not Ed25519 is
+        400/field ``identity_key``; a version mismatch is
+        409/field ``expected_version``; a failed verification is
+        400/field ``signature``; a sequence mismatch is
+        409/field ``sequence``. The authorization is checked even when the
+        message is already acked; any failure leaves the delivery state
+        untouched.
+
+        On success the response is the plain entry's five-field delivery
+        view with ``status`` ``acked``: 201 for the first ack, 200 for an
+        idempotent replay (writing nothing).
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        for name in ("device_id", "message_id"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not is_nonempty_string(payload[name]):
+                raise ServiceError(
+                    f"field must be a non-empty string: {name}", name)
+        for name in ("sequence", "expected_version"):
+            if name not in payload:
+                raise ServiceError(f"missing required field: {name}", name)
+            if not isinstance(payload[name], int) \
+                    or isinstance(payload[name], bool) \
+                    or payload[name] < 1:
+                raise ServiceError(
+                    f"field must be a positive integer: {name}", name)
+        if "signature" not in payload:
+            raise ServiceError("missing required field: signature",
+                               "signature")
+        if not is_nonempty_string(payload["signature"]):
+            raise ServiceError(
+                "field must be a non-empty string: signature", "signature")
+        signature = decode_ed25519_signature(payload["signature"])
+        if signature is None:
+            raise ServiceError(
+                "field must be a standard base64 64-byte Ed25519 "
+                "signature: signature", "signature")
+
+        try:
+            view, first_ack = self.store.ack_message_verified(
+                session_id, payload["message_id"], payload["device_id"],
+                payload["sequence"], payload["expected_version"], signature)
+        except DeliveryError as error:
+            raise self._delivery_error(
+                error, session_id, payload["message_id"],
+                payload["sequence"])
         return view, 201 if first_ack else 200
 
     def message_status(self, session_id: str, message_id: str,

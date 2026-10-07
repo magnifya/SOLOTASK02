@@ -147,6 +147,7 @@ serve 支持持久化：--data-file 指定状态文件路径，缺省时取环�
 - 命令行 `send-message` / `submit-message` / `pull-messages` 与上述接口一一对应，同样打印单行 JSON（`submit-message` 的 201 与 200 均为成功）。
 - `POST /v1/messages/{session_id}/retry/{message_id}`：可靠投递重试。体含非空 `device_id`、`attempt_id`；接收方须活跃，未知会话/消息 `404`（`field=session_id`/`message_id`），设备不符、未知或已撤销 `409/field=device_id`，字段缺失或类型错误 `400`。首次尝试 `201`、`attempts=1`；相同 `attempt_id` 幂等 `200` 不计数，新 id `200` 且 `attempts+1`；acked 后重试仍 `200` 且保持 `acked`。返回 `session_id`/`message_id`/`status(pending|acked)`/`attempts`/`sequence`。
 - `POST /v1/messages/{session_id}/acks`：体含 `device_id`、`message_id`、整数 `sequence`；权限/未知同上，序号不符 `409/field=sequence`。首次 `201` 置 acked，重复 `200` 幂等；响应同五字段（无重试时 `attempts=0`）。
+- `POST /v1/messages/{session_id}/acks-verified`：凭接收设备**当前 Ed25519 身份公钥签名授权**的单条投递确认（原 `acks` 入口行为不变；1:1 与群组会话均支持，群组仍按冻结成员逐设备确认）。请求体为对象，含非空字符串 `device_id`/`message_id`、正整数 `sequence`/`expected_version`（拒绝布尔值）与 `signature`（规范标准 base64、解码恰为 64 字节的 Ed25519 签名），其余字段忽略。被签字节为 `E2EE-MESSAGE-ACK-V1\n` 后接紧凑 JSON 的 UTF-8 编码：JSON 仅含 `device_id`/`expected_version`/`message_id`/`sequence`/`session_id`/`user_id`，键按字典序、Unicode 不转义；前四项取请求原值（序号为 JSON 整数），`session_id` 取路径解码值，`user_id` 取注册值。校验顺序：坏 JSON 或体非对象 `400/request_body`；`device_id`/`message_id`/`sequence`/`expected_version`/`signature` 缺失或非法 `400/对应 field`。随后在同一存储锁事务内依次核对：会话未知 `404/session_id`、消息未知 `404/message_id`、设备未知/已撤销/越权或非冻结成员 `409/device_id`、当前公钥非 Ed25519 `400/identity_key`、版本不符 `409/expected_version`、验签失败 `400/signature`、序号不符 `409/sequence`——即使消息已确认也先校验授权，任何失败不改动投递状态。成功响应为原五字段投递视图且 `status=acked`：首次确认 `201`，重复确认幂等 `200`（不写盘、不增代次）。授权与确认和撤销、身份轮换在同一存储锁下原子线性化；落盘失败 `503/field=data_file` 并回滚投递状态、内存与代次。不新增持久化段（复用既有 `delivery`/`group_delivery`），version=1 文件与重启完全兼容；服务端不接收私钥。命令行新增 `ack-message-verified SESSION_ID --device-id --message-id --sequence --expected-version --signature`，成功 stdout 单行 JSON（201/200 均退出 0），失败 stderr 单行 JSON 且非零退出。
 - `GET /v1/messages/{session_id}/status/{message_id}?device_id=…`：`device_id` 缺失/为空/重复 `400/field=device_id`；未知 `404`，越权或接收方撤销 `409/field=device_id`；`200` 返回五字段投递状态（无记录时 `pending`/`0`）。
 - 命令行 `retry-message` / `ack-message` / `message-status` 与三个接口一一对应；成功 stdout 单行 JSON（含 200/201），失败 stderr 单行 JSON 且非零退出。
 - 可靠投递的校验、去重计数与确认在存储同一把锁下原子完成，失败不改变状态。
@@ -376,6 +377,12 @@ python3 -m e2ee_backend ack-message SESSION_ID \
   --device-id phone --message-id MESSAGE_ID --sequence 1
 # => {"session_id":"…","message_id":"…","status":"acked","attempts":1,"sequence":1}
 
+# 签名授权确认（首次 201，重复 200；签名由设备当前 Ed25519 身份私钥离线生成）
+python3 -m e2ee_backend ack-message-verified SESSION_ID \
+  --device-id phone --message-id MESSAGE_ID --sequence 1 \
+  --expected-version 1 --signature BASE64_ED25519_SIGNATURE
+# => {"session_id":"…","message_id":"…","status":"acked","attempts":1,"sequence":1}
+
 # 查询投递状态
 python3 -m e2ee_backend message-status SESSION_ID MESSAGE_ID --device-id phone
 # => {"session_id":"…","message_id":"…","status":"acked","attempts":1,"sequence":1}
@@ -472,6 +479,6 @@ e2ee_backend/
   locking.py      # --data-file 状态文件的进程级非阻塞独占锁：POSIX flock、Windows msvcrt.locking 字节区间锁，锁文件只创建不截断、不参与崩溃遗留扫描
   service.py      # 业务逻辑与字段校验（400/404/409，设备/预密钥/会话/群组/群会话/群会话轮换/消息/投递/群同步）
   http_app.py     # POST/GET 路由与 JSON 响应（注册、查询、两类撤销、会话协商与查询、群组创建/查询/成员增删、群组会话协商/查询/轮换、消息投递/幂等提交与拉取、重试/确认/状态、群会话同步与检查点、会话同步批量确认 sync/ack、补投事件保留 event-gc、只读持久化完整性探针 /v1/persistence/integrity）
-  cli.py          # register/register-verified/show/key-events/revoke-*/rotate-identity-key/rotate-identity-key-verified/fingerprint/verify-identity/add-prekey/add-prekey-verified/add-prekeys-verified/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/message-status/encrypt-message/decrypt-message/derive-session-key/verify-prekey-proof/sign-prekey-proof/derive-verified-session-key/sign-message/verify-message/serve 命令行入口
+  cli.py          # register/register-verified/show/key-events/revoke-*/rotate-identity-key/rotate-identity-key-verified/fingerprint/verify-identity/add-prekey/add-prekey-verified/add-prekeys-verified/claim-prekey/claim-user-prekeys/create-session/create-session-from-claim/show-session/group-*/create-group-session/show-group-session/rotate-group-session/sync-group-messages/sync-checkpoint/send-message/submit-message/pull-messages/retry-message/ack-message/ack-message-verified/message-status/encrypt-message/decrypt-message/derive-session-key/verify-prekey-proof/sign-prekey-proof/derive-verified-session-key/sign-message/verify-message/serve 命令行入口
 tests/            # unittest 测试
 ```
