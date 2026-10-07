@@ -3230,7 +3230,9 @@ class DeviceService:
         by another device — or committed in the 1:1 namespace, since the
         id is global — is 409/field ``lease_id``; both are decided in the
         store under the lock, ahead of the path device's state. A first
-        release on an unknown/revoked device is 409/field ``device_id``.
+        release on an unknown/revoked device is 409/field ``device_id``;
+        a first release on an already completed lease is 409/field
+        ``lease_id`` (completion ends the lease's lifecycle).
 
         A first release returns 201 with ``device_id``, ``lease_id``,
         ``released_at`` (UTC ISO-8601, six microsecond digits, ``+00:00``)
@@ -3250,6 +3252,10 @@ class DeviceService:
             if error.reason == INBOX_LEASE_CONFLICT:
                 raise ServiceError(
                     "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_UNAVAILABLE:
+                raise ServiceError(
+                    "lease is already completed and cannot be released",
                     "lease_id", status_code=409)
             if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
                 raise ServiceError("device_id is not a registered device",
@@ -3319,6 +3325,136 @@ class DeviceService:
             raise ServiceError("device_id is revoked",
                                "device_id", status_code=409)
 
+    def group_inbox_lease_complete(
+            self, device_id: str, lease_id: str,
+            payload: object) -> Tuple[Dict[str, Any], int]:
+        """Validate and apply one group-inbox lease completion.
+
+        ``POST /v1/devices/{device_id}/group-inbox/leases/{lease_id}
+        /complete``. The body must be a JSON object carrying only a
+        non-empty string ``completion_id`` and an ``outcome`` of exactly
+        ``delivered`` or ``failed``: a bad/non-object body is 400/field
+        ``request_body``; an unexpected top-level key is 400 with that
+        key's name; a missing, empty or wrongly typed ``completion_id``
+        is 400/completion_id and a missing or non-allowed ``outcome`` is
+        400/outcome.
+
+        The lease is resolved in the store under the lock, ahead of the
+        path device's state: a never-committed ``lease_id`` is 404/field
+        ``lease_id`` and a lease owned by another device — or committed
+        in the 1:1 namespace, since the id is global — is 409/field
+        ``lease_id``. Replaying the same ``completion_id`` on the same
+        lease returns the frozen first response with 200 (ids may recur
+        on other leases, in either inbox namespace), winning over every
+        later state; completing the lease again under another id is
+        409/field ``completion_id``. Only a first completion checks the
+        device (unknown or revoked -> 409/field ``device_id``) and the
+        lease state (already released or expired -> 409/field
+        ``lease_id``). A first completion returns 201 with
+        ``device_id``, ``lease_id``, ``completion_id``, ``outcome`` and
+        ``completed_at`` (UTC ISO-8601 with six microsecond digits and
+        ``+00:00``) in that key order, and persists one generation.
+        Completion ends the lease: its still-unacked messages may be
+        claimed again (``delivered`` is not an acknowledgement) and no
+        renewal or first release follows.
+        """
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object",
+                               "request_body")
+        extras = [key for key in payload
+                  if key not in ("completion_id", "outcome")]
+        if extras:
+            raise ServiceError(
+                f"unexpected field: {extras[0]}", extras[0])
+        if "completion_id" not in payload:
+            raise ServiceError("missing required field: completion_id",
+                               "completion_id")
+        if not is_nonempty_string(payload["completion_id"]):
+            raise ServiceError(
+                "field must be a non-empty string: completion_id",
+                "completion_id")
+        if "outcome" not in payload:
+            raise ServiceError("missing required field: outcome", "outcome")
+        outcome = payload["outcome"]
+        if not isinstance(outcome, str) or outcome not in ("delivered",
+                                                           "failed"):
+            raise ServiceError(
+                "field must be one of 'delivered' or 'failed': outcome",
+                "outcome")
+
+        try:
+            return self.store.group_inbox_lease_complete(
+                device_id, lease_id, payload["completion_id"], outcome)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_COMPLETION_CONFLICT:
+                raise ServiceError(
+                    "completion_id is already used on this lease or the "
+                    "lease has already been completed",
+                    "completion_id", status_code=409)
+            if error.reason == INBOX_LEASE_UNAVAILABLE:
+                raise ServiceError(
+                    "lease is released or expired and cannot be completed",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
+    def group_inbox_lease_ack(self, device_id: str,
+                              lease_id: str) -> Tuple[Dict[str, Any], int]:
+        """Bulk-acknowledge every message of one delivered group lease.
+
+        ``POST /v1/devices/{device_id}/group-inbox/leases/{lease_id}
+        /ack`` (no request body and no query string; the HTTP layer
+        rejects them with 400/field ``request_body`` / ``query``). The
+        lease is resolved in the store under the lock, ahead of the path
+        device's state: a never-committed ``lease_id`` is 404/field
+        ``lease_id`` and a lease owned by another device — or committed
+        in the 1:1 namespace, since the id is global — is 409/field
+        ``lease_id``.
+
+        A lease whose messages are already all acked answers 200 and
+        writes nothing — even if the device has since been revoked; that
+        replay takes precedence. Otherwise only a lease completed with
+        ``completion.outcome == "delivered"`` may be acked: an active,
+        expired, released or ``failed`` lease is 409/field ``lease_id``.
+        A deliverable lease on an unknown or revoked device is
+        409/field ``device_id``. A first ack returns 201, sets every
+        leased message's group delivery record acked with
+        ``ack_sequence`` the message sequence (attempts and attempt ids
+        unchanged), and persists one generation. The body keys are
+        ``device_id``, ``lease_id``, ``acked`` (always ``true``) and
+        ``message_count`` (the number of messages the lease claimed) in
+        that order.
+        """
+        try:
+            return self.store.group_inbox_lease_ack(device_id, lease_id)
+        except InboxLeaseError as error:
+            if error.reason == INBOX_LEASE_NOT_FOUND:
+                raise ServiceError(f"lease not found: {lease_id}",
+                                   "lease_id", status_code=404)
+            if error.reason == INBOX_LEASE_CONFLICT:
+                raise ServiceError(
+                    "lease_id is owned by another device",
+                    "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_NOT_DELIVERED:
+                raise ServiceError(
+                    "lease can only be acknowledged after a 'delivered' "
+                    "completion", "lease_id", status_code=409)
+            if error.reason == INBOX_LEASE_DEVICE_UNKNOWN:
+                raise ServiceError("device_id is not a registered device",
+                                   "device_id", status_code=409)
+            raise ServiceError("device_id is revoked",
+                               "device_id", status_code=409)
+
     def group_inbox_lease_get(self, device_id: str,
                               lease_id: str) -> Dict[str, Any]:
         """Return one occupied group-inbox lease's current state (read-only).
@@ -3335,8 +3471,9 @@ class DeviceService:
         the lookup is purely read-only (no write, no ``commit_seq``
         change). On success the body keys are ``device_id``,
         ``lease_id``, ``limit``, ``state``, ``leased_until``,
-        ``released_at`` and ``messages`` in that order; ``state`` is one
-        of ``active``, ``expired`` or ``released``.
+        ``released_at``, ``completion`` and ``messages`` in that order;
+        ``state`` is one of ``active``, ``expired``, ``released`` or
+        ``completed``.
         """
         try:
             return self.store.group_inbox_lease_get(device_id, lease_id)

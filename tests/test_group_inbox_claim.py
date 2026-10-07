@@ -364,11 +364,12 @@ class GroupLeasePersistenceTest(GroupLeaseMixin, unittest.TestCase):
             self.assertEqual(len(record["leases"]), 1)
             self.assertEqual(list(record["leases"][0]),
                              ["lease_id", "limit", "leased_until",
-                              "released_at", "renewals"])
+                              "released_at", "renewals", "completion"])
             self.assertEqual(record["leases"][0]["lease_id"], "L1")
             self.assertEqual(record["leases"][0]["limit"], 2)
             self.assertIsNone(record["leases"][0]["released_at"])
             self.assertEqual(record["leases"][0]["renewals"], [])
+            self.assertIsNone(record["leases"][0]["completion"])
 
     def test_empty_claim_and_replay_consume_no_generation(self) -> None:
         self.service.group_inbox_claim(

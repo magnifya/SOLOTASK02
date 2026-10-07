@@ -369,8 +369,9 @@ class GroupRenewPersistenceTest(GroupRenewMixin, unittest.TestCase):
             lease = record["leases"][0]
             self.assertEqual(list(lease),
                              ["lease_id", "limit", "leased_until",
-                              "released_at", "renewals"])
+                              "released_at", "renewals", "completion"])
             self.assertIsNone(lease["released_at"])
+            self.assertIsNone(lease["completion"])
             self.assertEqual(len(lease["renewals"]), 1)
             renewal = lease["renewals"][0]
             self.assertEqual(list(renewal),
@@ -567,15 +568,24 @@ class GroupRenewPersistenceTest(GroupRenewMixin, unittest.TestCase):
         self._assert_refuses_startup(self._malformed_document(mutate))
 
     def test_restore_rejects_group_terminal_keys(self) -> None:
-        # Group leases never carry completion or ack id fields.
-        for key in ("completion", "ack_id"):
-            with self.subTest(key=key):
-                def mutate(document, key=key):
-                    for lease in (l for r in document["group_delivery"]
-                                 for l in r.get("leases", [])):
-                        lease[key] = None
-                self._assert_refuses_startup(
-                    self._malformed_document(mutate))
+        # Group leases never carry a bulk-ack id field (a completion, by
+        # contrast, is a regular terminal record and loads fine).
+        def mutate(document):
+            for lease in (l for r in document["group_delivery"]
+                         for l in r.get("leases", [])):
+                lease["ack_id"] = None
+        self._assert_refuses_startup(self._malformed_document(mutate))
+
+    def test_restore_accepts_null_completion(self) -> None:
+        def mutate(document):
+            for lease in (l for r in document["group_delivery"]
+                         for l in r.get("leases", [])):
+                lease["completion"] = None
+        bad_path = self._malformed_document(mutate)
+        restarted = DeviceService()
+        attach_persistence(restarted, bad_path)  # must not raise
+        body = restarted.group_inbox_lease_get("d3", "L1")
+        self.assertIsNone(body["completion"])
 
 
 class GroupRenewHTTPTest(GroupRenewMixin, unittest.TestCase):

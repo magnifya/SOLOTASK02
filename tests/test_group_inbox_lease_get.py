@@ -9,9 +9,9 @@ unknown lease id is 404/lease_id and one owned by another device (or
 committed in the 1:1 namespace) is 409/lease_id, both ahead of the
 path device's state; a matching lease stays readable after its device
 is revoked. The 200 body keys are device_id, lease_id, limit, state,
-leased_until, released_at, messages; the query is purely read-only (no
-write, no commit_seq change) and linearized under the store lock with
-the mutating group lease operations.
+leased_until, released_at, completion, messages; the query is purely
+read-only (no write, no commit_seq change) and linearized under the
+store lock with the mutating group lease operations.
 """
 import json
 import threading
@@ -79,13 +79,15 @@ class GetServiceTest(GetMixin, unittest.TestCase):
         body = self.service.group_inbox_lease_get("d3", "L1")
         self.assertEqual(list(body),
                          ["device_id", "lease_id", "limit", "state",
-                          "leased_until", "released_at", "messages"])
+                          "leased_until", "released_at", "completion",
+                          "messages"])
         self.assertEqual(body["device_id"], "d3")
         self.assertEqual(body["lease_id"], "L1")
         self.assertEqual(body["limit"], 2)
         self.assertEqual(body["state"], "active")
         self.assertEqual(body["leased_until"], claim["leased_until"])
         self.assertIsNone(body["released_at"])
+        self.assertIsNone(body["completion"])
 
     def test_messages_in_claim_order_with_current_delivery_values(
             self) -> None:
@@ -308,16 +310,20 @@ class GetHTTPTest(GetMixin, unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(list(body),
                          ["device_id", "lease_id", "limit", "state",
-                          "leased_until", "released_at", "messages"])
+                          "leased_until", "released_at", "completion",
+                          "messages"])
         self.assertLess(raw.index('"device_id"'), raw.index('"lease_id"'))
         self.assertLess(raw.index('"limit"'), raw.index('"state"'))
         self.assertLess(raw.index('"leased_until"'),
                         raw.index('"released_at"'))
         self.assertLess(raw.index('"released_at"'),
+                        raw.index('"completion"'))
+        self.assertLess(raw.index('"completion"'),
                         raw.index('"messages"'))
         self.assertEqual(body["device_id"], "d3")
         self.assertEqual(body["state"], "active")
         self.assertIsNone(body["released_at"])
+        self.assertIsNone(body["completion"])
 
     def test_repeated_gets_are_byte_identical(self) -> None:
         self._claim_http("L1", 2)
